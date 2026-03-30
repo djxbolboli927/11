@@ -1,7 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{signature::Keypair, signer::Signer, transaction::VersionedTransaction};
+use solana_sdk::{signature::Keypair, signer::Signer};
 use tracing::{debug, info, warn};
 
 use crate::alt_cache::AltCache;
@@ -15,8 +15,6 @@ use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
-/// Look up CU limit from config based on hop count.
-/// Index 0 = 2 hops, index 1 = 3 hops, etc.
 fn lookup_cu_limit(hop_count: usize, cu_limits: &[u32]) -> u32 {
     if cu_limits.is_empty() {
         return 200_000;
@@ -26,7 +24,6 @@ fn lookup_cu_limit(hop_count: usize, cu_limits: &[u32]) -> u32 {
     cu_limits[clamped]
 }
 
-/// Represents a profitable circular arbitrage opportunity.
 struct Opportunity {
     token_mint: String,
     amount: u64,
@@ -37,8 +34,6 @@ struct Opportunity {
     hop_count: usize,
 }
 
-/// Check a single (amount, token) pair for arbitrage profitability.
-/// Returns Some(Opportunity) if profitable, None otherwise.
 async fn check_opportunity(
     metis: &MetisClient,
     token_mint: &str,
@@ -49,11 +44,9 @@ async fn check_opportunity(
     tip_max: u64,
     min_profit: u64,
 ) -> Option<Opportunity> {
-    // Leg 1: WSOL → Token
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
 
-    // Leg 2: Token → WSOL
     let quote2 = metis.get_quote(token_mint, WSOL_MINT, token_amount).await.ok()?;
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
@@ -88,7 +81,7 @@ async fn check_opportunity(
 }
 
 /// Scan ALL (amount × token) pairs concurrently.
-/// Execute IMMEDIATELY on the first profitable result — don't wait for the rest.
+/// Execute IMMEDIATELY on the first profitable result — send to ALL Jito endpoints at once.
 pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
@@ -96,7 +89,6 @@ pub async fn scan_all_tokens(
     jito: &JitoClient,
     trading_keypair: &Keypair,
     rpc_client: &RpcClient,
-    sim_rpc_client: Option<&RpcClient>,
     jito_limiter: &mut RateLimiter,
     blockhash_cache: &BlockhashCache,
     alt_cache: &AltCache,
@@ -106,8 +98,6 @@ pub async fn scan_all_tokens(
     let step_lamports = (config.trading.step_sol * LAMPORTS_PER_SOL) as u64;
     let base_fee = config.trading.base_fee_lamports;
 
-    // Launch ALL (amount × token) checks concurrently via FuturesUnordered.
-    // Results stream in as they complete — first profitable one wins.
     let mut futs = FuturesUnordered::new();
 
     let mut amount = min_lamports;
@@ -127,7 +117,6 @@ pub async fn scan_all_tokens(
         amount += step_lamports;
     }
 
-    // Stream results as they arrive — execute the first profitable one immediately
     while let Some(result) = futs.next().await {
         let opp = match result {
             Some(opp) => opp,
@@ -158,7 +147,6 @@ pub async fn scan_all_tokens(
             jito,
             trading_keypair,
             rpc_client,
-            sim_rpc_client,
             cu_limit,
             blockhash_cache,
             alt_cache,
@@ -170,64 +158,42 @@ pub async fn scan_all_tokens(
                     uuid = %uuid,
                     token = opp.token_mint.as_str(),
                     profit = opp.net_profit,
-                    "bundle sent to Jito"
+                    "bundle sent to all Jito endpoints"
                 );
             }
             Err(e) => {
-                warn!(
-                    error = %e,
-                    token = opp.token_mint.as_str(),
-                    "execution failed"
-                );
+                warn!(error = %e, token = opp.token_mint.as_str(), "execution failed");
             }
         }
 
         // Break after first execution — restart scan with fresh quotes.
-        // Remaining futures are dropped (prices are already stale).
         break;
     }
 
     Ok(())
 }
 
-/// Simulate a transaction via RPC before sending to Jito.
-fn simulate_transaction(sim_rpc: &RpcClient, tx: &VersionedTransaction) -> Result<()> {
-    let result = sim_rpc
-        .simulate_transaction(tx)
-        .context("simulation RPC call failed")?;
-
-    if let Some(err) = result.value.err {
-        anyhow::bail!("simulation failed: {:?}", err);
-    }
-
-    Ok(())
-}
-
-/// Execute a circular arbitrage opportunity.
-///
-/// Flow: swap-instructions → build tx (cached blockhash + ALT) → simulate → send to Jito
+/// Execute: get swap instructions → build tx → send directly to ALL Jito endpoints (no simulation).
 async fn execute_opportunity(
     opp: &Opportunity,
     metis: &MetisClient,
     jito: &JitoClient,
     trading_keypair: &Keypair,
     rpc_client: &RpcClient,
-    sim_rpc_client: Option<&RpcClient>,
     cu_limit: u32,
     blockhash_cache: &BlockhashCache,
     alt_cache: &AltCache,
 ) -> Result<String> {
     let user_pubkey = trading_keypair.pubkey().to_string();
 
-    // Get swap instructions from Metis
     let swap_ixs = metis
         .get_swap_instructions(&user_pubkey, &opp.merged_quote)
         .await?;
 
-    // Use cached blockhash (~100ns) instead of RPC call (~5ms)
+    // Cached blockhash — zero RPC calls
     let recent_blockhash = blockhash_cache.get();
 
-    // Build tx with ALT cache (0ms on hit, ~5ms on first miss)
+    // Build tx with ALT cache
     let tx = transaction::build_arb_transaction(
         &swap_ixs,
         trading_keypair,
@@ -238,18 +204,12 @@ async fn execute_opportunity(
         rpc_client,
     )?;
 
-    // Verify transaction size
     let tx_bytes = bincode::serialize(&tx)?;
     if tx_bytes.len() > 1232 {
         anyhow::bail!("tx too large: {} bytes", tx_bytes.len());
     }
 
-    // Simulate via eRPC before sending to Jito
-    if let Some(sim_rpc) = sim_rpc_client {
-        simulate_transaction(sim_rpc, &tx)?;
-        debug!("simulation passed");
-    }
-
+    // Send directly to ALL Jito endpoints concurrently — no simulation
     let uuid = jito.send_bundle(&tx).await?;
     Ok(uuid)
 }

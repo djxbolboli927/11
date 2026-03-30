@@ -40,16 +40,7 @@ async fn main() -> Result<()> {
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
 
-    let sim_rpc_client = if !config.rpc.simulation_url.is_empty() {
-        let client = Arc::new(RpcClient::new(config.rpc.simulation_url.clone()));
-        info!(url = config.rpc.simulation_url.as_str(), "simulation RPC enabled");
-        Some(client)
-    } else {
-        info!("simulation RPC disabled (no simulation_url)");
-        None
-    };
-
-    // Verify WSOL ATA exists (required because wrapAndUnwrapSol=false)
+    // Verify WSOL ATA exists
     let wsol_mint = solana_sdk::pubkey::Pubkey::from_str_const(tokens::WSOL_MINT);
     let wsol_ata = spl_associated_token_account::get_associated_token_address(
         &trading_keypair.pubkey(),
@@ -66,18 +57,24 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Initialize BlockhashCache — refreshes every 300ms in background
+    // BlockhashCache — refreshes every 300ms in background
     let blockhash_cache = BlockhashCache::new(rpc_client.clone());
     info!("blockhash cache initialized (refresh every 300ms)");
 
-    // Initialize AltCache — Jito tip accounts excluded from ALT entries
+    // AltCache — Jito tip accounts excluded from ALT entries
     let tip_pubkeys = transaction::jito_tip_pubkeys();
     let alt_cache = AltCache::new(tip_pubkeys);
     info!("ALT cache initialized");
 
     let metis = metis::MetisClient::new(&config.metis.url, config.performance.quote_timeout_ms);
 
-    let jito_client = jito::JitoClient::new(&config.jito.url, &config.jito.uuid);
+    // Multi-region Jito client — sends to ALL endpoints concurrently
+    let jito_client = jito::JitoClient::new(&config.jito.urls, &config.jito.uuid);
+    info!(
+        regions = config.jito.urls.len(),
+        urls = ?config.jito.urls,
+        "Jito multi-region client ready"
+    );
 
     let mut jito_limiter = RateLimiter::new(config.jito.max_bundles_per_second);
 
@@ -86,7 +83,6 @@ async fn main() -> Result<()> {
         min_sol = config.trading.min_amount_sol,
         max_sol = config.trading.max_amount_sol,
         step = config.trading.step_sol,
-        base_fee = config.trading.base_fee_lamports,
         "starting arbitrage scanner"
     );
 
@@ -98,7 +94,6 @@ async fn main() -> Result<()> {
             &jito_client,
             &trading_keypair,
             &rpc_client,
-            sim_rpc_client.as_deref(),
             &mut jito_limiter,
             &blockhash_cache,
             &alt_cache,

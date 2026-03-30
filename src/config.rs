@@ -32,7 +32,8 @@ pub struct TradingConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct JitoConfig {
-    pub url: String,
+    /// Multiple Jito block engine URLs — bundles are sent to ALL concurrently.
+    pub urls: Vec<String>,
     pub uuid: String,
     pub trading_keypair: String,
     pub tip_min_lamports: u64,
@@ -44,10 +45,6 @@ pub struct JitoConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RpcConfig {
     pub url: String,
-    /// RPC for tx simulation before sending to Jito (e.g. eRPC).
-    /// If empty, simulation is skipped.
-    #[serde(default)]
-    pub simulation_url: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
