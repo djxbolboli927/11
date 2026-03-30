@@ -1,0 +1,43 @@
+[metis]
+url = "http://127.0.0.1:8080"
+# کلید باینری برای راه‌اندازی خود متیس (ربات مستقیماً از آن استفاده نمیکند)
+binary_key = "5b945476-f95d-4403-a2b5-156db4ee3212"
+
+[trading]
+min_amount_sol = 0.1
+max_amount_sol = 0.2
+step_sol = 0.00005
+min_profit_lamports = 1000
+# کارمزد پایه شبکه سولانا (لمپرت) — 10000 = 0.00001 SOL
+base_fee_lamports = 10000
+tokens_file = "tokens.txt"
+
+[jito]
+url = "https://frankfurt.mainnet.block-engine.jito.wtf"
+uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
+trading_keypair = "/home/ubuntu/arb/wallet/wallet-new.json"
+# حداقل تیپ طبق داکیومنت جیتو: 1000 لمپرت
+tip_min_lamports = 1000
+tip_max_lamports = 1000000
+tip_profit_percent = 0.50
+# ریت لیمیت ارسال باندل به جیتو: حداکثر 5 در ثانیه
+max_bundles_per_second = 5
+
+[rpc]
+url = "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok"
+# RPC برای شبیه‌سازی تراکنش قبل از ارسال به جیتو (eRPC)
+# اگر خالی باشه شبیه‌سازی انجام نمیشه
+simulation_url = "https://edge.erpc.global?api-key=3e18191a-c008-48ae-ae1a-d694e58f6878"
+
+[yellowstone_grpc]
+# برای راه‌اندازی متیس باینری استفاده میشه
+endpoint = "https://grpc.fra.shyft.to"
+x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
+
+[performance]
+threads = 4
+quote_timeout_ms = 500
+# CU limit بر اساس تعداد هاپ: [2 hops, 3 hops, 4 hops, 5 hops, 6 hops]
+# اگه تعداد هاپ بیشتر از طول آرایه بشه، آخرین مقدار استفاده میشه
+# هر هاپ حدود ۸۰-۱۵۰ هزار CU مصرف میکنه (بسته به AMM)
+cu_limits = [300000, 400000, 500000, 600000, 700000]
