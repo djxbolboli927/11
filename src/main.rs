@@ -1,4 +1,6 @@
+mod alt_cache;
 mod arbitrage;
+mod blockhash_cache;
 mod config;
 mod jito;
 mod metis;
@@ -13,11 +15,12 @@ use solana_sdk::signer::Signer;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use alt_cache::AltCache;
+use blockhash_cache::BlockhashCache;
 use rate_limiter::RateLimiter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging — always filter noisy crate debug logs
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::new(
@@ -26,25 +29,17 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Load config
     let config = config::Config::load("config.toml")?;
     info!("config loaded");
 
-    // Load tokens
     let token_mints = tokens::load_tokens(&config.trading.tokens_file)?;
     info!(count = token_mints.len(), "tokens loaded");
 
-    // Load trading keypair
     let trading_keypair = wallet::read_keypair(&config.jito.trading_keypair)?;
-    info!(
-        trading_wallet = %trading_keypair.pubkey(),
-        "keypair loaded"
-    );
+    info!(trading_wallet = %trading_keypair.pubkey(), "keypair loaded");
 
-    // Create main RPC client (for blockhash, ALT fetch)
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
 
-    // Create simulation RPC client (eRPC — for simulateTransaction before Jito)
     let sim_rpc_client = if !config.rpc.simulation_url.is_empty() {
         let client = Arc::new(RpcClient::new(config.rpc.simulation_url.clone()));
         info!(url = config.rpc.simulation_url.as_str(), "simulation RPC enabled");
@@ -71,16 +66,21 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Create Metis client
+    // Initialize BlockhashCache — refreshes every 300ms in background
+    let blockhash_cache = BlockhashCache::new(rpc_client.clone());
+    info!("blockhash cache initialized (refresh every 300ms)");
+
+    // Initialize AltCache — Jito tip accounts excluded from ALT entries
+    let tip_pubkeys = transaction::jito_tip_pubkeys();
+    let alt_cache = AltCache::new(tip_pubkeys);
+    info!("ALT cache initialized");
+
     let metis = metis::MetisClient::new(&config.metis.url, config.performance.quote_timeout_ms);
 
-    // Create Jito JSON-RPC client with UUID auth
     let jito_client = jito::JitoClient::new(&config.jito.url, &config.jito.uuid);
 
-    // Jito rate limiter: max N bundles per second, drop if exceeded (no queue)
     let mut jito_limiter = RateLimiter::new(config.jito.max_bundles_per_second);
 
-    // Main loop — scan ALL tokens at each amount step
     info!(
         tokens = token_mints.len(),
         min_sol = config.trading.min_amount_sol,
@@ -100,6 +100,8 @@ async fn main() -> Result<()> {
             &rpc_client,
             sim_rpc_client.as_deref(),
             &mut jito_limiter,
+            &blockhash_cache,
+            &alt_cache,
         )
         .await
         {

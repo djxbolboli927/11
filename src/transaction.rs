@@ -14,6 +14,7 @@ use solana_sdk::{
 };
 use std::str::FromStr;
 
+use crate::alt_cache::AltCache;
 use crate::metis::{InstructionData, SwapInstructionsResponse};
 
 /// Jito tip account addresses — pick one at random for each bundle.
@@ -28,6 +29,14 @@ const JITO_TIP_ACCOUNTS: &[&str] = &[
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
+
+/// Return Jito tip account pubkeys (used by AltCache to filter them out).
+pub fn jito_tip_pubkeys() -> Vec<Pubkey> {
+    JITO_TIP_ACCOUNTS
+        .iter()
+        .filter_map(|a| Pubkey::from_str(a).ok())
+        .collect()
+}
 
 /// Convert a Metis instruction into a Solana SDK Instruction.
 fn to_sdk_instruction(ix: &InstructionData) -> Result<Instruction> {
@@ -57,7 +66,6 @@ fn to_sdk_instruction(ix: &InstructionData) -> Result<Instruction> {
 }
 
 /// Calculate the Jito tip amount.
-/// Per Jito docs: minimum tip is 1000 lamports for bundles.
 pub fn calculate_tip(
     profit_lamports: u64,
     tip_percent: f64,
@@ -70,37 +78,29 @@ pub fn calculate_tip(
 
 /// Build a versioned transaction with exactly 3 instructions:
 ///
-/// #1 - Compute Budget: SetComputeUnitLimit (manual, based on hop count from config)
-/// #2 - Jupiter Aggregator V6: route/route_v2 (single instruction for entire circular arb)
+/// #1 - Compute Budget: SetComputeUnitLimit
+/// #2 - Jupiter Aggregator: route/route_v2 (entire circular arb)
 /// #3 - System Program: Transfer (Jito tip, MUST be last)
 ///
-/// The merged route handles all swap hops internally (e.g. WSOL→USDC→hyUSD→WSOL).
-/// Setup/cleanup instructions are NOT needed because:
-/// - useSharedAccounts=false in circular arb mode
-/// - WSOL ATA pre-exists (verified at startup)
-///
-/// CU limit is set manually (not via Metis dynamicComputeUnitLimit) to avoid
-/// an extra RPC simulation call that adds latency.
-///
-/// Tip account is NEVER placed in ALT — Jito requires direct write-lock visibility.
+/// Uses AltCache for ALT lookups (0ns on cache hit vs ~5ms RPC call).
+/// Uses pre-cached blockhash (passed in, ~100ns read vs ~5ms RPC call).
 pub fn build_arb_transaction(
     swap_ixs: &SwapInstructionsResponse,
     payer: &Keypair,
     tip_lamports: u64,
     cu_limit: u32,
     recent_blockhash: Hash,
+    alt_cache: &AltCache,
     rpc_client: &RpcClient,
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
-    // #1 — SetComputeUnitLimit built manually from hop count (config-driven).
-    // dynamicComputeUnitLimit=false in Metis, so we don't rely on Metis for CU.
-    // This avoids an extra RPC simulation call that Metis would make.
+    // #1 — SetComputeUnitLimit
     let cu_limit_ix = Instruction {
         program_id: Pubkey::from_str("ComputeBudget111111111111111111111111111111")?,
         accounts: vec![],
         data: {
-            let mut data = vec![0x02]; // SetComputeUnitLimit discriminator
+            let mut data = vec![0x02];
             data.extend_from_slice(&cu_limit.to_le_bytes());
             data
         },
@@ -110,7 +110,7 @@ pub fn build_arb_transaction(
     // #2 — Single route_v2 for the entire circular swap
     instructions.push(to_sdk_instruction(&swap_ixs.swap_instruction)?);
 
-    // #3 — Jito tip (MUST be last instruction, MUST NOT be in ALT)
+    // #3 — Jito tip (MUST be last, MUST NOT be in ALT)
     let tip_account = {
         let mut rng = rand::thread_rng();
         let addr = JITO_TIP_ACCOUNTS.choose(&mut rng).unwrap();
@@ -123,13 +123,7 @@ pub fn build_arb_transaction(
         tip_lamports,
     ));
 
-    // Collect Jito tip account pubkeys to exclude from ALT resolution
-    let tip_pubkeys: Vec<Pubkey> = JITO_TIP_ACCOUNTS
-        .iter()
-        .filter_map(|a| Pubkey::from_str(a).ok())
-        .collect();
-
-    // Fetch ALTs from Metis response
+    // Fetch ALTs via cache (instant on hit, RPC on first miss only)
     let mut alt_addresses: Vec<Pubkey> = Vec::new();
     for addr in &swap_ixs.address_lookup_table_addresses {
         let pubkey = Pubkey::from_str(addr)?;
@@ -140,20 +134,7 @@ pub fn build_arb_transaction(
 
     let mut address_lookup_tables: Vec<AddressLookupTableAccount> = Vec::new();
     for alt_pubkey in &alt_addresses {
-        let raw_account = rpc_client
-            .get_account(alt_pubkey)
-            .with_context(|| format!("failed to fetch ALT {}", alt_pubkey))?;
-
-        let mut addresses = deserialize_alt_addresses(&raw_account.data)?;
-
-        // Remove Jito tip accounts from ALT entries to prevent them
-        // being compressed into ALT references (Jito needs direct write-lock)
-        addresses.retain(|addr| !tip_pubkeys.contains(addr));
-
-        let alt_account = AddressLookupTableAccount {
-            key: *alt_pubkey,
-            addresses,
-        };
+        let alt_account = alt_cache.get_or_fetch(alt_pubkey, rpc_client)?;
         address_lookup_tables.push(alt_account);
     }
 

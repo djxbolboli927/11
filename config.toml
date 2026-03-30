@@ -6,7 +6,7 @@ binary_key = "5b945476-f95d-4403-a2b5-156db4ee3212"
 [trading]
 min_amount_sol = 0.1
 max_amount_sol = 0.2
-step_sol = 0.00005
+step_sol = 0.01
 min_profit_lamports = 1000
 # کارمزد پایه شبکه سولانا (لمپرت) — 10000 = 0.00001 SOL
 base_fee_lamports = 10000
