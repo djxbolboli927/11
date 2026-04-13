@@ -8,7 +8,7 @@ use crate::alt_cache::AltCache;
 use crate::blockhash_cache::BlockhashCache;
 use crate::config::Config;
 use crate::jito::JitoClient;
-use crate::metis::{MetisClient, QuoteResponse};
+use crate::metis::{MetisClient, SwapInstructionsResponse};
 use crate::rate_limiter::RateLimiter;
 use crate::tokens::WSOL_MINT;
 use crate::transaction;
@@ -24,16 +24,22 @@ fn lookup_cu_limit(hop_count: usize, cu_limits: &[u32]) -> u32 {
     cu_limits[clamped]
 }
 
+/// A profitable opportunity with PRE-FETCHED swap instructions.
+/// By the time we build the tx, no more Metis calls are needed.
 struct Opportunity {
     token_mint: String,
     amount: u64,
     output_wsol: u64,
     tip_lamports: u64,
     net_profit: u64,
-    merged_quote: QuoteResponse,
+    swap_ixs: SwapInstructionsResponse,
     hop_count: usize,
+    cu_limit: u32,
 }
 
+/// Check a single (amount, token) pair for profitability.
+/// If profitable, ALSO fetch swap-instructions in the same concurrent task.
+/// This moves the 3rd Metis call OUT of the critical path.
 async fn check_opportunity(
     metis: &MetisClient,
     token_mint: &str,
@@ -43,10 +49,14 @@ async fn check_opportunity(
     tip_min: u64,
     tip_max: u64,
     min_profit: u64,
+    user_pubkey: &str,
+    cu_limits: &[u32],
 ) -> Option<Opportunity> {
+    // Leg 1: WSOL → Token
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
 
+    // Leg 2: Token → WSOL (input = output of leg 1)
     let quote2 = metis.get_quote(token_mint, WSOL_MINT, token_amount).await.ok()?;
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
@@ -69,19 +79,30 @@ async fn check_opportunity(
         .map(|a| a.len())
         .unwrap_or(2);
 
+    // CRITICAL: fetch swap-instructions HERE (concurrent with other scans).
+    // This removes the 3-5ms gap between "opportunity found" and "tx sent".
+    let swap_ixs = metis
+        .get_swap_instructions(user_pubkey, &merged_quote)
+        .await
+        .ok()?;
+
+    let cu_limit = lookup_cu_limit(hop_count, cu_limits);
+
     Some(Opportunity {
         token_mint: token_mint.to_string(),
         amount,
         output_wsol,
         tip_lamports: tip,
         net_profit: raw_profit - total_costs,
-        merged_quote,
+        swap_ixs,
         hop_count,
+        cu_limit,
     })
 }
 
 /// Scan ALL (amount × token) pairs concurrently.
-/// Execute IMMEDIATELY on the first profitable result — send to ALL Jito endpoints at once.
+/// For each profitable pair, swap-instructions is pre-fetched in the same task.
+/// First ready Opportunity triggers immediate tx build + send — NO more Metis calls.
 pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
@@ -98,6 +119,8 @@ pub async fn scan_all_tokens(
     let step_lamports = (config.trading.step_sol * LAMPORTS_PER_SOL) as u64;
     let base_fee = config.trading.base_fee_lamports;
 
+    let user_pubkey = trading_keypair.pubkey().to_string();
+
     let mut futs = FuturesUnordered::new();
 
     let mut amount = min_lamports;
@@ -112,6 +135,8 @@ pub async fn scan_all_tokens(
                 config.jito.tip_min_lamports,
                 config.jito.tip_max_lamports,
                 config.trading.min_profit_lamports,
+                &user_pubkey,
+                &config.performance.cu_limits,
             ));
         }
         amount += step_lamports;
@@ -128,8 +153,6 @@ pub async fn scan_all_tokens(
             continue;
         }
 
-        let cu_limit = lookup_cu_limit(opp.hop_count, &config.performance.cu_limits);
-
         info!(
             token = opp.token_mint.as_str(),
             input_sol = opp.amount as f64 / LAMPORTS_PER_SOL,
@@ -137,17 +160,15 @@ pub async fn scan_all_tokens(
             profit_lamports = opp.net_profit,
             tip_lamports = opp.tip_lamports,
             hops = opp.hop_count,
-            cu_limit = cu_limit,
-            "PROFITABLE — executing immediately"
+            cu_limit = opp.cu_limit,
+            "PROFITABLE — instructions ready, building tx"
         );
 
         match execute_opportunity(
             &opp,
-            metis,
             jito,
             trading_keypair,
             rpc_client,
-            cu_limit,
             blockhash_cache,
             alt_cache,
         )
@@ -173,32 +194,25 @@ pub async fn scan_all_tokens(
     Ok(())
 }
 
-/// Execute: get swap instructions → build tx → send directly to ALL Jito endpoints (no simulation).
+/// Execute: swap_ixs ALREADY in opp → build tx → send to ALL Jito endpoints.
+/// ZERO Metis calls in this function — no network round-trip to Metis.
 async fn execute_opportunity(
     opp: &Opportunity,
-    metis: &MetisClient,
     jito: &JitoClient,
     trading_keypair: &Keypair,
     rpc_client: &RpcClient,
-    cu_limit: u32,
     blockhash_cache: &BlockhashCache,
     alt_cache: &AltCache,
 ) -> Result<String> {
-    let user_pubkey = trading_keypair.pubkey().to_string();
-
-    let swap_ixs = metis
-        .get_swap_instructions(&user_pubkey, &opp.merged_quote)
-        .await?;
-
     // Cached blockhash — zero RPC calls
     let recent_blockhash = blockhash_cache.get();
 
-    // Build tx with ALT cache
+    // Build tx using pre-fetched swap instructions
     let tx = transaction::build_arb_transaction(
-        &swap_ixs,
+        &opp.swap_ixs,
         trading_keypair,
         opp.tip_lamports,
-        cu_limit,
+        opp.cu_limit,
         recent_blockhash,
         alt_cache,
         rpc_client,
@@ -209,7 +223,7 @@ async fn execute_opportunity(
         anyhow::bail!("tx too large: {} bytes", tx_bytes.len());
     }
 
-    // Send directly to ALL Jito endpoints concurrently — no simulation
+    // Send directly to ALL Jito endpoints concurrently
     let uuid = jito.send_bundle(&tx).await?;
     Ok(uuid)
 }
