@@ -11,17 +11,26 @@ base_fee_lamports = 10000
 tokens_file = "tokens.txt"
 
 [jito]
-# باندل به طور همزمان به همه endpoint ها ارسال می‌شود
+# باندل به طور همزمان به همه 8 ریجن Jito ارسال می‌شود.
+# ریت لیمیت 5/sec روی هر endpoint جداگانه اعمال می‌شود،
+# پس افزودن ریجن هزینه rate-limit ندارد — فقط افزایش پوشش جغرافیایی.
 urls = [
-    "https://frankfurt.mainnet.block-engine.jito.wtf",
     "https://amsterdam.mainnet.block-engine.jito.wtf",
+    "https://dublin.mainnet.block-engine.jito.wtf",
+    "https://frankfurt.mainnet.block-engine.jito.wtf",
+    "https://london.mainnet.block-engine.jito.wtf",
+    "https://ny.mainnet.block-engine.jito.wtf",
+    "https://slc.mainnet.block-engine.jito.wtf",
+    "https://singapore.mainnet.block-engine.jito.wtf",
+    "https://tokyo.mainnet.block-engine.jito.wtf",
 ]
 uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
 trading_keypair = "/home/soluser/wallet.json"
 tip_min_lamports = 1000
 tip_max_lamports = 1000000
 tip_profit_percent = 0.50
-# ریت لیمیت: 5 باندل در ثانیه (per endpoint)
+# ریت لیمیت فقط سمت ما: 5 باندل در ثانیه برای کل loop
+# (هر باندل به ۸ endpoint می‌رود که هر کدام خودش 5/sec limit دارد)
 max_bundles_per_second = 5
 
 [rpc]
@@ -32,7 +41,14 @@ endpoint = "https://grpc.fra.shyft.to"
 x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
 
 [performance]
-threads = 4
+# تعداد worker thread های tokio برای ربات. در سرور 16 هسته‌ای،
+# 3 هسته برای ربات و 13 هسته برای متیس توصیه می‌شود.
+threads = 3
 quote_timeout_ms = 500
 # CU limit بر اساس تعداد هاپ: [2 hops, 3 hops, 4 hops, 5 hops, 6 hops]
 cu_limits = [300000, 400000, 500000, 600000, 700000]
+# Pin کردن هر worker thread به یک هسته مشخص CPU.
+# اگر خالی بگذاری [] هیچ pinning انجام نمی‌شود.
+# نمونه: اگر متیس روی هسته 0-12 و ربات روی هسته 13-15 است:
+#   bot_cpu_cores = [13, 14, 15]
+bot_cpu_cores = [13, 14, 15]

@@ -56,11 +56,17 @@ pub struct YellowstoneGrpcConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PerformanceConfig {
+    /// Number of tokio worker threads (multi-thread runtime).
     pub threads: usize,
     pub quote_timeout_ms: u64,
     /// CU limits per hop count: index 0 = 2 hops, index 1 = 3 hops, etc.
     /// If hops exceed the array, the last value is used.
     pub cu_limits: Vec<u32>,
+    /// Optional CPU affinity for each worker thread.
+    /// If non-empty, worker i is pinned to core `bot_cpu_cores[i % len]`.
+    /// Leave empty `[]` to disable pinning.
+    #[serde(default)]
+    pub bot_cpu_cores: Vec<usize>,
 }
 
 impl Config {

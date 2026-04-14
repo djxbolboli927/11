@@ -12,19 +12,21 @@ mod wallet;
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::signer::Signer;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tracing::{error, info, warn};
 
 use alt_cache::AltCache;
 use blockhash_cache::BlockhashCache;
 use rate_limiter::RateLimiter;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::new(
-                "info,hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,tonic=warn"
+                "info,hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,tonic=warn",
             ),
         )
         .init();
@@ -32,6 +34,50 @@ async fn main() -> Result<()> {
     let config = config::Config::load("config.toml")?;
     info!("config loaded");
 
+    // Build a multi-thread tokio runtime with EXACTLY the number of worker
+    // threads requested in [performance].threads. If bot_cpu_cores is set,
+    // pin each worker thread to a specific core via core_affinity.
+    let worker_threads = config.performance.threads.max(1);
+    let pinned_cores: Vec<usize> = config.performance.bot_cpu_cores.clone();
+    let available_cores = core_affinity::get_core_ids().unwrap_or_default();
+    let next_worker = Arc::new(AtomicUsize::new(0));
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(worker_threads).enable_all();
+    builder.thread_name("arb-worker");
+
+    if !pinned_cores.is_empty() {
+        let cores = pinned_cores.clone();
+        let available = available_cores.clone();
+        let counter = next_worker.clone();
+        builder.on_thread_start(move || {
+            let idx = counter.fetch_add(1, Ordering::SeqCst);
+            let target = cores[idx % cores.len()];
+            if let Some(core_id) = available.iter().find(|c| c.id == target) {
+                let ok = core_affinity::set_for_current(*core_id);
+                if ok {
+                    tracing::info!(worker = idx, core = target, "pinned tokio worker to core");
+                } else {
+                    tracing::warn!(worker = idx, core = target, "failed to pin worker to core");
+                }
+            } else {
+                tracing::warn!(worker = idx, core = target, "requested core not available");
+            }
+        });
+    }
+
+    let runtime = builder.build()?;
+    info!(
+        worker_threads,
+        pinned = !pinned_cores.is_empty(),
+        cores = ?pinned_cores,
+        "tokio runtime built"
+    );
+
+    runtime.block_on(async_main(config))
+}
+
+async fn async_main(config: config::Config) -> Result<()> {
     let token_mints = tokens::load_tokens(&config.trading.tokens_file)?;
     info!(count = token_mints.len(), "tokens loaded");
 

@@ -161,6 +161,13 @@ pub async fn scan_all_tokens(
         amount += step_lamports;
     }
 
+    // PARALLEL EXECUTION: as each profitable opportunity is ready, we IMMEDIATELY
+    // build its tx and kick off the Jito HTTP send (which itself fans out to all
+    // regions concurrently). We do NOT break on the first hit — multiple concurrent
+    // bundles per cycle increase the chance of landing one. A Jito bundle that
+    // reverts on-chain pays no tip, so sending redundant shots is free.
+    let mut send_futs = FuturesUnordered::new();
+
     while let Some(result) = futs.next().await {
         let opp = match result {
             Some(opp) => opp,
@@ -183,66 +190,65 @@ pub async fn scan_all_tokens(
             "PROFITABLE — instructions ready, building tx"
         );
 
-        match execute_opportunity(
-            &opp,
-            jito,
+        // Build the tx synchronously (CPU-bound, ~0.5ms; ALTs served from cache).
+        let recent_blockhash = blockhash_cache.get();
+        let tx = match transaction::build_arb_transaction(
+            &opp.swap_ixs,
             trading_keypair,
-            rpc_client,
-            blockhash_cache,
+            opp.tip_lamports,
+            opp.cu_limit,
+            recent_blockhash,
             alt_cache,
-        )
-        .await
-        {
-            Ok(uuid) => {
-                info!(
-                    uuid = %uuid,
-                    token = opp.token_mint.as_str(),
-                    profit = opp.net_profit,
-                    "bundle sent to all Jito endpoints"
-                );
-            }
+            rpc_client,
+        ) {
+            Ok(tx) => tx,
             Err(e) => {
-                warn!(error = %e, token = opp.token_mint.as_str(), "execution failed");
+                warn!(error = %e, token = opp.token_mint.as_str(), "tx build failed");
+                continue;
+            }
+        };
+
+        // Tx size check here so we don't consume a Jito send for a doomed tx.
+        match bincode::serialize(&tx) {
+            Ok(bytes) if bytes.len() > 1232 => {
+                warn!(
+                    token = opp.token_mint.as_str(),
+                    bytes = bytes.len(),
+                    "tx too large, dropping"
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, token = opp.token_mint.as_str(), "tx serialize failed");
+                continue;
             }
         }
 
-        // Break after first execution — restart scan with fresh quotes.
-        break;
+        // Fire the send concurrently. The tx is moved into the future; the closure
+        // captures &jito and opp metadata for logging at completion.
+        let token_for_log = opp.token_mint.clone();
+        let profit_for_log = opp.net_profit;
+        send_futs.push(async move {
+            let res = jito.send_bundle(&tx).await;
+            (token_for_log, profit_for_log, res)
+        });
+    }
+
+    // Drain all in-flight sends; log each outcome. We intentionally don't break:
+    // every profitable opportunity of this cycle gets its own shot.
+    while let Some((token, profit, res)) = send_futs.next().await {
+        match res {
+            Ok(uuid) => info!(
+                uuid = %uuid,
+                token = token.as_str(),
+                profit = profit,
+                "bundle sent to all Jito endpoints"
+            ),
+            Err(e) => warn!(error = %e, token = token.as_str(), "execution failed"),
+        }
     }
 
     Ok(())
 }
 
-/// Execute: swap_ixs ALREADY in opp → build tx → send to ALL Jito endpoints.
-/// ZERO Metis calls in this function — no network round-trip to Metis.
-async fn execute_opportunity(
-    opp: &Opportunity,
-    jito: &JitoClient,
-    trading_keypair: &Keypair,
-    rpc_client: &RpcClient,
-    blockhash_cache: &BlockhashCache,
-    alt_cache: &AltCache,
-) -> Result<String> {
-    // Cached blockhash — zero RPC calls
-    let recent_blockhash = blockhash_cache.get();
-
-    // Build tx using pre-fetched swap instructions
-    let tx = transaction::build_arb_transaction(
-        &opp.swap_ixs,
-        trading_keypair,
-        opp.tip_lamports,
-        opp.cu_limit,
-        recent_blockhash,
-        alt_cache,
-        rpc_client,
-    )?;
-
-    let tx_bytes = bincode::serialize(&tx)?;
-    if tx_bytes.len() > 1232 {
-        anyhow::bail!("tx too large: {} bytes", tx_bytes.len());
-    }
-
-    // Send directly to ALL Jito endpoints concurrently
-    let uuid = jito.send_bundle(&tx).await?;
-    Ok(uuid)
-}

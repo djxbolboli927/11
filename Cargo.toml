@@ -36,6 +36,7 @@ futures = "0.3"
 rand = "0.8"
 anyhow = "1"
 thiserror = "1"
+core_affinity = "0.8"
 
 [build-dependencies]
 tonic-build = "0.12"
