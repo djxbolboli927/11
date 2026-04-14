@@ -72,7 +72,26 @@ async fn check_opportunity(
         return None;
     }
 
-    let merged_quote = MetisClient::merge_quotes(&quote1, &quote2).ok()?;
+    // On-chain break-even floor. The tx reverts ONLY if the final output would
+    // be less than input + tip + base_fee (i.e. an actual net loss). Any positive
+    // slippage — or even a shrunk-but-still-profitable outcome — still lands.
+    // This is what competing arb bots do; locking threshold to quote2.out_amount
+    // (zero negative slippage) was the root cause of frequent reverts.
+    let min_acceptable_out = amount + total_costs;
+
+    let merged_quote =
+        MetisClient::merge_quotes(&quote1, &quote2, min_acceptable_out).ok()?;
+
+    // Sanity check: if the Metis binary is older than v7.0.5, it ignores
+    // instructionVersion=V2 and still emits legacy `route`. Log (don't abort)
+    // so a stale server is visible in production traces.
+    if merged_quote.instruction_version.as_deref() != Some("V2") {
+        debug!(
+            token = token_mint,
+            got = ?merged_quote.instruction_version,
+            "quote did NOT report instructionVersion=V2 — Metis binary may be outdated"
+        );
+    }
     let hop_count = merged_quote
         .route_plan
         .as_array()

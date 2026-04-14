@@ -24,6 +24,11 @@ pub struct QuoteResponse {
     pub route_plan: serde_json::Value,
     #[serde(default)]
     pub context_slot: Option<u64>,
+    /// Returned by Metis v7.0.5+ when the /quote call uses `instructionVersion=V2`.
+    /// Will be `Some("V2")` on an up-to-date server, `None` on older binaries
+    /// (in which case the bot silently falls back to the legacy `route` instruction).
+    #[serde(default)]
+    pub instruction_version: Option<String>,
     /// Catch-all for extra fields returned by Metis.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -90,12 +95,17 @@ impl MetisClient {
     /// Get a quote from Metis.
     ///
     /// Parameters:
-    /// - slippageBps=0: zero slippage, tx reverts if exact amount not met
+    /// - slippageBps=0: zero slippage at quote layer; the real on-chain floor
+    ///   is set via `other_amount_threshold` in `merge_quotes`.
     /// - onlyDirectRoutes=false: allow multi-hop for better routes
     /// - maxAccounts=50: leave room for tip account in final tx
     /// - forJitoBundle=true: excludes Jito-incompatible DEXes
     /// - swapMode=ExactIn: exact input amount
     /// - restrictIntermediateTokens=false: allow all intermediate tokens
+    /// - instructionVersion=V2: tells Metis to produce a route_plan that uses
+    ///   `bps: 10000` (instead of legacy `percent: 100`). When this QuoteResponse
+    ///   is later sent to /swap-instructions, Metis builds a `route_v2` instruction
+    ///   which costs fewer compute units and is what competing arb bots use.
     pub async fn get_quote(
         &self,
         input_mint: &str,
@@ -109,7 +119,8 @@ impl MetisClient {
              &maxAccounts=50\
              &swapMode=ExactIn\
              &forJitoBundle=true\
-             &restrictIntermediateTokens=false",
+             &restrictIntermediateTokens=false\
+             &instructionVersion=V2",
             self.base_url, input_mint, output_mint, amount_lamports
         );
 
@@ -138,7 +149,18 @@ impl MetisClient {
     ///
     /// The combined quote is then sent to /swap-instructions to get
     /// a SINGLE route_v2 instruction that handles the entire circular arb.
-    pub fn merge_quotes(quote1: &QuoteResponse, quote2: &QuoteResponse) -> Result<QuoteResponse> {
+    ///
+    /// `min_acceptable_out` is the minimum output lamports we will tolerate
+    /// on-chain. It becomes the `other_amount_threshold` of the merged quote
+    /// and is embedded as `slippage_bps` floor in the route_v2 instruction.
+    /// Setting it to `amount + tip + base_fee` means the tx reverts ONLY if
+    /// the trade would lose lamports — any price jitter that still leaves us
+    /// at break-even or better will land on-chain (even if profit shrinks).
+    pub fn merge_quotes(
+        quote1: &QuoteResponse,
+        quote2: &QuoteResponse,
+        min_acceptable_out: u64,
+    ) -> Result<QuoteResponse> {
         // Concatenate routePlans: q1.routePlan + q2.routePlan
         let route_plan1 = quote1
             .route_plan
@@ -156,17 +178,19 @@ impl MetisClient {
         // - inputMint, inAmount from quote1 (WSOL input)
         // - outputMint, outAmount from quote2 (WSOL output)
         // - routePlan = concatenated
-        // - otherAmountThreshold = quote2.outAmount (slippage=0)
+        // - otherAmountThreshold = min_acceptable_out (break-even floor, NOT quote2.outAmount)
+        // - instructionVersion propagates from quote1 (must be "V2" for route_v2)
         Ok(QuoteResponse {
             input_mint: quote1.input_mint.clone(),
             in_amount: quote1.in_amount.clone(),
             output_mint: quote2.output_mint.clone(),
             out_amount: quote2.out_amount.clone(),
-            other_amount_threshold: quote2.out_amount.clone(),
+            other_amount_threshold: min_acceptable_out.to_string(),
             swap_mode: quote1.swap_mode.clone(),
             price_impact_pct: "0".to_string(),
             route_plan: serde_json::Value::Array(combined_route_plan),
             context_slot: quote2.context_slot,
+            instruction_version: quote1.instruction_version.clone(),
             extra: quote1.extra.clone(),
         })
     }
