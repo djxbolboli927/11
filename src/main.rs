@@ -114,8 +114,9 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let metis = metis::MetisClient::new(&config.metis.url, config.performance.quote_timeout_ms);
 
-    // Multi-region Jito client — sends to ALL endpoints concurrently
-    let jito_client = jito::JitoClient::new(&config.jito.urls, &config.jito.uuid);
+    // Multi-region Jito client — sends to ALL endpoints concurrently.
+    // Wrapped in Arc so send tasks can be tokio::spawn'd with 'static lifetime.
+    let jito_client = Arc::new(jito::JitoClient::new(&config.jito.urls, &config.jito.uuid));
     info!(
         regions = config.jito.urls.len(),
         urls = ?config.jito.urls,

@@ -2,6 +2,7 @@ use anyhow::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{signature::Keypair, signer::Signer};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::alt_cache::AltCache;
@@ -126,7 +127,7 @@ pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
     config: &Config,
-    jito: &JitoClient,
+    jito: &Arc<JitoClient>,
     trading_keypair: &Keypair,
     rpc_client: &RpcClient,
     jito_limiter: &mut RateLimiter,
@@ -162,12 +163,13 @@ pub async fn scan_all_tokens(
     }
 
     // PARALLEL EXECUTION: as each profitable opportunity is ready, we IMMEDIATELY
-    // build its tx and kick off the Jito HTTP send (which itself fans out to all
-    // regions concurrently). We do NOT break on the first hit — multiple concurrent
-    // bundles per cycle increase the chance of landing one. A Jito bundle that
-    // reverts on-chain pays no tip, so sending redundant shots is free.
-    let mut send_futs = FuturesUnordered::new();
-
+    // build its tx AND kick off the Jito HTTP send on the tokio runtime via
+    // `tokio::spawn`. UNLIKE `FuturesUnordered::push` (which only queues a future
+    // and never polls it until the owner calls `.next().await`), `tokio::spawn`
+    // starts executing the future on a worker thread the moment it is spawned.
+    // That is crucial here: we do NOT want to wait for all quote tasks to finish
+    // before the FIRST send hits the wire. Every ~100ms of delay against a fresh
+    // quote is enough for the pool to move and the tx to revert on slippage.
     while let Some(result) = futs.next().await {
         let opp = match result {
             Some(opp) => opp,
@@ -225,28 +227,27 @@ pub async fn scan_all_tokens(
             }
         }
 
-        // Fire the send concurrently. The tx is moved into the future; the closure
-        // captures &jito and opp metadata for logging at completion.
+        // Fire-and-forget: spawn the send on the runtime so it starts IMMEDIATELY,
+        // while this loop keeps draining more opportunities from `futs`. Jito
+        // bundles that revert on-chain pay no tip, so redundant shots are free.
+        let jito_clone = jito.clone();
         let token_for_log = opp.token_mint.clone();
         let profit_for_log = opp.net_profit;
-        send_futs.push(async move {
-            let res = jito.send_bundle(&tx).await;
-            (token_for_log, profit_for_log, res)
+        tokio::spawn(async move {
+            match jito_clone.send_bundle(&tx).await {
+                Ok(uuid) => info!(
+                    uuid = %uuid,
+                    token = token_for_log.as_str(),
+                    profit = profit_for_log,
+                    "bundle sent to all Jito endpoints"
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    token = token_for_log.as_str(),
+                    "execution failed"
+                ),
+            }
         });
-    }
-
-    // Drain all in-flight sends; log each outcome. We intentionally don't break:
-    // every profitable opportunity of this cycle gets its own shot.
-    while let Some((token, profit, res)) = send_futs.next().await {
-        match res {
-            Ok(uuid) => info!(
-                uuid = %uuid,
-                token = token.as_str(),
-                profit = profit,
-                "bundle sent to all Jito endpoints"
-            ),
-            Err(e) => warn!(error = %e, token = token.as_str(), "execution failed"),
-        }
     }
 
     Ok(())
