@@ -122,6 +122,17 @@ impl Simulator {
         // Collect every pubkey referenced by the tx (static keys + ALT entries).
         let accounts = collect_tx_accounts(tx, alts);
 
+        // CRITICAL: Yellowstone's account subscription only streams UPDATES,
+        // not an initial snapshot. Any DEX pool that hasn't traded since
+        // bot startup is missing from the cache, and LiteSVM then rejects
+        // the tx with InvalidAccountData (DEX side) or Jupiter custom 6025
+        // (token-account side). Lazy-fetch every referenced account that
+        // is not yet in cache via a single getMultipleAccounts call. After
+        // the first sim that touches a given pool, future sims for that
+        // pool hit the cache (and Yellowstone keeps the cached entry fresh
+        // as updates flow in).
+        cache.batch_fetch_missing(&accounts);
+
         let mut svm = self.svm.lock().unwrap();
 
         // CRITICAL: the ALT accounts themselves must exist in LiteSVM state,

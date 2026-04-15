@@ -86,6 +86,46 @@ impl AccountCache {
         }
     }
 
+    /// Batch-fetch every pubkey not already in the cache via a single
+    /// `getMultipleAccounts` RPC call. Used by the simulator before each tx
+    /// because Yellowstone's account subscription only streams UPDATES (no
+    /// initial snapshot), so a pool that hasn't traded since startup will be
+    /// missing from the cache and LiteSVM will reject the tx with errors
+    /// like `InvalidAccountData` or Jupiter custom 6025 (`InvalidTokenAccount`).
+    /// `getMultipleAccounts` accepts up to 100 pubkeys per call; we chunk
+    /// defensively. Accounts that don't exist on-chain are silently skipped.
+    pub fn batch_fetch_missing(&self, pubkeys: &[Pubkey]) {
+        let missing: Vec<Pubkey> = pubkeys
+            .iter()
+            .filter(|pk| self.inner.get(pk).is_none())
+            .copied()
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        for chunk in missing.chunks(100) {
+            match self.rpc.get_multiple_accounts(chunk) {
+                Ok(results) => {
+                    for (pk, opt) in chunk.iter().zip(results.into_iter()) {
+                        if let Some(acct) = opt {
+                            let account = Account {
+                                lamports: acct.lamports,
+                                data: acct.data,
+                                owner: acct.owner,
+                                executable: acct.executable,
+                                rent_epoch: acct.rent_epoch,
+                            };
+                            self.inner.insert(*pk, account);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, n = chunk.len(), "batch_fetch RPC failed");
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len()
     }
