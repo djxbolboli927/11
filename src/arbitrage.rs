@@ -231,7 +231,7 @@ pub async fn scan_all_tokens(
             }
         }
 
-        // ── LiteSVM pre-flight gate ──
+        // -- LiteSVM pre-flight gate --
         // If simulation is wired in, run the tx locally against the hot
         // Yellowstone-fed account cache. This catches CU overruns, CPI
         // constraint failures, and AMM math divergence between Metis's

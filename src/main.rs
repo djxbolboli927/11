@@ -128,7 +128,7 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let mut jito_limiter = RateLimiter::new(config.jito.max_bundles_per_second);
 
-    // ── LiteSVM pre-flight simulation (optional, enabled via [simulation]) ──
+    // -- LiteSVM pre-flight simulation (optional, enabled via [simulation]) --
     // Spins up an AccountCache backed by the same Yellowstone gRPC stream
     // Metis reads from, plus a Simulator that loads every DEX .so at startup.
     // On every profitable opportunity, scan_all_tokens will ask the Simulator
