@@ -108,6 +108,26 @@ impl Simulator {
 
         let mut svm = self.svm.lock().unwrap();
 
+        // CRITICAL: the ALT accounts themselves must exist in LiteSVM state,
+        // otherwise `simulate_transaction` fails at sanitization time while
+        // resolving V0 lookup-table indexes (the error we saw as
+        // "Transaction sanitization failed"). Fetch the raw on-chain ALT
+        // account -- unfiltered, exactly as Solana runtime sees it -- via the
+        // AccountCache: cache hit if Yellowstone already has it, otherwise a
+        // one-time RPC fetch that is then memoized.
+        for alt in alts {
+            match cache.get_or_fetch(&alt.key) {
+                Ok(raw) => {
+                    if let Err(e) = svm.set_account(alt.key, raw) {
+                        warn!(alt = %alt.key, error = ?e, "set_account(ALT) failed");
+                    }
+                }
+                Err(e) => {
+                    warn!(alt = %alt.key, error = %e, "ALT raw fetch failed");
+                }
+            }
+        }
+
         // Inject whatever state we have. Accounts we don't know about keep
         // LiteSVM's default (empty). That is usually fine for read-only
         // sysvars / token program state we already preloaded.
