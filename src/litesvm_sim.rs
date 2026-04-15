@@ -28,6 +28,7 @@ use solana_sdk::{
 };
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::account_cache::AccountCache;
@@ -57,19 +58,38 @@ impl Simulator {
             .with_blockhash_check(false)
             .with_spl_programs();
 
-        // CRITICAL: advance LiteSVM's Clock past every mainnet ALT's
-        // `last_extended_slot`. The ALT lookup logic in
-        // solana-address-lookup-table-interface only exposes addresses up to
-        // `last_extended_slot_start_index` if `current_slot <=
-        // last_extended_slot` (see state.rs:173-177). LiteSVM defaults to
-        // slot 0, which is smaller than any real mainnet ALT slot
-        // (currently ~3.6e8), so sanitization fails with
-        // InvalidLookupIndex for every index pointing at entries added
-        // after the ALT was first created. Warp to a slot that's
-        // guaranteed to be past `last_extended_slot` for any active ALT.
+        // CRITICAL: realistic Clock is required for two independent reasons.
+        //
+        // 1. ALT validation: solana-address-lookup-table-interface only
+        //    exposes addresses up to `last_extended_slot_start_index` when
+        //    `current_slot <= last_extended_slot` (see state.rs:173-177).
+        //    LiteSVM defaults to slot 0, smaller than any active mainnet
+        //    ALT slot (~3.6e8), so V0 sanitization fails with
+        //    InvalidLookupIndex for any index pointing past the ALT's
+        //    creation point. Need slot >> last_extended_slot.
+        //
+        // 2. Oracle / TWAP / pool-staleness checks: many DEXes (Tessera,
+        //    GoonFi, etc.) compare `clock.unix_timestamp` against an
+        //    on-chain `last_update_ts` and refuse the swap if the gap is
+        //    too large or negative. LiteSVM's default unix_timestamp is 0
+        //    (= 1970), so EVERY pool looks "infinitely stale" and the
+        //    program returns its proprietary error code (0xffff for
+        //    Tessera, 0x15 for GoonFi -- both observed in production logs
+        //    while the cache and pool state were already correct).
+        //
+        // Set unix_timestamp to wall-clock now (cheap, no RPC), and slot
+        // to a value past every plausible ALT extension. We refresh
+        // unix_timestamp on every simulate() call so the bot doesn't drift
+        // out of an oracle's freshness window during long runs.
         const FUTURE_SLOT: u64 = 1_000_000_000_000;
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         let mut clock = svm.get_sysvar::<Clock>();
         clock.slot = FUTURE_SLOT;
+        clock.unix_timestamp = now_ts;
+        clock.epoch_start_timestamp = now_ts;
         svm.set_sysvar::<Clock>(&clock);
 
         let mut loaded = 0usize;
@@ -134,6 +154,21 @@ impl Simulator {
         cache.batch_fetch_missing(&accounts);
 
         let mut svm = self.svm.lock().unwrap();
+
+        // Bump Clock.unix_timestamp to wall-clock now BEFORE injecting
+        // anything else. Oracles inside DEX programs read this to gauge
+        // pool freshness; if we leave it at the value set during startup,
+        // after a few minutes pools start failing freshness checks and
+        // emitting opaque custom errors. SystemTime::now() is sub-microsecond.
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut clock = svm.get_sysvar::<Clock>();
+        if clock.unix_timestamp != now_ts {
+            clock.unix_timestamp = now_ts;
+            svm.set_sysvar::<Clock>(&clock);
+        }
 
         // CRITICAL: the ALT accounts themselves must exist in LiteSVM state,
         // otherwise `simulate_transaction` fails at sanitization time while
