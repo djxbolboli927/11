@@ -12,6 +12,12 @@
 /// are labelled TODO -- the bot will simply skip sim for routes that touch
 /// an un-mapped program until the mapping is filled in.
 pub const PROGRAMS: &[(&str, &str)] = &[
+    // --- Aggregator (top-level program the swap_instruction targets) ---
+    // Metis is a Jupiter fork: its swap_instruction carries Jupiter v6's
+    // program_id. Without this loaded as executable, LiteSVM rejects the tx
+    // with "Program account JUP6Lkb... is not executable".
+    ("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "Jupiter_Aggregator_v6.so"),
+
     // --- high confidence ---
     ("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG", "Meteora_DAMM_v2.so"),
     ("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", "Raydium_Concentrated_Liquidity.so"),
