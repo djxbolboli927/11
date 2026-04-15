@@ -163,6 +163,19 @@ impl Simulator {
         for pk in &accounts {
             match cache.get(pk) {
                 Some(acct) => {
+                    // Skip executable accounts. Two reasons:
+                    //   1. Our DEX programs (and Jupiter v6) were already
+                    //      loaded via `add_program_from_file` at startup,
+                    //      which sets up the program-data side correctly.
+                    //      Overwriting with `set_account` clobbers that
+                    //      and the runtime then complains that the matching
+                    //      program-data account is missing
+                    //      (`Instruction(MissingAccount)` -> Custom(65535)).
+                    //   2. Builtins (System, Token, ComputeBudget, ...) are
+                    //      pre-registered by LiteSVM and must not be touched.
+                    if acct.executable {
+                        continue;
+                    }
                     if let Err(e) = svm.set_account(*pk, acct) {
                         warn!(pubkey = %pk, error = ?e, "set_account failed");
                     } else {
