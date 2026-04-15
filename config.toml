@@ -53,3 +53,16 @@ cu_limits = [300000, 400000, 500000, 600000, 700000]
 #   bot_cpu_cores = [13, 14, 15]
 # موقتاً غیرفعال برای A/B تست (به درخواست کاربر): بررسی اینکه pinning باعث تأخیر می‌شد یا نه.
 bot_cpu_cores = []
+
+[simulation]
+# LiteSVM pre-flight: قبل از ارسال هر باندل به Jito، همان tx را محلی روی
+# بایت‌کد واقعی DEXها اجرا می‌کنیم. اگر revert شد یا سود نداشت، ارسال لغو
+# می‌شود و base fee ذخیره می‌شود.
+#
+# منبع داده‌ی sim = همان gRPC شیفت که Metis هم می‌خواند (یک اتصال جدا،
+# هیچ سربار متقابلی با Metis ندارد).
+enabled = true
+so_dir = "/home/soluser/m/so"
+# fail_closed=true  (امن)  : اگر sim خطا داد ⇒ ارسال نکن
+# fail_closed=false (رول‌اوت) : اگر sim خطا داد ⇒ فقط log بزن و بفرست
+fail_closed = true

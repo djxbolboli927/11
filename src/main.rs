@@ -1,9 +1,12 @@
+mod account_cache;
 mod alt_cache;
 mod arbitrage;
 mod blockhash_cache;
 mod config;
 mod jito;
+mod litesvm_sim;
 mod metis;
+mod program_registry;
 mod rate_limiter;
 mod tokens;
 mod transaction;
@@ -125,11 +128,54 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let mut jito_limiter = RateLimiter::new(config.jito.max_bundles_per_second);
 
+    // ── LiteSVM pre-flight simulation (optional, enabled via [simulation]) ──
+    // Spins up an AccountCache backed by the same Yellowstone gRPC stream
+    // Metis reads from, plus a Simulator that loads every DEX .so at startup.
+    // On every profitable opportunity, scan_all_tokens will ask the Simulator
+    // to run the tx locally before paying for a Jito base fee.
+    let (sim_cache, simulator) = if config.simulation.enabled {
+        let cache = account_cache::AccountCache::new(rpc_client.clone());
+        cache.spawn_subscription(
+            config.yellowstone_grpc.endpoint.clone(),
+            config.yellowstone_grpc.x_token.clone(),
+            program_registry::all_program_ids(),
+            vec![wsol_ata],
+        );
+        info!(
+            endpoint = %config.yellowstone_grpc.endpoint,
+            dex_programs = program_registry::PROGRAMS.len(),
+            "Yellowstone account cache subscribed"
+        );
+
+        // Pre-warm: token mints and the user's WSOL ATA are not streamed via
+        // the DEX-owner filter. Fetch once from RPC so the first sim doesn't
+        // miss them.
+        let mut warm: Vec<solana_sdk::pubkey::Pubkey> = token_mints
+            .iter()
+            .filter_map(|s| solana_sdk::pubkey::Pubkey::try_from(s.as_str()).ok())
+            .collect();
+        warm.push(wsol_mint);
+        warm.push(wsol_ata);
+        cache.prefetch(&warm);
+        info!(warmed = cache.len(), "account cache pre-warmed");
+
+        let sim = litesvm_sim::Simulator::new(
+            &config.simulation.so_dir,
+            wsol_ata,
+            config.simulation.fail_closed,
+        )?;
+        (Some(Arc::new(cache)), Some(Arc::new(sim)))
+    } else {
+        info!("LiteSVM simulation disabled via config");
+        (None, None)
+    };
+
     info!(
         tokens = token_mints.len(),
         min_sol = config.trading.min_amount_sol,
         max_sol = config.trading.max_amount_sol,
         step = config.trading.step_sol,
+        sim = config.simulation.enabled,
         "starting arbitrage scanner"
     );
 
@@ -144,6 +190,8 @@ async fn async_main(config: config::Config) -> Result<()> {
             &mut jito_limiter,
             &blockhash_cache,
             &alt_cache,
+            sim_cache.as_ref(),
+            simulator.as_ref(),
         )
         .await
         {

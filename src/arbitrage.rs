@@ -5,10 +5,12 @@ use solana_sdk::{signature::Keypair, signer::Signer};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::account_cache::AccountCache;
 use crate::alt_cache::AltCache;
 use crate::blockhash_cache::BlockhashCache;
 use crate::config::Config;
 use crate::jito::JitoClient;
+use crate::litesvm_sim::{self, Simulator};
 use crate::metis::{MetisClient, SwapInstructionsResponse};
 use crate::rate_limiter::RateLimiter;
 use crate::tokens::WSOL_MINT;
@@ -133,6 +135,8 @@ pub async fn scan_all_tokens(
     jito_limiter: &mut RateLimiter,
     blockhash_cache: &BlockhashCache,
     alt_cache: &AltCache,
+    sim_cache: Option<&Arc<AccountCache>>,
+    simulator: Option<&Arc<Simulator>>,
 ) -> Result<()> {
     let min_lamports = (config.trading.min_amount_sol * LAMPORTS_PER_SOL) as u64;
     let max_lamports = (config.trading.max_amount_sol * LAMPORTS_PER_SOL) as u64;
@@ -224,6 +228,45 @@ pub async fn scan_all_tokens(
             Err(e) => {
                 warn!(error = %e, token = opp.token_mint.as_str(), "tx serialize failed");
                 continue;
+            }
+        }
+
+        // ── LiteSVM pre-flight gate ──
+        // If simulation is wired in, run the tx locally against the hot
+        // Yellowstone-fed account cache. This catches CU overruns, CPI
+        // constraint failures, and AMM math divergence between Metis's
+        // Rust model and the real on-chain bytecode — all BEFORE we spend
+        // a base fee on Jito. A sim pass doesn't guarantee landing (the
+        // pool can still move before the slot lands) but a sim failure is
+        // a near-certain revert, so dropping them is pure savings.
+        if let (Some(cache), Some(sim)) = (sim_cache, simulator) {
+            let min_acceptable_out = opp.amount + opp.tip_lamports + base_fee;
+            // Resolve ALTs the same way build_arb_transaction did so the
+            // simulator can inject state for every account the tx touches.
+            let alts = match litesvm_sim::resolve_alts(
+                &opp.swap_ixs.address_lookup_table_addresses,
+                alt_cache,
+                rpc_client,
+            ) {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(error = %e, token = opp.token_mint.as_str(), "sim ALT resolve failed");
+                    continue;
+                }
+            };
+            match sim.simulate(&tx, &alts, cache, min_acceptable_out) {
+                Ok(outcome) => {
+                    debug!(
+                        token = opp.token_mint.as_str(),
+                        cu = outcome.compute_units,
+                        wsol_after = outcome.wsol_after,
+                        "sim OK"
+                    );
+                }
+                Err(e) => {
+                    debug!(error = %e, token = opp.token_mint.as_str(), "sim rejected, skipping");
+                    continue;
+                }
             }
         }
 

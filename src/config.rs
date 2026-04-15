@@ -10,6 +10,8 @@ pub struct Config {
     pub rpc: RpcConfig,
     pub yellowstone_grpc: YellowstoneGrpcConfig,
     pub performance: PerformanceConfig,
+    #[serde(default)]
+    pub simulation: SimulationConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -48,10 +50,43 @@ pub struct RpcConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct YellowstoneGrpcConfig {
     pub endpoint: String,
     pub x_token: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SimulationConfig {
+    /// If false, bot sends every profitable tx without any local sim gate
+    /// (pre-LiteSVM behaviour). Default: disabled so legacy configs keep
+    /// working until the operator opts in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory containing the DEX .so binaries listed in `program_registry`.
+    #[serde(default = "default_so_dir")]
+    pub so_dir: String,
+    /// When sim reverts or errors, `fail_closed=true` drops the send (safest);
+    /// `false` logs and forwards to Jito anyway (useful during rollout).
+    #[serde(default = "default_true")]
+    pub fail_closed: bool,
+}
+
+impl Default for SimulationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            so_dir: default_so_dir(),
+            fail_closed: true,
+        }
+    }
+}
+
+fn default_so_dir() -> String {
+    "/home/soluser/m/so".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone)]

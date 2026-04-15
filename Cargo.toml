@@ -38,5 +38,15 @@ anyhow = "1"
 thiserror = "1"
 core_affinity = "0.8"
 
+# Local SVM simulation (pre-flight filter before Jito send)
+litesvm = "0.6"
+solana-account = "2.2"
+dashmap = "6"
+
+# Yellowstone gRPC — live account-state stream (feeds sim cache, same source as Metis)
+# Version 6.1 aligns with solana-sdk ~2.2 used elsewhere in this crate.
+yellowstone-grpc-client = "6.1"
+yellowstone-grpc-proto = "6.1"
+
 [build-dependencies]
 tonic-build = "0.12"
