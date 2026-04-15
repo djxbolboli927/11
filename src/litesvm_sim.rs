@@ -21,6 +21,7 @@ use litesvm::LiteSVM;
 use solana_account::ReadableAccount;
 use solana_sdk::{
     address_lookup_table::AddressLookupTableAccount,
+    clock::Clock,
     message::VersionedMessage,
     pubkey::Pubkey,
     transaction::VersionedTransaction,
@@ -55,6 +56,21 @@ impl Simulator {
             .with_sigverify(false)
             .with_blockhash_check(false)
             .with_spl_programs();
+
+        // CRITICAL: advance LiteSVM's Clock past every mainnet ALT's
+        // `last_extended_slot`. The ALT lookup logic in
+        // solana-address-lookup-table-interface only exposes addresses up to
+        // `last_extended_slot_start_index` if `current_slot <=
+        // last_extended_slot` (see state.rs:173-177). LiteSVM defaults to
+        // slot 0, which is smaller than any real mainnet ALT slot
+        // (currently ~3.6e8), so sanitization fails with
+        // InvalidLookupIndex for every index pointing at entries added
+        // after the ALT was first created. Warp to a slot that's
+        // guaranteed to be past `last_extended_slot` for any active ALT.
+        const FUTURE_SLOT: u64 = 1_000_000_000_000;
+        let mut clock = svm.get_sysvar::<Clock>();
+        clock.slot = FUTURE_SLOT;
+        svm.set_sysvar::<Clock>(&clock);
 
         let mut loaded = 0usize;
         let mut missing = 0usize;
@@ -181,11 +197,13 @@ impl Simulator {
                 // sim bug doesn't silently block every tx.
                 if self.fail_closed {
                     anyhow::bail!(
-                        "sim reverted: logs={:?}",
+                        "sim reverted: err={:?} logs={:?}",
+                        meta.err,
                         meta.meta.logs.iter().rev().take(5).collect::<Vec<_>>()
                     );
                 } else {
                     warn!(
+                        err = ?meta.err,
                         logs = ?meta.meta.logs.iter().rev().take(3).collect::<Vec<_>>(),
                         "sim reverted but fail_open=true, allowing send"
                     );
