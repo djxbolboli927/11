@@ -254,16 +254,22 @@ impl Simulator {
             Err(meta) => {
                 // fail_closed: refuse to send. fail_open: allow the send so a
                 // sim bug doesn't silently block every tx.
+                //
+                // Capture FULL log stream (no truncation, no reverse) on
+                // failure so the operator can see exactly what each program
+                // emitted before erroring. Custom error codes alone don't
+                // tell us if the issue is oracle staleness, owner mismatch,
+                // signature check, etc.; the program's own `msg!` lines do.
                 if self.fail_closed {
                     anyhow::bail!(
-                        "sim reverted: err={:?} logs={:?}",
+                        "sim reverted: err={:?} logs={:#?}",
                         meta.err,
-                        meta.meta.logs.iter().rev().take(5).collect::<Vec<_>>()
+                        meta.meta.logs
                     );
                 } else {
                     warn!(
                         err = ?meta.err,
-                        logs = ?meta.meta.logs.iter().rev().take(3).collect::<Vec<_>>(),
+                        logs = ?meta.meta.logs,
                         "sim reverted but fail_open=true, allowing send"
                     );
                     Ok(SimOutcome {
