@@ -101,23 +101,23 @@ async fn async_main(config: config::Config) -> Result<()> {
             warn!(
                 ata = %wsol_ata,
                 error = %e,
-                "WSOL ATA not found — run: spl-token wrap <amount>"
+                "WSOL ATA not found -- run: spl-token wrap <amount>"
             );
         }
     }
 
-    // BlockhashCache — refreshes every 300ms in background
+    // BlockhashCache -- refreshes every 300ms in background
     let blockhash_cache = BlockhashCache::new(rpc_client.clone());
     info!("blockhash cache initialized (refresh every 300ms)");
 
-    // AltCache — Jito tip accounts excluded from ALT entries
+    // AltCache -- Jito tip accounts excluded from ALT entries
     let tip_pubkeys = transaction::jito_tip_pubkeys();
     let alt_cache = AltCache::new(tip_pubkeys);
     info!("ALT cache initialized");
 
     let metis = metis::MetisClient::new(&config.metis.url, config.performance.quote_timeout_ms);
 
-    // Multi-region Jito client — sends to ALL endpoints concurrently.
+    // Multi-region Jito client -- sends to ALL endpoints concurrently.
     // Wrapped in Arc so send tasks can be tokio::spawn'd with 'static lifetime.
     let jito_client = Arc::new(jito::JitoClient::new(&config.jito.urls, &config.jito.uuid));
     info!(

@@ -3,7 +3,7 @@
 //! This is the same data Metis consumes. By keeping a parallel copy in our
 //! own process we can hand it to LiteSVM for pre-flight simulation without
 //! any RPC round-trip on the hot path (a getMultipleAccounts would add
-//! 20–50ms and make simulation useless).
+//! 20-50ms and make simulation useless).
 //!
 //! The cache subscribes once at startup with two filter entries:
 //!   1. all DEX program ids from `program_registry::PROGRAMS` (owner filter)

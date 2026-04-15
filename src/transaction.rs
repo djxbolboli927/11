@@ -17,7 +17,7 @@ use std::str::FromStr;
 use crate::alt_cache::AltCache;
 use crate::metis::{InstructionData, SwapInstructionsResponse};
 
-/// Jito tip account addresses — pick one at random for each bundle.
+/// Jito tip account addresses -- pick one at random for each bundle.
 /// Per Jito docs: do NOT use ALTs for tip accounts.
 const JITO_TIP_ACCOUNTS: &[&str] = &[
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
@@ -95,7 +95,7 @@ pub fn build_arb_transaction(
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
-    // #1 — SetComputeUnitLimit
+    // #1 -- SetComputeUnitLimit
     let cu_limit_ix = Instruction {
         program_id: Pubkey::from_str("ComputeBudget111111111111111111111111111111")?,
         accounts: vec![],
@@ -107,10 +107,10 @@ pub fn build_arb_transaction(
     };
     instructions.push(cu_limit_ix);
 
-    // #2 — Single route_v2 for the entire circular swap
+    // #2 -- Single route_v2 for the entire circular swap
     instructions.push(to_sdk_instruction(&swap_ixs.swap_instruction)?);
 
-    // #3 — Jito tip (MUST be last, MUST NOT be in ALT)
+    // #3 -- Jito tip (MUST be last, MUST NOT be in ALT)
     let tip_account = {
         let mut rng = rand::thread_rng();
         let addr = JITO_TIP_ACCOUNTS.choose(&mut rng).unwrap();

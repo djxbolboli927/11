@@ -35,7 +35,7 @@ impl AltCache {
             }
         }
 
-        debug!(alt = %pubkey, "ALT cache miss — fetching from RPC");
+        debug!(alt = %pubkey, "ALT cache miss -- fetching from RPC");
         let account = rpc
             .get_account(pubkey)
             .map_err(|e| anyhow::anyhow!("failed to fetch ALT {}: {}", pubkey, e))?;

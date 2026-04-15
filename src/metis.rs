@@ -134,7 +134,7 @@ impl MetisClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("quote failed: {} — {}", status, body);
+            anyhow::bail!("quote failed: {} -- {}", status, body);
         }
 
         let quote: QuoteResponse = resp.json().await.context("failed to parse quote response")?;
@@ -143,9 +143,9 @@ impl MetisClient {
 
     /// Merge two quotes into a single circular quote via Route Concatenation.
     ///
-    /// Takes quote1 (WSOL→Token) and quote2 (Token→WSOL),
+    /// Takes quote1 (WSOL->Token) and quote2 (Token->WSOL),
     /// concatenates their routePlans, and produces a single combined quote
-    /// that represents the full circular path WSOL→Token→WSOL.
+    /// that represents the full circular path WSOL->Token->WSOL.
     ///
     /// The combined quote is then sent to /swap-instructions to get
     /// a SINGLE route_v2 instruction that handles the entire circular arb.
@@ -154,7 +154,7 @@ impl MetisClient {
     /// on-chain. It becomes the `other_amount_threshold` of the merged quote
     /// and is embedded as `slippage_bps` floor in the route_v2 instruction.
     /// Setting it to `amount + tip + base_fee` means the tx reverts ONLY if
-    /// the trade would lose lamports — any price jitter that still leaves us
+    /// the trade would lose lamports -- any price jitter that still leaves us
     /// at break-even or better will land on-chain (even if profit shrinks).
     pub fn merge_quotes(
         quote1: &QuoteResponse,
@@ -199,7 +199,7 @@ impl MetisClient {
     ///
     /// CRITICAL for circular arbitrage:
     /// - useSharedAccounts=false (shared accounts cause memory conflicts in circular swaps)
-    /// - dynamicComputeUnitLimit=false (avoid extra RPC simulation call by Metis — we set CU manually)
+    /// - dynamicComputeUnitLimit=false (avoid extra RPC simulation call by Metis -- we set CU manually)
     /// - wrapAndUnwrapSol=false (WSOL ATA must pre-exist)
     /// - asLegacyTransaction=false (v0 for ALT support)
     pub async fn get_swap_instructions(
@@ -231,7 +231,7 @@ impl MetisClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("swap-instructions failed: {} — {}", status, body);
+            anyhow::bail!("swap-instructions failed: {} -- {}", status, body);
         }
 
         let swap_ixs: SwapInstructionsResponse = resp

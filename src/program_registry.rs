@@ -9,7 +9,7 @@
 /// Best-effort mapping. The 23 program ids below match the DEX filter
 /// currently configured in Metis. Filenames correspond to the .so files the
 /// user downloaded to `/home/soluser/m/so/`. A few of the lesser-known ids
-/// are labelled TODO — the bot will simply skip sim for routes that touch
+/// are labelled TODO -- the bot will simply skip sim for routes that touch
 /// an un-mapped program until the mapping is filled in.
 pub const PROGRAMS: &[(&str, &str)] = &[
     // --- high confidence ---

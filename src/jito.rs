@@ -109,7 +109,7 @@ impl JitoClient {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             warn!(endpoint = url, http_status = %status, body = %body, "Jito HTTP error");
-            anyhow::bail!("Jito HTTP error at {}: {} — {}", url, status, body);
+            anyhow::bail!("Jito HTTP error at {}: {} -- {}", url, status, body);
         }
 
         let rpc_resp: RpcResponse = resp

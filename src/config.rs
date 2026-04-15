@@ -34,7 +34,7 @@ pub struct TradingConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct JitoConfig {
-    /// Multiple Jito block engine URLs — bundles are sent to ALL concurrently.
+    /// Multiple Jito block engine URLs -- bundles are sent to ALL concurrently.
     pub urls: Vec<String>,
     pub uuid: String,
     pub trading_keypair: String,

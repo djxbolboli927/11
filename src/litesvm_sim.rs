@@ -12,7 +12,7 @@
 //! If simulation says the arb would net less than `min_acceptable_out`
 //! WSOL (i.e. `amount + tip + base_fee`), we drop the send and save the
 //! base fee. If simulation says success, we forward to Jito with confidence
-//! that the code path works — the only remaining risk is that the pool
+//! that the code path works -- the only remaining risk is that the pool
 //! state moved between our cached snapshot and the slot the tx lands in,
 //! which no local simulator can eliminate.
 
@@ -92,7 +92,7 @@ impl Simulator {
 
     /// Simulate `tx` against `cache`. Returns `Ok(SimOutcome)` if the tx
     /// would succeed AND leaves at least `min_acceptable_out` lamports in
-    /// the user's WSOL ATA. `Err` otherwise — caller should drop the send.
+    /// the user's WSOL ATA. `Err` otherwise -- caller should drop the send.
     ///
     /// `alts` is required to resolve lookup-table indexes into real pubkeys
     /// so every account the tx touches can be injected.

@@ -55,11 +55,11 @@ async fn check_opportunity(
     user_pubkey: &str,
     cu_limits: &[u32],
 ) -> Option<Opportunity> {
-    // Leg 1: WSOL → Token
+    // Leg 1: WSOL -> Token
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
 
-    // Leg 2: Token → WSOL (input = output of leg 1)
+    // Leg 2: Token -> WSOL (input = output of leg 1)
     let quote2 = metis.get_quote(token_mint, WSOL_MINT, token_amount).await.ok()?;
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
@@ -77,7 +77,7 @@ async fn check_opportunity(
 
     // On-chain break-even floor. The tx reverts ONLY if the final output would
     // be less than input + tip + base_fee (i.e. an actual net loss). Any positive
-    // slippage — or even a shrunk-but-still-profitable outcome — still lands.
+    // slippage -- or even a shrunk-but-still-profitable outcome -- still lands.
     // This is what competing arb bots do; locking threshold to quote2.out_amount
     // (zero negative slippage) was the root cause of frequent reverts.
     let min_acceptable_out = amount + total_costs;
@@ -92,7 +92,7 @@ async fn check_opportunity(
         debug!(
             token = token_mint,
             got = ?merged_quote.instruction_version,
-            "quote did NOT report instructionVersion=V2 — Metis binary may be outdated"
+            "quote did NOT report instructionVersion=V2 -- Metis binary may be outdated"
         );
     }
     let hop_count = merged_quote
@@ -122,9 +122,9 @@ async fn check_opportunity(
     })
 }
 
-/// Scan ALL (amount × token) pairs concurrently.
+/// Scan ALL (amount x token) pairs concurrently.
 /// For each profitable pair, swap-instructions is pre-fetched in the same task.
-/// First ready Opportunity triggers immediate tx build + send — NO more Metis calls.
+/// First ready Opportunity triggers immediate tx build + send -- NO more Metis calls.
 pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
@@ -193,7 +193,7 @@ pub async fn scan_all_tokens(
             tip_lamports = opp.tip_lamports,
             hops = opp.hop_count,
             cu_limit = opp.cu_limit,
-            "PROFITABLE — instructions ready, building tx"
+            "PROFITABLE -- instructions ready, building tx"
         );
 
         // Build the tx synchronously (CPU-bound, ~0.5ms; ALTs served from cache).
@@ -235,7 +235,7 @@ pub async fn scan_all_tokens(
         // If simulation is wired in, run the tx locally against the hot
         // Yellowstone-fed account cache. This catches CU overruns, CPI
         // constraint failures, and AMM math divergence between Metis's
-        // Rust model and the real on-chain bytecode — all BEFORE we spend
+        // Rust model and the real on-chain bytecode -- all BEFORE we spend
         // a base fee on Jito. A sim pass doesn't guarantee landing (the
         // pool can still move before the slot lands) but a sim failure is
         // a near-certain revert, so dropping them is pure savings.
