@@ -178,6 +178,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             &config.simulation.so_dir,
             wsol_ata,
             config.simulation.fail_closed,
+            rpc_client.clone(),
         )?;
         (Some(Arc::new(cache)), Some(Arc::new(sim)))
     } else {

@@ -19,6 +19,7 @@
 use anyhow::{anyhow, Context, Result};
 use litesvm::LiteSVM;
 use solana_account::ReadableAccount;
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     address_lookup_table::AddressLookupTableAccount,
     clock::Clock,
@@ -27,8 +28,9 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::account_cache::AccountCache;
@@ -44,13 +46,25 @@ pub struct Simulator {
     svm: Mutex<LiteSVM>,
     wsol_ata: Pubkey,
     fail_closed: bool,
+    /// Live mainnet slot, refreshed by a background tokio task every second.
+    /// Read on every `simulate()` and pushed into LiteSVM's Clock so that
+    /// PMM-style DEXes (Tessera, GoonFi, SolFi, ZeroFi) which validate
+    /// `current_slot - oracle.last_update_slot < MAX_AGE_SLOTS` see a slot
+    /// close to mainnet's. Keeping a stale slot here is the same class of
+    /// failure as keeping a stale unix_timestamp.
+    current_slot: Arc<AtomicU64>,
 }
 
 impl Simulator {
     /// Load every program listed in `program_registry::PROGRAMS` from
     /// `so_dir`. Missing files are skipped with a warning so a partial
     /// mapping doesn't block startup.
-    pub fn new(so_dir: &str, wsol_ata: Pubkey, fail_closed: bool) -> Result<Self> {
+    pub fn new(
+        so_dir: &str,
+        wsol_ata: Pubkey,
+        fail_closed: bool,
+        rpc: Arc<RpcClient>,
+    ) -> Result<Self> {
         let mut svm = LiteSVM::new()
             .with_sysvars()
             .with_precompiles()
@@ -63,34 +77,55 @@ impl Simulator {
         // 1. ALT validation: solana-address-lookup-table-interface only
         //    exposes addresses up to `last_extended_slot_start_index` when
         //    `current_slot <= last_extended_slot` (see state.rs:173-177).
-        //    LiteSVM defaults to slot 0, smaller than any active mainnet
-        //    ALT slot (~3.6e8), so V0 sanitization fails with
-        //    InvalidLookupIndex for any index pointing past the ALT's
-        //    creation point. Need slot >> last_extended_slot.
+        //    Need slot > last_extended_slot. Real mainnet slot is always
+        //    past every ALT's extension slot (an ALT can only have been
+        //    extended at a *past* slot), so live slot satisfies this.
         //
-        // 2. Oracle / TWAP / pool-staleness checks: many DEXes (Tessera,
-        //    GoonFi, etc.) compare `clock.unix_timestamp` against an
-        //    on-chain `last_update_ts` and refuse the swap if the gap is
-        //    too large or negative. LiteSVM's default unix_timestamp is 0
-        //    (= 1970), so EVERY pool looks "infinitely stale" and the
-        //    program returns its proprietary error code (0xffff for
-        //    Tessera, 0x15 for GoonFi -- both observed in production logs
-        //    while the cache and pool state were already correct).
+        // 2. Pool / quote freshness: PMM-style DEXes (Tessera, GoonFi,
+        //    SolFi, ZeroFi) validate `current_slot - last_update_slot <
+        //    MAX_AGE_SLOTS` (typically 100-200 slots, ~40-80s). They fail
+        //    SILENTLY in their entrypoint with proprietary error codes
+        //    (0xffff Tessera, 0x15 GoonFi, ...) before ever calling msg!,
+        //    which is exactly what we observe. Setting slot to a fake
+        //    "future" value (e.g. 1e12) makes EVERY quote look ancient
+        //    and triggers the same failure.
         //
-        // Set unix_timestamp to wall-clock now (cheap, no RPC), and slot
-        // to a value past every plausible ALT extension. We refresh
-        // unix_timestamp on every simulate() call so the bot doesn't drift
-        // out of an oracle's freshness window during long runs.
-        const FUTURE_SLOT: u64 = 1_000_000_000_000;
+        // Fetch live mainnet slot once at startup, then keep it fresh via
+        // a tokio background task (similar to BlockhashCache). Each
+        // simulate() reads the atomic and pushes it into Clock.slot.
+        // unix_timestamp gets the same treatment using SystemTime::now().
+        let initial_slot = rpc
+            .get_slot()
+            .context("initial RPC get_slot for sim Clock failed")?;
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let mut clock = svm.get_sysvar::<Clock>();
-        clock.slot = FUTURE_SLOT;
+        clock.slot = initial_slot;
         clock.unix_timestamp = now_ts;
         clock.epoch_start_timestamp = now_ts;
         svm.set_sysvar::<Clock>(&clock);
+        info!(initial_slot, "sim Clock initialised with live mainnet slot");
+
+        let current_slot = Arc::new(AtomicU64::new(initial_slot));
+        let slot_for_task = current_slot.clone();
+        let rpc_for_task = rpc.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let rpc_inner = rpc_for_task.clone();
+                let res = tokio::task::spawn_blocking(move || rpc_inner.get_slot()).await;
+                match res {
+                    Ok(Ok(s)) => {
+                        slot_for_task.store(s, Ordering::Relaxed);
+                    }
+                    Ok(Err(e)) => warn!(error = %e, "slot RPC refresh failed"),
+                    Err(e) => warn!(error = %e, "slot refresh task panicked"),
+                }
+            }
+        });
 
         let mut loaded = 0usize;
         let mut missing = 0usize;
@@ -123,6 +158,7 @@ impl Simulator {
             svm: Mutex::new(svm),
             wsol_ata,
             fail_closed,
+            current_slot,
         })
     }
 
@@ -155,18 +191,29 @@ impl Simulator {
 
         let mut svm = self.svm.lock().unwrap();
 
-        // Bump Clock.unix_timestamp to wall-clock now BEFORE injecting
-        // anything else. Oracles inside DEX programs read this to gauge
-        // pool freshness; if we leave it at the value set during startup,
-        // after a few minutes pools start failing freshness checks and
-        // emitting opaque custom errors. SystemTime::now() is sub-microsecond.
+        // Bump Clock.{slot,unix_timestamp} to live values BEFORE injecting
+        // accounts. PMM-style DEXes (Tessera, GoonFi, SolFi, ZeroFi) check
+        // both: `current_slot - quote.last_slot < MAX_AGE_SLOTS` AND
+        // `unix_timestamp - quote.last_ts < MAX_AGE_SECS`. If either is
+        // stale they fail their entrypoint with proprietary error codes
+        // BEFORE emitting any msg!, which matches the production logs:
+        // Tessera fails the moment Jupiter `invoke [2]`s into it.
+        let live_slot = self.current_slot.load(Ordering::Relaxed);
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let mut clock = svm.get_sysvar::<Clock>();
+        let mut clock_dirty = false;
+        if clock.slot != live_slot {
+            clock.slot = live_slot;
+            clock_dirty = true;
+        }
         if clock.unix_timestamp != now_ts {
             clock.unix_timestamp = now_ts;
+            clock_dirty = true;
+        }
+        if clock_dirty {
             svm.set_sysvar::<Clock>(&clock);
         }
 
