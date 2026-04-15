@@ -256,15 +256,21 @@ pub async fn scan_all_tokens(
             };
             match sim.simulate(&tx, &alts, cache, min_acceptable_out) {
                 Ok(outcome) => {
-                    debug!(
+                    info!(
                         token = opp.token_mint.as_str(),
                         cu = outcome.compute_units,
                         wsol_after = outcome.wsol_after,
-                        "sim OK"
+                        "sim PASSED, sending to Jito"
                     );
                 }
                 Err(e) => {
-                    debug!(error = %e, token = opp.token_mint.as_str(), "sim rejected, skipping");
+                    info!(
+                        error = %e,
+                        token = opp.token_mint.as_str(),
+                        amount = opp.amount,
+                        expected_out = opp.output_wsol,
+                        "sim REJECTED, dropping (no Jito send, no fee paid)"
+                    );
                     continue;
                 }
             }
