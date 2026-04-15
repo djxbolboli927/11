@@ -147,15 +147,18 @@ async fn async_main(config: config::Config) -> Result<()> {
             "Yellowstone account cache subscribed"
         );
 
-        // Pre-warm: token mints and the user's WSOL ATA are not streamed via
-        // the DEX-owner filter. Fetch once from RPC so the first sim doesn't
-        // miss them.
+        // Pre-warm: token mints, the user's WSOL ATA, and the trading wallet
+        // itself are not streamed via the DEX-owner filter (they are owned by
+        // SPL Token / System Program). Fetch once from RPC so the first sim
+        // doesn't miss them. Missing the payer specifically surfaces as
+        // "Payer account <pk> not found" inside LiteSVM.
         let mut warm: Vec<solana_sdk::pubkey::Pubkey> = token_mints
             .iter()
             .filter_map(|s| solana_sdk::pubkey::Pubkey::try_from(s.as_str()).ok())
             .collect();
         warm.push(wsol_mint);
         warm.push(wsol_ata);
+        warm.push(trading_keypair.pubkey());
         cache.prefetch(&warm);
         info!(warmed = cache.len(), "account cache pre-warmed");
 
