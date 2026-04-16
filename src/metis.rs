@@ -127,7 +127,7 @@ impl MetisClient {
              &forJitoBundle=true\
              &restrictIntermediateTokens=false\
              &instructionVersion=V2\
-             &excludeDexes=Tessera%20V,GoonFi,SolFi,SolFi%20V2,ZeroFi",
+             &excludeDexes=Tessera%20V,GoonFi,SolFi,SolFi%20V2,ZeroFi,AlphaQ,Aquifer,Byreal",
             self.base_url, input_mint, output_mint, amount_lamports
         );
 

@@ -133,7 +133,7 @@ async fn async_main(config: config::Config) -> Result<()> {
     // Metis reads from, plus a Simulator that loads every DEX .so at startup.
     // On every profitable opportunity, scan_all_tokens will ask the Simulator
     // to run the tx locally before paying for a Jito base fee.
-    let (sim_cache, simulator) = if config.simulation.enabled {
+    let (sim_cache, sim_pool) = if config.simulation.enabled {
         let cache = account_cache::AccountCache::new(rpc_client.clone());
         cache.spawn_subscription(
             config.yellowstone_grpc.endpoint.clone(),
@@ -174,13 +174,14 @@ async fn async_main(config: config::Config) -> Result<()> {
         cache.prefetch(&warm);
         info!(warmed = cache.len(), "account cache pre-warmed");
 
-        let sim = litesvm_sim::Simulator::new(
+        let pool = litesvm_sim::SimulatorPool::new(
+            config.simulation.workers,
             &config.simulation.so_dir,
             wsol_ata,
             config.simulation.fail_closed,
             rpc_client.clone(),
         )?;
-        (Some(Arc::new(cache)), Some(Arc::new(sim)))
+        (Some(Arc::new(cache)), Some(Arc::new(pool)))
     } else {
         info!("LiteSVM simulation disabled via config");
         (None, None)
@@ -207,7 +208,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             &blockhash_cache,
             &alt_cache,
             sim_cache.as_ref(),
-            simulator.as_ref(),
+            sim_pool.as_ref(),
         )
         .await
         {

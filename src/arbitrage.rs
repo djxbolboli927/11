@@ -10,7 +10,7 @@ use crate::alt_cache::AltCache;
 use crate::blockhash_cache::BlockhashCache;
 use crate::config::Config;
 use crate::jito::JitoClient;
-use crate::litesvm_sim::{self, Simulator};
+use crate::litesvm_sim::{self, SimulatorPool};
 use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
 use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS};
 use crate::rate_limiter::RateLimiter;
@@ -186,7 +186,7 @@ pub async fn scan_all_tokens(
     blockhash_cache: &BlockhashCache,
     alt_cache: &AltCache,
     sim_cache: Option<&Arc<AccountCache>>,
-    simulator: Option<&Arc<Simulator>>,
+    sim_pool: Option<&Arc<SimulatorPool>>,
 ) -> Result<()> {
     let min_lamports = (config.trading.min_amount_sol * LAMPORTS_PER_SOL) as u64;
     let max_lamports = (config.trading.max_amount_sol * LAMPORTS_PER_SOL) as u64;
@@ -281,58 +281,86 @@ pub async fn scan_all_tokens(
             }
         }
 
-        // -- LiteSVM pre-flight gate --
-        // If simulation is wired in, run the tx locally against the hot
-        // Yellowstone-fed account cache. This catches CU overruns, CPI
-        // constraint failures, and AMM math divergence between Metis's
-        // Rust model and the real on-chain bytecode -- all BEFORE we spend
-        // a base fee on Jito. A sim pass doesn't guarantee landing (the
-        // pool can still move before the slot lands) but a sim failure is
-        // a near-certain revert, so dropping them is pure savings.
-        if let (Some(cache), Some(sim)) = (sim_cache, simulator) {
-            let min_acceptable_out = opp.amount + opp.tip_lamports + base_fee;
-            // Resolve ALTs the same way build_arb_transaction did so the
-            // simulator can inject state for every account the tx touches.
-            let alts = match litesvm_sim::resolve_alts(
+        // -- Sim + Jito send, DISPATCHED OFF-LOOP --
+        //
+        // The entire "resolve ALTs -> pick worker -> simulate -> send bundle"
+        // chain is moved into a `tokio::spawn`. The main loop does ZERO work
+        // past this point and immediately polls the next opportunity from
+        // `futs`. Why it matters:
+        //
+        //   * Each sim takes ~2-5ms of CPU on a single LiteSVM mutex. With
+        //     the old code we blocked the main loop for the full sim
+        //     duration, so opportunities N+1, N+2, ... went stale while
+        //     opportunity N was simulated serially.
+        //
+        //   * With N parallel Simulator workers (SimulatorPool) and one
+        //     tokio task per opportunity, we can now run up to N sims
+        //     concurrently. The mutex contention is limited to "same
+        //     worker picked twice" which round-robin minimises.
+        //
+        //   * Total budget from `opp` ready -> Jito POST on the wire stays
+        //     at sim_latency (2-5ms) + bundle HTTP (async) -- never serial
+        //     accumulation.
+        //
+        // If sim is disabled the spawned task just sends; we still spawn
+        // so the send's HTTP round-trip (tens of ms) doesn't block the
+        // scan loop either.
+        let jito_clone = jito.clone();
+        let token_for_log = opp.token_mint.clone();
+        let profit_for_log = opp.net_profit;
+        let amount_for_log = opp.amount;
+        let expected_out_for_log = opp.output_wsol;
+        let min_acceptable_out = opp.amount + opp.tip_lamports + base_fee;
+
+        // ALT resolve is CHEAP (cache hit after first sim; pure hash lookup),
+        // so we do it here on the scan thread rather than in the spawned task.
+        // This avoids copying the entire SwapInstructionsResponse into the
+        // closure.
+        let alts_for_sim = match (sim_cache, sim_pool) {
+            (Some(_), Some(_)) => match litesvm_sim::resolve_alts(
                 &opp.swap_ixs.address_lookup_table_addresses,
                 alt_cache,
                 rpc_client,
             ) {
-                Ok(a) => a,
+                Ok(a) => Some(a),
                 Err(e) => {
                     warn!(error = %e, token = opp.token_mint.as_str(), "sim ALT resolve failed");
                     continue;
                 }
-            };
-            match sim.simulate(&tx, &alts, cache, min_acceptable_out) {
-                Ok(outcome) => {
-                    info!(
-                        token = opp.token_mint.as_str(),
-                        cu = outcome.compute_units,
-                        wsol_after = outcome.wsol_after,
-                        "sim PASSED, sending to Jito"
-                    );
-                }
-                Err(e) => {
-                    info!(
-                        error = %e,
-                        token = opp.token_mint.as_str(),
-                        amount = opp.amount,
-                        expected_out = opp.output_wsol,
-                        "sim REJECTED, dropping (no Jito send, no fee paid)"
-                    );
-                    continue;
+            },
+            _ => None,
+        };
+
+        let sim_cache_for_task = sim_cache.cloned();
+        let sim_worker = sim_pool.map(|p| p.acquire());
+
+        tokio::spawn(async move {
+            // -- LiteSVM pre-flight gate (inside the spawned task) --
+            if let (Some(cache), Some(sim), Some(alts)) =
+                (sim_cache_for_task, sim_worker, alts_for_sim)
+            {
+                match sim.simulate(&tx, &alts, &cache, min_acceptable_out) {
+                    Ok(outcome) => {
+                        info!(
+                            token = token_for_log.as_str(),
+                            cu = outcome.compute_units,
+                            wsol_after = outcome.wsol_after,
+                            "sim PASSED, sending to Jito"
+                        );
+                    }
+                    Err(e) => {
+                        info!(
+                            error = %e,
+                            token = token_for_log.as_str(),
+                            amount = amount_for_log,
+                            expected_out = expected_out_for_log,
+                            "sim REJECTED, dropping (no Jito send, no fee paid)"
+                        );
+                        return;
+                    }
                 }
             }
-        }
 
-        // Fire-and-forget: spawn the send on the runtime so it starts IMMEDIATELY,
-        // while this loop keeps draining more opportunities from `futs`. Jito
-        // bundles that revert on-chain pay no tip, so redundant shots are free.
-        let jito_clone = jito.clone();
-        let token_for_log = opp.token_mint.clone();
-        let profit_for_log = opp.net_profit;
-        tokio::spawn(async move {
             match jito_clone.send_bundle(&tx).await {
                 Ok(uuid) => info!(
                     uuid = %uuid,

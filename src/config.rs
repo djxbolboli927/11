@@ -69,6 +69,14 @@ pub struct SimulationConfig {
     /// `false` logs and forwards to Jito anyway (useful during rollout).
     #[serde(default = "default_true")]
     pub fail_closed: bool,
+    /// Number of INDEPENDENT Simulator instances to spin up. Each Simulator
+    /// owns its own `Mutex<LiteSVM>`, so N workers = N sims in parallel.
+    /// Sizing guidance: in steady state each sim takes ~2-5ms of CPU, so
+    /// `workers` should roughly equal the peak number of profitable
+    /// opportunities that arrive per 5ms window. In production, 8 is a
+    /// sensible default (handles ~1600 sims/sec with headroom).
+    #[serde(default = "default_workers")]
+    pub workers: usize,
 }
 
 impl Default for SimulationConfig {
@@ -77,6 +85,7 @@ impl Default for SimulationConfig {
             enabled: false,
             so_dir: default_so_dir(),
             fail_closed: true,
+            workers: default_workers(),
         }
     }
 }
@@ -87,6 +96,10 @@ fn default_so_dir() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_workers() -> usize {
+    8
 }
 
 #[derive(Debug, Deserialize, Clone)]

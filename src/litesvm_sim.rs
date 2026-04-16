@@ -28,7 +28,7 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
@@ -372,6 +372,63 @@ fn collect_tx_accounts(
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// Pool of INDEPENDENT `Simulator` instances. Each Simulator owns its own
+/// `Mutex<LiteSVM>`, so N workers = N sims running in parallel. The pool
+/// hands out a simulator via round-robin (`acquire()`), letting the caller
+/// `tokio::spawn` a background task that blocks only on *that* simulator's
+/// mutex -- not on any other worker's. The main opportunity-scanning loop
+/// never waits on sim: it just picks a worker, fires-and-forgets, and
+/// moves on to the next opportunity. This is the only way to keep the
+/// "Metis quote -> sim -> Jito send" latency under the 20-30ms MEV budget
+/// when many profitable opportunities arrive in the same scan cycle.
+///
+/// Memory note: each Simulator loads every .so from disk into LiteSVM, so
+/// N workers costs ~N × (sum of .so sizes) in RSS. For the 15 AMMs we
+/// currently keep, this is roughly 20-40 MB per worker. 8 workers = ~250
+/// MB extra, which is negligible on any modern box.
+pub struct SimulatorPool {
+    sims: Vec<Arc<Simulator>>,
+    next: AtomicUsize,
+}
+
+impl SimulatorPool {
+    /// Build `workers` independent Simulators. Minimum of 1 is enforced.
+    pub fn new(
+        workers: usize,
+        so_dir: &str,
+        wsol_ata: Pubkey,
+        fail_closed: bool,
+        rpc: Arc<RpcClient>,
+    ) -> Result<Self> {
+        let workers = workers.max(1);
+        let mut sims = Vec::with_capacity(workers);
+        for i in 0..workers {
+            let sim = Simulator::new(so_dir, wsol_ata, fail_closed, rpc.clone())
+                .with_context(|| format!("failed to build sim worker #{i}"))?;
+            sims.push(Arc::new(sim));
+            info!(worker = i, "sim worker initialised");
+        }
+        info!(workers, "SimulatorPool ready");
+        Ok(Self {
+            sims,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    /// Acquire a simulator in round-robin order. Cloning an `Arc` is
+    /// constant-time; the returned `Arc<Simulator>` can be moved into a
+    /// `tokio::spawn`'d task with no lifetime concerns.
+    #[inline]
+    pub fn acquire(&self) -> Arc<Simulator> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.sims.len();
+        self.sims[idx].clone()
+    }
+
+    pub fn workers(&self) -> usize {
+        self.sims.len()
+    }
 }
 
 /// Convenience: resolve every ALT referenced by a Metis swap-instructions
