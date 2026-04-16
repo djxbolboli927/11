@@ -6,6 +6,7 @@ mod config;
 mod jito;
 mod litesvm_sim;
 mod metis;
+mod metrics;
 mod program_registry;
 mod rate_limiter;
 mod tokens;
@@ -105,6 +106,11 @@ async fn async_main(config: config::Config) -> Result<()> {
             );
         }
     }
+
+    // Pipeline metrics — logs a 120-second rolling window every 2 minutes.
+    let metrics = metrics::Metrics::new();
+    metrics.spawn_reporter();
+    info!("pipeline metrics reporter started (120s window)");
 
     // BlockhashCache -- refreshes every 300ms in background
     let blockhash_cache = BlockhashCache::new(rpc_client.clone());
@@ -209,6 +215,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             &alt_cache,
             sim_cache.as_ref(),
             sim_pool.as_ref(),
+            &metrics,
         )
         .await
         {

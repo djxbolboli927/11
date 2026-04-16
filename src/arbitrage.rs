@@ -2,6 +2,7 @@ use anyhow::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{signature::Keypair, signer::Signer};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -12,6 +13,7 @@ use crate::config::Config;
 use crate::jito::JitoClient;
 use crate::litesvm_sim::{self, SimulatorPool};
 use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
+use crate::metrics::Metrics;
 use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS};
 use crate::rate_limiter::RateLimiter;
 use crate::tokens::WSOL_MINT;
@@ -96,7 +98,11 @@ async fn check_opportunity(
     min_profit: u64,
     user_pubkey: &str,
     cu_limits: &[u32],
+    metrics: &Metrics,
 ) -> Option<Opportunity> {
+    // Count every screened pair whether profitable or not.
+    metrics.metis_quotes.fetch_add(1, Ordering::Relaxed);
+
     // Leg 1: WSOL -> Token
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
@@ -160,6 +166,8 @@ async fn check_opportunity(
 
     let cu_limit = lookup_cu_limit(hop_count, cu_limits);
 
+    metrics.metis_profitable.fetch_add(1, Ordering::Relaxed);
+
     Some(Opportunity {
         token_mint: token_mint.to_string(),
         amount,
@@ -187,6 +195,7 @@ pub async fn scan_all_tokens(
     alt_cache: &AltCache,
     sim_cache: Option<&Arc<AccountCache>>,
     sim_pool: Option<&Arc<SimulatorPool>>,
+    metrics: &Arc<Metrics>,
 ) -> Result<()> {
     let min_lamports = (config.trading.min_amount_sol * LAMPORTS_PER_SOL) as u64;
     let max_lamports = (config.trading.max_amount_sol * LAMPORTS_PER_SOL) as u64;
@@ -211,6 +220,7 @@ pub async fn scan_all_tokens(
                 config.trading.min_profit_lamports,
                 &user_pubkey,
                 &config.performance.cu_limits,
+                metrics,
             ));
         }
         amount += step_lamports;
@@ -306,6 +316,7 @@ pub async fn scan_all_tokens(
         // so the send's HTTP round-trip (tens of ms) doesn't block the
         // scan loop either.
         let jito_clone = jito.clone();
+        let metrics_clone = metrics.clone();
         let token_for_log = opp.token_mint.clone();
         let profit_for_log = opp.net_profit;
         let amount_for_log = opp.amount;
@@ -339,7 +350,8 @@ pub async fn scan_all_tokens(
             if let (Some(cache), Some(sim), Some(alts)) =
                 (sim_cache_for_task, sim_worker, alts_for_sim)
             {
-                match sim.simulate(&tx, &alts, &cache, min_acceptable_out) {
+                metrics_clone.sim_submitted.fetch_add(1, Ordering::Relaxed);
+                match sim.simulate(&tx, &alts, &cache, min_acceptable_out, &metrics_clone) {
                     Ok(outcome) => {
                         info!(
                             token = token_for_log.as_str(),
@@ -362,12 +374,15 @@ pub async fn scan_all_tokens(
             }
 
             match jito_clone.send_bundle(&tx).await {
-                Ok(uuid) => info!(
-                    uuid = %uuid,
-                    token = token_for_log.as_str(),
-                    profit = profit_for_log,
-                    "bundle sent to all Jito endpoints"
-                ),
+                Ok(uuid) => {
+                    metrics_clone.jito_sent.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        uuid = %uuid,
+                        token = token_for_log.as_str(),
+                        profit = profit_for_log,
+                        "bundle sent to all Jito endpoints"
+                    )
+                }
                 Err(e) => warn!(
                     error = %e,
                     token = token_for_log.as_str(),
@@ -379,4 +394,3 @@ pub async fn scan_all_tokens(
 
     Ok(())
 }
-

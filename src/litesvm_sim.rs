@@ -34,6 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::account_cache::AccountCache;
+use crate::metrics::Metrics;
 
 pub struct SimOutcome {
     pub compute_units: u64,
@@ -174,7 +175,9 @@ impl Simulator {
         alts: &[AddressLookupTableAccount],
         cache: &AccountCache,
         min_acceptable_out: u64,
+        metrics: &Metrics,
     ) -> Result<SimOutcome> {
+        metrics.sim_executed.fetch_add(1, Ordering::Relaxed);
         // Collect every pubkey referenced by the tx (static keys + ALT entries).
         let accounts = collect_tx_accounts(tx, alts);
 
@@ -287,12 +290,14 @@ impl Simulator {
 
                 let cu = info.meta.compute_units_consumed;
                 if wsol_after < min_acceptable_out {
+                    metrics.sim_slippage_rejected.fetch_add(1, Ordering::Relaxed);
                     anyhow::bail!(
                         "sim unprofitable: wsol_after={} < min={}",
                         wsol_after,
                         min_acceptable_out
                     );
                 }
+                metrics.sim_passed.fetch_add(1, Ordering::Relaxed);
                 Ok(SimOutcome {
                     compute_units: cu,
                     wsol_after,
@@ -307,6 +312,7 @@ impl Simulator {
                 // emitted before erroring. Custom error codes alone don't
                 // tell us if the issue is oracle staleness, owner mismatch,
                 // signature check, etc.; the program's own `msg!` lines do.
+                metrics.sim_revert_rejected.fetch_add(1, Ordering::Relaxed);
                 if self.fail_closed {
                     anyhow::bail!(
                         "sim reverted: err={:?} logs={:#?}",
@@ -319,6 +325,8 @@ impl Simulator {
                         logs = ?meta.meta.logs,
                         "sim reverted but fail_open=true, allowing send"
                     );
+                    // fail_open: we still forward to Jito — treat as passed
+                    metrics.sim_passed.fetch_add(1, Ordering::Relaxed);
                     Ok(SimOutcome {
                         compute_units: meta.meta.compute_units_consumed,
                         wsol_after: 0,
