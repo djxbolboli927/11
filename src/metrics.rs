@@ -16,6 +16,17 @@ pub struct Metrics {
     pub metis_quotes: AtomicU64,
     /// 2. Profitable opportunities identified (gross profit > tip + base_fee)
     pub metis_profitable: AtomicU64,
+    /// 2a. Profitable opportunities dropped by the Jito per-second rate limiter
+    ///     BEFORE they reach the simulator. This is usually the biggest gap
+    ///     between `metis_profitable` and `sim_submitted`: Metis returns many
+    ///     profitable quotes in a burst, the rate limiter only lets
+    ///     `max_bundles_per_second` through per rolling 1-second window, and
+    ///     the rest are dropped.
+    pub jito_rate_limited: AtomicU64,
+    /// 2b. Tx build / serialize / size-check failed (too large, >1232 bytes, or
+    ///     ALT resolve error). Also contributes to the profitable -> submitted
+    ///     gap, but usually tiny.
+    pub tx_build_failed: AtomicU64,
     /// 3. Opportunities submitted to the simulator (sim enabled path only)
     pub sim_submitted: AtomicU64,
     /// 4. Simulations actually executed inside LiteSVM
@@ -35,6 +46,8 @@ impl Metrics {
         Arc::new(Self {
             metis_quotes: AtomicU64::new(0),
             metis_profitable: AtomicU64::new(0),
+            jito_rate_limited: AtomicU64::new(0),
+            tx_build_failed: AtomicU64::new(0),
             sim_submitted: AtomicU64::new(0),
             sim_executed: AtomicU64::new(0),
             sim_slippage_rejected: AtomicU64::new(0),
@@ -53,18 +66,22 @@ impl Metrics {
             interval.tick().await; // discard the immediate first tick
             loop {
                 interval.tick().await;
-                let quotes    = m.metis_quotes.swap(0, Ordering::Relaxed);
-                let profit    = m.metis_profitable.swap(0, Ordering::Relaxed);
-                let submitted = m.sim_submitted.swap(0, Ordering::Relaxed);
-                let executed  = m.sim_executed.swap(0, Ordering::Relaxed);
-                let slippage  = m.sim_slippage_rejected.swap(0, Ordering::Relaxed);
-                let revert    = m.sim_revert_rejected.swap(0, Ordering::Relaxed);
-                let passed    = m.sim_passed.swap(0, Ordering::Relaxed);
-                let sent      = m.jito_sent.swap(0, Ordering::Relaxed);
+                let quotes     = m.metis_quotes.swap(0, Ordering::Relaxed);
+                let profit     = m.metis_profitable.swap(0, Ordering::Relaxed);
+                let ratelim    = m.jito_rate_limited.swap(0, Ordering::Relaxed);
+                let build_fail = m.tx_build_failed.swap(0, Ordering::Relaxed);
+                let submitted  = m.sim_submitted.swap(0, Ordering::Relaxed);
+                let executed   = m.sim_executed.swap(0, Ordering::Relaxed);
+                let slippage   = m.sim_slippage_rejected.swap(0, Ordering::Relaxed);
+                let revert     = m.sim_revert_rejected.swap(0, Ordering::Relaxed);
+                let passed     = m.sim_passed.swap(0, Ordering::Relaxed);
+                let sent       = m.jito_sent.swap(0, Ordering::Relaxed);
                 info!(
                     window_secs        = WINDOW_SECS,
                     metis_quotes       = quotes,
                     metis_profitable   = profit,
+                    jito_rate_limited  = ratelim,
+                    tx_build_failed    = build_fail,
                     sim_submitted      = submitted,
                     sim_executed       = executed,
                     sim_slippage_rej   = slippage,

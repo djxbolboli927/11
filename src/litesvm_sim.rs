@@ -60,11 +60,18 @@ impl Simulator {
     /// Load every program listed in `program_registry::PROGRAMS` from
     /// `so_dir`. Missing files are skipped with a warning so a partial
     /// mapping doesn't block startup.
+    ///
+    /// `current_slot` is a SHARED Arc<AtomicU64> owned by the pool; every
+    /// worker reads from the same atomic, so the live-mainnet-slot refresh
+    /// task runs ONCE for the whole pool, not once per worker. Before this
+    /// change, 8 workers caused 8 `get_slot` RPC calls per second, which
+    /// combined with blockhash refresh (~3.3/sec) quickly tripped Shyft's
+    /// rate limits and produced 429 errors in the sim thread.
     pub fn new(
         so_dir: &str,
         wsol_ata: Pubkey,
         fail_closed: bool,
-        rpc: Arc<RpcClient>,
+        current_slot: Arc<AtomicU64>,
     ) -> Result<Self> {
         let mut svm = LiteSVM::new()
             .with_sysvars()
@@ -91,13 +98,9 @@ impl Simulator {
         //    "future" value (e.g. 1e12) makes EVERY quote look ancient
         //    and triggers the same failure.
         //
-        // Fetch live mainnet slot once at startup, then keep it fresh via
-        // a tokio background task (similar to BlockhashCache). Each
-        // simulate() reads the atomic and pushes it into Clock.slot.
-        // unix_timestamp gets the same treatment using SystemTime::now().
-        let initial_slot = rpc
-            .get_slot()
-            .context("initial RPC get_slot for sim Clock failed")?;
+        // The slot value is fed from the shared `current_slot` atomic,
+        // refreshed by the pool-level background task once per second.
+        let initial_slot = current_slot.load(Ordering::Relaxed);
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -107,26 +110,7 @@ impl Simulator {
         clock.unix_timestamp = now_ts;
         clock.epoch_start_timestamp = now_ts;
         svm.set_sysvar::<Clock>(&clock);
-        info!(initial_slot, "sim Clock initialised with live mainnet slot");
-
-        let current_slot = Arc::new(AtomicU64::new(initial_slot));
-        let slot_for_task = current_slot.clone();
-        let rpc_for_task = rpc.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                ticker.tick().await;
-                let rpc_inner = rpc_for_task.clone();
-                let res = tokio::task::spawn_blocking(move || rpc_inner.get_slot()).await;
-                match res {
-                    Ok(Ok(s)) => {
-                        slot_for_task.store(s, Ordering::Relaxed);
-                    }
-                    Ok(Err(e)) => warn!(error = %e, "slot RPC refresh failed"),
-                    Err(e) => warn!(error = %e, "slot refresh task panicked"),
-                }
-            }
-        });
+        debug!(initial_slot, "sim Clock initialised with shared mainnet slot");
 
         let mut loaded = 0usize;
         let mut missing = 0usize;
@@ -403,6 +387,12 @@ pub struct SimulatorPool {
 
 impl SimulatorPool {
     /// Build `workers` independent Simulators. Minimum of 1 is enforced.
+    ///
+    /// A SINGLE background task refreshes the live mainnet slot once per
+    /// second and shares it with every worker via an `Arc<AtomicU64>`. Before
+    /// this, each of N workers ran its own 1-sec refresh task -> N RPCs/sec
+    /// just on `getSlot`, which combined with blockhash refresh was the main
+    /// cause of 429 rate-limit errors on the sim path.
     pub fn new(
         workers: usize,
         so_dir: &str,
@@ -411,9 +401,35 @@ impl SimulatorPool {
         rpc: Arc<RpcClient>,
     ) -> Result<Self> {
         let workers = workers.max(1);
+
+        // One-shot initial slot for all workers so they start with the same
+        // Clock. After startup the shared refresh task keeps the atomic fresh.
+        let initial_slot = rpc
+            .get_slot()
+            .context("initial RPC get_slot for sim Clock failed")?;
+        let current_slot = Arc::new(AtomicU64::new(initial_slot));
+        info!(initial_slot, "sim pool Clock initialised with live mainnet slot");
+
+        // Single background refresher shared by every worker.
+        let slot_for_task = current_slot.clone();
+        let rpc_for_task = rpc.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let rpc_inner = rpc_for_task.clone();
+                let res = tokio::task::spawn_blocking(move || rpc_inner.get_slot()).await;
+                match res {
+                    Ok(Ok(s)) => slot_for_task.store(s, Ordering::Relaxed),
+                    Ok(Err(e)) => warn!(error = %e, "slot RPC refresh failed"),
+                    Err(e) => warn!(error = %e, "slot refresh task panicked"),
+                }
+            }
+        });
+
         let mut sims = Vec::with_capacity(workers);
         for i in 0..workers {
-            let sim = Simulator::new(so_dir, wsol_ata, fail_closed, rpc.clone())
+            let sim = Simulator::new(so_dir, wsol_ata, fail_closed, current_slot.clone())
                 .with_context(|| format!("failed to build sim worker #{i}"))?;
             sims.push(Arc::new(sim));
             info!(worker = i, "sim worker initialised");

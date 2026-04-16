@@ -241,6 +241,7 @@ pub async fn scan_all_tokens(
         };
 
         if !jito_limiter.try_acquire() {
+            metrics.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
             debug!(token = opp.token_mint.as_str(), "jito rate limit hit, dropping");
             continue;
         }
@@ -269,6 +270,7 @@ pub async fn scan_all_tokens(
         ) {
             Ok(tx) => tx,
             Err(e) => {
+                metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
                 warn!(error = %e, token = opp.token_mint.as_str(), "tx build failed");
                 continue;
             }
@@ -277,6 +279,7 @@ pub async fn scan_all_tokens(
         // Tx size check here so we don't consume a Jito send for a doomed tx.
         match bincode::serialize(&tx) {
             Ok(bytes) if bytes.len() > 1232 => {
+                metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     token = opp.token_mint.as_str(),
                     bytes = bytes.len(),
@@ -286,6 +289,7 @@ pub async fn scan_all_tokens(
             }
             Ok(_) => {}
             Err(e) => {
+                metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
                 warn!(error = %e, token = opp.token_mint.as_str(), "tx serialize failed");
                 continue;
             }
@@ -335,6 +339,7 @@ pub async fn scan_all_tokens(
             ) {
                 Ok(a) => Some(a),
                 Err(e) => {
+                    metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
                     warn!(error = %e, token = opp.token_mint.as_str(), "sim ALT resolve failed");
                     continue;
                 }
