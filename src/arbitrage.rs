@@ -11,12 +11,54 @@ use crate::blockhash_cache::BlockhashCache;
 use crate::config::Config;
 use crate::jito::JitoClient;
 use crate::litesvm_sim::{self, Simulator};
-use crate::metis::{MetisClient, SwapInstructionsResponse};
+use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
+use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS};
 use crate::rate_limiter::RateLimiter;
 use crate::tokens::WSOL_MINT;
 use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+
+/// Inspect a Metis quote's `route_plan` and return true if any hop is served
+/// by a DEX we have banned (proprietary PMMs that simulate-revert deterministically).
+/// We check both `swapInfo.label` (string match, case-insensitive) and any
+/// nested field whose value happens to be one of the banned program ids.
+/// Belt-and-suspenders: even if Metis ignores `excludeDexes` on the URL, the
+/// route is dropped here BEFORE we waste a /swap-instructions call.
+fn route_uses_forbidden_dex(quote: &QuoteResponse) -> bool {
+    let arr = match quote.route_plan.as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    for hop in arr {
+        let swap_info = match hop.get("swapInfo") {
+            Some(s) => s,
+            None => continue,
+        };
+        if let Some(label) = swap_info.get("label").and_then(|v| v.as_str()) {
+            for banned in FORBIDDEN_DEX_LABELS {
+                if label.eq_ignore_ascii_case(banned)
+                    || label.to_ascii_lowercase().contains(&banned.to_ascii_lowercase())
+                {
+                    return true;
+                }
+            }
+        }
+        // Some Metis builds expose the program id directly (e.g. "ammKey" is
+        // the pool, but "programId"/"dexProgramId" can appear too). Scan all
+        // string values in the swapInfo blob for any banned program id.
+        if let Some(obj) = swap_info.as_object() {
+            for v in obj.values() {
+                if let Some(s) = v.as_str() {
+                    if FORBIDDEN_DEX_PROGRAM_IDS.iter().any(|p| *p == s) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
 
 fn lookup_cu_limit(hop_count: usize, cu_limits: &[u32]) -> u32 {
     if cu_limits.is_empty() {
@@ -64,6 +106,14 @@ async fn check_opportunity(
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
     if output_wsol <= amount {
+        return None;
+    }
+
+    // Defensive: drop opportunities whose route touches a banned DEX even if
+    // Metis ignored `excludeDexes` on the URL. Saves the /swap-instructions
+    // round-trip and the eventual sim revert + base-fee burn.
+    if route_uses_forbidden_dex(&quote1) || route_uses_forbidden_dex(&quote2) {
+        debug!(token = token_mint, "skipping route through forbidden PMM");
         return None;
     }
 

@@ -106,6 +106,12 @@ impl MetisClient {
     ///   `bps: 10000` (instead of legacy `percent: 100`). When this QuoteResponse
     ///   is later sent to /swap-instructions, Metis builds a `route_v2` instruction
     ///   which costs fewer compute units and is what competing arb bots use.
+    /// - excludeDexes=Tessera+V,GoonFi,SolFi,SolFi+V2,ZeroFi: proprietary PMMs
+    ///   that rely on same-slot oracle freshness in the Jito auction. They cannot
+    ///   be simulated locally (every sim reverts with their proprietary error
+    ///   codes) and we have removed them from `program_registry::PROGRAMS`.
+    ///   Asking Metis to never propose them in the first place is the cheapest
+    ///   filter; `arbitrage::route_uses_forbidden_dex` is the defensive fallback.
     pub async fn get_quote(
         &self,
         input_mint: &str,
@@ -120,7 +126,8 @@ impl MetisClient {
              &swapMode=ExactIn\
              &forJitoBundle=true\
              &restrictIntermediateTokens=false\
-             &instructionVersion=V2",
+             &instructionVersion=V2\
+             &excludeDexes=Tessera%20V,GoonFi,SolFi,SolFi%20V2,ZeroFi",
             self.base_url, input_mint, output_mint, amount_lamports
         );
 
