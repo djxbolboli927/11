@@ -18,7 +18,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::signer::Signer;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use tracing::{error, info, warn};
 
@@ -38,9 +38,6 @@ fn main() -> Result<()> {
     let config = config::Config::load("config.toml")?;
     info!("config loaded");
 
-    // Build a multi-thread tokio runtime with EXACTLY the number of worker
-    // threads requested in [performance].threads. If bot_cpu_cores is set,
-    // pin each worker thread to a specific core via core_affinity.
     let worker_threads = config.performance.threads.max(1);
     let pinned_cores: Vec<usize> = config.performance.bot_cpu_cores.clone();
     let available_cores = core_affinity::get_core_ids().unwrap_or_default();
@@ -90,7 +87,6 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
 
-    // Verify WSOL ATA exists
     let wsol_mint = solana_sdk::pubkey::Pubkey::from_str_const(tokens::WSOL_MINT);
     let wsol_ata = spl_associated_token_account::get_associated_token_address(
         &trading_keypair.pubkey(),
@@ -107,24 +103,19 @@ async fn async_main(config: config::Config) -> Result<()> {
         }
     }
 
-    // Pipeline metrics — logs a 120-second rolling window every 2 minutes.
     let metrics = metrics::Metrics::new();
     metrics.spawn_reporter();
     info!("pipeline metrics reporter started (120s window)");
 
-    // BlockhashCache -- refreshes every 300ms in background
     let blockhash_cache = BlockhashCache::new(rpc_client.clone());
     info!("blockhash cache initialized (refresh every 300ms)");
 
-    // AltCache -- Jito tip accounts excluded from ALT entries
     let tip_pubkeys = transaction::jito_tip_pubkeys();
     let alt_cache = AltCache::new(tip_pubkeys);
     info!("ALT cache initialized");
 
     let metis = metis::MetisClient::new(&config.metis.url, config.performance.quote_timeout_ms);
 
-    // Multi-region Jito client -- sends to ALL endpoints concurrently.
-    // Wrapped in Arc so send tasks can be tokio::spawn'd with 'static lifetime.
     let jito_client = Arc::new(jito::JitoClient::new(&config.jito.urls, &config.jito.uuid));
     info!(
         regions = config.jito.urls.len(),
@@ -132,15 +123,24 @@ async fn async_main(config: config::Config) -> Result<()> {
         "Jito multi-region client ready"
     );
 
-    let mut jito_limiter = RateLimiter::new(config.jito.max_bundles_per_second);
+    // Arc<Mutex<>> so spawned sim tasks can acquire after sim passes.
+    let jito_limiter = Arc::new(Mutex::new(
+        RateLimiter::new(config.jito.max_bundles_per_second),
+    ));
 
-    // -- LiteSVM pre-flight simulation (optional, enabled via [simulation]) --
-    // Spins up an AccountCache backed by the same Yellowstone gRPC stream
-    // Metis reads from, plus a Simulator that loads every DEX .so at startup.
-    // On every profitable opportunity, scan_all_tokens will ask the Simulator
-    // to run the tx locally before paying for a Jito base fee.
     let (sim_cache, sim_pool) = if config.simulation.enabled {
         let cache = account_cache::AccountCache::new(rpc_client.clone());
+
+        // Seed the Yellowstone slot with a one-time RPC call so sims have
+        // a valid Clock.slot before the first gRPC message arrives.
+        match rpc_client.get_slot() {
+            Ok(s) => {
+                cache.seed_slot(s);
+                info!(initial_slot = s, "sim Clock seeded from RPC (one-time)");
+            }
+            Err(e) => warn!(error = %e, "initial get_slot failed, sims start at slot 0"),
+        }
+
         cache.spawn_subscription(
             config.yellowstone_grpc.endpoint.clone(),
             config.yellowstone_grpc.x_token.clone(),
@@ -153,14 +153,6 @@ async fn async_main(config: config::Config) -> Result<()> {
             "Yellowstone account cache subscribed"
         );
 
-        // Pre-warm: token mints, the user's WSOL ATA, the trading wallet
-        // itself, AND the user's token ATA for every mint in tokens.txt are
-        // not streamed via the DEX-owner filter (they are owned by SPL Token
-        // / System Program). Fetch once from RPC so the first sim doesn't
-        // miss them. Symptoms of misses:
-        //   * Missing payer        -> "Payer account <pk> not found"
-        //   * Missing token ATA    -> Jupiter custom error 6025 / 0x1789
-        //                            ("InvalidTokenAccount")
         let mut warm: Vec<solana_sdk::pubkey::Pubkey> = token_mints
             .iter()
             .filter_map(|s| solana_sdk::pubkey::Pubkey::try_from(s.as_str()).ok())
@@ -180,12 +172,13 @@ async fn async_main(config: config::Config) -> Result<()> {
         cache.prefetch(&warm);
         info!(warmed = cache.len(), "account cache pre-warmed");
 
+        // SimulatorPool gets its slot from the Yellowstone stream — zero RPC.
         let pool = litesvm_sim::SimulatorPool::new(
             config.simulation.workers,
             &config.simulation.so_dir,
             wsol_ata,
             config.simulation.fail_closed,
-            rpc_client.clone(),
+            cache.stream_slot(),
         )?;
         (Some(Arc::new(cache)), Some(Arc::new(pool)))
     } else {
@@ -210,7 +203,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             &jito_client,
             &trading_keypair,
             &rpc_client,
-            &mut jito_limiter,
+            &jito_limiter,
             &blockhash_cache,
             &alt_cache,
             sim_cache.as_ref(),

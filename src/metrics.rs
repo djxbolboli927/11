@@ -16,12 +16,11 @@ pub struct Metrics {
     pub metis_quotes: AtomicU64,
     /// 2. Profitable opportunities identified (gross profit > tip + base_fee)
     pub metis_profitable: AtomicU64,
-    /// 2a. Profitable opportunities dropped by the Jito per-second rate limiter
-    ///     BEFORE they reach the simulator. This is usually the biggest gap
-    ///     between `metis_profitable` and `sim_submitted`: Metis returns many
-    ///     profitable quotes in a burst, the rate limiter only lets
-    ///     `max_bundles_per_second` through per rolling 1-second window, and
-    ///     the rest are dropped.
+    /// 2a. Sim-passed opportunities dropped by the Jito per-second rate
+    ///     limiter. This counter is bumped AFTER simulation passes, right
+    ///     before `send_bundle`. A non-zero value means we found and
+    ///     validated more profitable arbs than `max_bundles_per_second`
+    ///     allows — consider raising the config value.
     pub jito_rate_limited: AtomicU64,
     /// 2b. Tx build / serialize / size-check failed (too large, >1232 bytes, or
     ///     ALT resolve error). Also contributes to the profitable -> submitted
@@ -76,17 +75,23 @@ impl Metrics {
                 let revert     = m.sim_revert_rejected.swap(0, Ordering::Relaxed);
                 let passed     = m.sim_passed.swap(0, Ordering::Relaxed);
                 let sent       = m.jito_sent.swap(0, Ordering::Relaxed);
+                let coverage_pct = if profit > 0 {
+                    submitted * 100 / profit
+                } else {
+                    100
+                };
                 info!(
                     window_secs        = WINDOW_SECS,
                     metis_quotes       = quotes,
                     metis_profitable   = profit,
-                    jito_rate_limited  = ratelim,
                     tx_build_failed    = build_fail,
                     sim_submitted      = submitted,
+                    sim_coverage_pct   = coverage_pct,
                     sim_executed       = executed,
                     sim_slippage_rej   = slippage,
                     sim_revert_rej     = revert,
                     sim_passed         = passed,
+                    jito_rate_limited  = ratelim,
                     jito_sent          = sent,
                     "==[PIPELINE METRICS]==",
                 );

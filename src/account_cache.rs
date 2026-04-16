@@ -22,6 +22,7 @@ use solana_account::Account;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -37,6 +38,9 @@ use yellowstone_grpc_proto::prelude::{
 pub struct AccountCache {
     inner: Arc<DashMap<Pubkey, Account>>,
     rpc: Arc<RpcClient>,
+    /// Slot of the most recent Yellowstone account update. The simulator
+    /// reads this to set LiteSVM's Clock.slot — no RPC call needed.
+    stream_slot: Arc<AtomicU64>,
 }
 
 impl AccountCache {
@@ -44,7 +48,20 @@ impl AccountCache {
         Self {
             inner: Arc::new(DashMap::with_capacity(4096)),
             rpc,
+            stream_slot: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The latest slot seen from the Yellowstone stream. The sim pool reads
+    /// this instead of making its own `get_slot` RPC.
+    pub fn stream_slot(&self) -> Arc<AtomicU64> {
+        self.stream_slot.clone()
+    }
+
+    /// Seed the stream slot with an initial value (from RPC at startup)
+    /// so sims have a valid Clock.slot before the first Yellowstone message.
+    pub fn seed_slot(&self, slot: u64) {
+        self.stream_slot.store(slot, Ordering::Relaxed);
     }
 
     /// Fast path: read from the hot cache. Returns None if not yet populated.
@@ -64,7 +81,6 @@ impl AccountCache {
             .rpc
             .get_account(pubkey)
             .with_context(|| format!("RPC fetch of {pubkey} failed"))?;
-        // Convert solana_sdk::Account -> solana_account::Account via field copy.
         let account = Account {
             lamports: acct.lamports,
             data: acct.data,
@@ -86,46 +102,6 @@ impl AccountCache {
         }
     }
 
-    /// Batch-fetch every pubkey not already in the cache via a single
-    /// `getMultipleAccounts` RPC call. Used by the simulator before each tx
-    /// because Yellowstone's account subscription only streams UPDATES (no
-    /// initial snapshot), so a pool that hasn't traded since startup will be
-    /// missing from the cache and LiteSVM will reject the tx with errors
-    /// like `InvalidAccountData` or Jupiter custom 6025 (`InvalidTokenAccount`).
-    /// `getMultipleAccounts` accepts up to 100 pubkeys per call; we chunk
-    /// defensively. Accounts that don't exist on-chain are silently skipped.
-    pub fn batch_fetch_missing(&self, pubkeys: &[Pubkey]) {
-        let missing: Vec<Pubkey> = pubkeys
-            .iter()
-            .filter(|pk| self.inner.get(pk).is_none())
-            .copied()
-            .collect();
-        if missing.is_empty() {
-            return;
-        }
-        for chunk in missing.chunks(100) {
-            match self.rpc.get_multiple_accounts(chunk) {
-                Ok(results) => {
-                    for (pk, opt) in chunk.iter().zip(results.into_iter()) {
-                        if let Some(acct) = opt {
-                            let account = Account {
-                                lamports: acct.lamports,
-                                data: acct.data,
-                                owner: acct.owner,
-                                executable: acct.executable,
-                                rent_epoch: acct.rent_epoch,
-                            };
-                            self.inner.insert(*pk, account);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, n = chunk.len(), "batch_fetch RPC failed");
-                }
-            }
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -140,6 +116,7 @@ impl AccountCache {
         extra_accounts: Vec<Pubkey>,
     ) {
         let cache = self.inner.clone();
+        let stream_slot = self.stream_slot.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
             loop {
@@ -149,6 +126,7 @@ impl AccountCache {
                     &dex_program_ids,
                     &extra_accounts,
                     &cache,
+                    &stream_slot,
                 )
                 .await
                 {
@@ -172,6 +150,7 @@ async fn run_stream(
     dex_program_ids: &[String],
     extra_accounts: &[Pubkey],
     cache: &Arc<DashMap<Pubkey, Account>>,
+    stream_slot: &Arc<AtomicU64>,
 ) -> Result<()> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
         .x_token(Some(x_token.to_string()))?
@@ -234,6 +213,10 @@ async fn run_stream(
         let msg = msg.context("stream yielded error")?;
         match msg.update_oneof {
             Some(UpdateOneof::Account(a)) => {
+                // Update the stream slot from every account message so the
+                // simulator always has a fresh mainnet slot for Clock.slot.
+                stream_slot.store(a.slot, Ordering::Relaxed);
+
                 if let Some(info) = a.account {
                     let pk = match Pubkey::try_from(info.pubkey.as_slice()) {
                         Ok(p) => p,
@@ -256,7 +239,6 @@ async fn run_stream(
                 }
             }
             Some(UpdateOneof::Ping(_)) => {
-                // Keep the channel alive.
                 let _ = tx
                     .send(SubscribeRequest {
                         ping: Some(SubscribeRequestPing { id: 1 }),

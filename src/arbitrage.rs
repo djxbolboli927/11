@@ -3,7 +3,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{signature::Keypair, signer::Signer};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::account_cache::AccountCache;
@@ -21,12 +21,6 @@ use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
-/// Inspect a Metis quote's `route_plan` and return true if any hop is served
-/// by a DEX we have banned (proprietary PMMs that simulate-revert deterministically).
-/// We check both `swapInfo.label` (string match, case-insensitive) and any
-/// nested field whose value happens to be one of the banned program ids.
-/// Belt-and-suspenders: even if Metis ignores `excludeDexes` on the URL, the
-/// route is dropped here BEFORE we waste a /swap-instructions call.
 fn route_uses_forbidden_dex(quote: &QuoteResponse) -> bool {
     let arr = match quote.route_plan.as_array() {
         Some(a) => a,
@@ -46,9 +40,6 @@ fn route_uses_forbidden_dex(quote: &QuoteResponse) -> bool {
                 }
             }
         }
-        // Some Metis builds expose the program id directly (e.g. "ammKey" is
-        // the pool, but "programId"/"dexProgramId" can appear too). Scan all
-        // string values in the swapInfo blob for any banned program id.
         if let Some(obj) = swap_info.as_object() {
             for v in obj.values() {
                 if let Some(s) = v.as_str() {
@@ -71,8 +62,6 @@ fn lookup_cu_limit(hop_count: usize, cu_limits: &[u32]) -> u32 {
     cu_limits[clamped]
 }
 
-/// A profitable opportunity with PRE-FETCHED swap instructions.
-/// By the time we build the tx, no more Metis calls are needed.
 struct Opportunity {
     token_mint: String,
     amount: u64,
@@ -84,9 +73,6 @@ struct Opportunity {
     cu_limit: u32,
 }
 
-/// Check a single (amount, token) pair for profitability.
-/// If profitable, ALSO fetch swap-instructions in the same concurrent task.
-/// This moves the 3rd Metis call OUT of the critical path.
 async fn check_opportunity(
     metis: &MetisClient,
     token_mint: &str,
@@ -100,14 +86,11 @@ async fn check_opportunity(
     cu_limits: &[u32],
     metrics: &Metrics,
 ) -> Option<Opportunity> {
-    // Count every screened pair whether profitable or not.
     metrics.metis_quotes.fetch_add(1, Ordering::Relaxed);
 
-    // Leg 1: WSOL -> Token
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
 
-    // Leg 2: Token -> WSOL (input = output of leg 1)
     let quote2 = metis.get_quote(token_mint, WSOL_MINT, token_amount).await.ok()?;
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
@@ -115,9 +98,6 @@ async fn check_opportunity(
         return None;
     }
 
-    // Defensive: drop opportunities whose route touches a banned DEX even if
-    // Metis ignored `excludeDexes` on the URL. Saves the /swap-instructions
-    // round-trip and the eventual sim revert + base-fee burn.
     if route_uses_forbidden_dex(&quote1) || route_uses_forbidden_dex(&quote2) {
         debug!(token = token_mint, "skipping route through forbidden PMM");
         return None;
@@ -131,19 +111,11 @@ async fn check_opportunity(
         return None;
     }
 
-    // On-chain break-even floor. The tx reverts ONLY if the final output would
-    // be less than input + tip + base_fee (i.e. an actual net loss). Any positive
-    // slippage -- or even a shrunk-but-still-profitable outcome -- still lands.
-    // This is what competing arb bots do; locking threshold to quote2.out_amount
-    // (zero negative slippage) was the root cause of frequent reverts.
     let min_acceptable_out = amount + total_costs;
 
     let merged_quote =
         MetisClient::merge_quotes(&quote1, &quote2, min_acceptable_out).ok()?;
 
-    // Sanity check: if the Metis binary is older than v7.0.5, it ignores
-    // instructionVersion=V2 and still emits legacy `route`. Log (don't abort)
-    // so a stale server is visible in production traces.
     if merged_quote.instruction_version.as_deref() != Some("V2") {
         debug!(
             token = token_mint,
@@ -157,8 +129,6 @@ async fn check_opportunity(
         .map(|a| a.len())
         .unwrap_or(2);
 
-    // CRITICAL: fetch swap-instructions HERE (concurrent with other scans).
-    // This removes the 3-5ms gap between "opportunity found" and "tx sent".
     let swap_ixs = metis
         .get_swap_instructions(user_pubkey, &merged_quote)
         .await
@@ -181,8 +151,11 @@ async fn check_opportunity(
 }
 
 /// Scan ALL (amount x token) pairs concurrently.
-/// For each profitable pair, swap-instructions is pre-fetched in the same task.
-/// First ready Opportunity triggers immediate tx build + send -- NO more Metis calls.
+///
+/// EVERY profitable opportunity goes to the simulator — no rate limiting
+/// before sim. The Jito rate limiter only applies AFTER a sim passes,
+/// right before send_bundle. This ensures the metrics show:
+///   `metis_profitable ≈ sim_submitted = sim_executed`
 pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
@@ -190,7 +163,7 @@ pub async fn scan_all_tokens(
     jito: &Arc<JitoClient>,
     trading_keypair: &Keypair,
     rpc_client: &RpcClient,
-    jito_limiter: &mut RateLimiter,
+    jito_limiter: &Arc<Mutex<RateLimiter>>,
     blockhash_cache: &BlockhashCache,
     alt_cache: &AltCache,
     sim_cache: Option<&Arc<AccountCache>>,
@@ -226,25 +199,11 @@ pub async fn scan_all_tokens(
         amount += step_lamports;
     }
 
-    // PARALLEL EXECUTION: as each profitable opportunity is ready, we IMMEDIATELY
-    // build its tx AND kick off the Jito HTTP send on the tokio runtime via
-    // `tokio::spawn`. UNLIKE `FuturesUnordered::push` (which only queues a future
-    // and never polls it until the owner calls `.next().await`), `tokio::spawn`
-    // starts executing the future on a worker thread the moment it is spawned.
-    // That is crucial here: we do NOT want to wait for all quote tasks to finish
-    // before the FIRST send hits the wire. Every ~100ms of delay against a fresh
-    // quote is enough for the pool to move and the tx to revert on slippage.
     while let Some(result) = futs.next().await {
         let opp = match result {
             Some(opp) => opp,
             None => continue,
         };
-
-        if !jito_limiter.try_acquire() {
-            metrics.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
-            debug!(token = opp.token_mint.as_str(), "jito rate limit hit, dropping");
-            continue;
-        }
 
         info!(
             token = opp.token_mint.as_str(),
@@ -254,10 +213,9 @@ pub async fn scan_all_tokens(
             tip_lamports = opp.tip_lamports,
             hops = opp.hop_count,
             cu_limit = opp.cu_limit,
-            "PROFITABLE -- instructions ready, building tx"
+            "PROFITABLE -- building tx"
         );
 
-        // Build the tx synchronously (CPU-bound, ~0.5ms; ALTs served from cache).
         let recent_blockhash = blockhash_cache.get();
         let tx = match transaction::build_arb_transaction(
             &opp.swap_ixs,
@@ -276,7 +234,6 @@ pub async fn scan_all_tokens(
             }
         };
 
-        // Tx size check here so we don't consume a Jito send for a doomed tx.
         match bincode::serialize(&tx) {
             Ok(bytes) if bytes.len() > 1232 => {
                 metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
@@ -295,31 +252,8 @@ pub async fn scan_all_tokens(
             }
         }
 
-        // -- Sim + Jito send, DISPATCHED OFF-LOOP --
-        //
-        // The entire "resolve ALTs -> pick worker -> simulate -> send bundle"
-        // chain is moved into a `tokio::spawn`. The main loop does ZERO work
-        // past this point and immediately polls the next opportunity from
-        // `futs`. Why it matters:
-        //
-        //   * Each sim takes ~2-5ms of CPU on a single LiteSVM mutex. With
-        //     the old code we blocked the main loop for the full sim
-        //     duration, so opportunities N+1, N+2, ... went stale while
-        //     opportunity N was simulated serially.
-        //
-        //   * With N parallel Simulator workers (SimulatorPool) and one
-        //     tokio task per opportunity, we can now run up to N sims
-        //     concurrently. The mutex contention is limited to "same
-        //     worker picked twice" which round-robin minimises.
-        //
-        //   * Total budget from `opp` ready -> Jito POST on the wire stays
-        //     at sim_latency (2-5ms) + bundle HTTP (async) -- never serial
-        //     accumulation.
-        //
-        // If sim is disabled the spawned task just sends; we still spawn
-        // so the send's HTTP round-trip (tens of ms) doesn't block the
-        // scan loop either.
         let jito_clone = jito.clone();
+        let jito_limiter_clone = jito_limiter.clone();
         let metrics_clone = metrics.clone();
         let token_for_log = opp.token_mint.clone();
         let profit_for_log = opp.net_profit;
@@ -327,10 +261,6 @@ pub async fn scan_all_tokens(
         let expected_out_for_log = opp.output_wsol;
         let min_acceptable_out = opp.amount + opp.tip_lamports + base_fee;
 
-        // ALT resolve is CHEAP (cache hit after first sim; pure hash lookup),
-        // so we do it here on the scan thread rather than in the spawned task.
-        // This avoids copying the entire SwapInstructionsResponse into the
-        // closure.
         let alts_for_sim = match (sim_cache, sim_pool) {
             (Some(_), Some(_)) => match litesvm_sim::resolve_alts(
                 &opp.swap_ixs.address_lookup_table_addresses,
@@ -351,7 +281,7 @@ pub async fn scan_all_tokens(
         let sim_worker = sim_pool.map(|p| p.acquire());
 
         tokio::spawn(async move {
-            // -- LiteSVM pre-flight gate (inside the spawned task) --
+            // -- Simulate ALL profitable txs (no rate limit here) --
             if let (Some(cache), Some(sim), Some(alts)) =
                 (sim_cache_for_task, sim_worker, alts_for_sim)
             {
@@ -362,7 +292,7 @@ pub async fn scan_all_tokens(
                             token = token_for_log.as_str(),
                             cu = outcome.compute_units,
                             wsol_after = outcome.wsol_after,
-                            "sim PASSED, sending to Jito"
+                            "sim PASSED"
                         );
                     }
                     Err(e) => {
@@ -371,11 +301,18 @@ pub async fn scan_all_tokens(
                             token = token_for_log.as_str(),
                             amount = amount_for_log,
                             expected_out = expected_out_for_log,
-                            "sim REJECTED, dropping (no Jito send, no fee paid)"
+                            "sim REJECTED, dropping"
                         );
                         return;
                     }
                 }
+            }
+
+            // Rate limit ONLY here — after sim passed, before Jito send.
+            if !jito_limiter_clone.lock().unwrap().try_acquire() {
+                metrics_clone.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
+                debug!(token = token_for_log.as_str(), "jito rate limit hit after sim pass");
+                return;
             }
 
             match jito_clone.send_bundle(&tx).await {

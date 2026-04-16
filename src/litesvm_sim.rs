@@ -1,4 +1,4 @@
-//! Local LiteSVM simulation gate.
+//! Local LiteSVM simulation gate — ZERO RPC on the hot path.
 //!
 //! For every profitable opportunity Metis finds, we build the final
 //! VersionedTransaction and hand it here BEFORE it reaches Jito. LiteSVM
@@ -15,11 +15,16 @@
 //! that the code path works -- the only remaining risk is that the pool
 //! state moved between our cached snapshot and the slot the tx lands in,
 //! which no local simulator can eliminate.
+//!
+//! DESIGN: simulate() does NOT make any RPC calls. Every account it needs
+//! must already be in the AccountCache (fed by Yellowstone gRPC + startup
+//! prefetch). If an account is missing, the sim fails fast — better a quick
+//! rejection than a 20-50ms RPC round-trip that kills latency. The Clock
+//! slot is also sourced from the Yellowstone stream, not from `getSlot`.
 
 use anyhow::{anyhow, Context, Result};
 use litesvm::LiteSVM;
 use solana_account::ReadableAccount;
-use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     address_lookup_table::AddressLookupTableAccount,
     clock::Clock,
@@ -30,7 +35,7 @@ use solana_sdk::{
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::account_cache::AccountCache;
@@ -42,31 +47,16 @@ pub struct SimOutcome {
 }
 
 pub struct Simulator {
-    /// LiteSVM is not Sync; a single Mutex serialises sim calls. Each sim is
-    /// ~2-5ms so contention is a non-issue at our 5 bundles/sec rate.
     svm: Mutex<LiteSVM>,
     wsol_ata: Pubkey,
     fail_closed: bool,
-    /// Live mainnet slot, refreshed by a background tokio task every second.
-    /// Read on every `simulate()` and pushed into LiteSVM's Clock so that
-    /// PMM-style DEXes (Tessera, GoonFi, SolFi, ZeroFi) which validate
-    /// `current_slot - oracle.last_update_slot < MAX_AGE_SLOTS` see a slot
-    /// close to mainnet's. Keeping a stale slot here is the same class of
-    /// failure as keeping a stale unix_timestamp.
+    /// Live mainnet slot, sourced from the Yellowstone gRPC stream
+    /// (via AccountCache::stream_slot). Updated by every account message
+    /// the stream delivers — NO RPC involved.
     current_slot: Arc<AtomicU64>,
 }
 
 impl Simulator {
-    /// Load every program listed in `program_registry::PROGRAMS` from
-    /// `so_dir`. Missing files are skipped with a warning so a partial
-    /// mapping doesn't block startup.
-    ///
-    /// `current_slot` is a SHARED Arc<AtomicU64> owned by the pool; every
-    /// worker reads from the same atomic, so the live-mainnet-slot refresh
-    /// task runs ONCE for the whole pool, not once per worker. Before this
-    /// change, 8 workers caused 8 `get_slot` RPC calls per second, which
-    /// combined with blockhash refresh (~3.3/sec) quickly tripped Shyft's
-    /// rate limits and produced 429 errors in the sim thread.
     pub fn new(
         so_dir: &str,
         wsol_ata: Pubkey,
@@ -80,26 +70,6 @@ impl Simulator {
             .with_blockhash_check(false)
             .with_spl_programs();
 
-        // CRITICAL: realistic Clock is required for two independent reasons.
-        //
-        // 1. ALT validation: solana-address-lookup-table-interface only
-        //    exposes addresses up to `last_extended_slot_start_index` when
-        //    `current_slot <= last_extended_slot` (see state.rs:173-177).
-        //    Need slot > last_extended_slot. Real mainnet slot is always
-        //    past every ALT's extension slot (an ALT can only have been
-        //    extended at a *past* slot), so live slot satisfies this.
-        //
-        // 2. Pool / quote freshness: PMM-style DEXes (Tessera, GoonFi,
-        //    SolFi, ZeroFi) validate `current_slot - last_update_slot <
-        //    MAX_AGE_SLOTS` (typically 100-200 slots, ~40-80s). They fail
-        //    SILENTLY in their entrypoint with proprietary error codes
-        //    (0xffff Tessera, 0x15 GoonFi, ...) before ever calling msg!,
-        //    which is exactly what we observe. Setting slot to a fake
-        //    "future" value (e.g. 1e12) makes EVERY quote look ancient
-        //    and triggers the same failure.
-        //
-        // The slot value is fed from the shared `current_slot` atomic,
-        // refreshed by the pool-level background task once per second.
         let initial_slot = current_slot.load(Ordering::Relaxed);
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -110,7 +80,7 @@ impl Simulator {
         clock.unix_timestamp = now_ts;
         clock.epoch_start_timestamp = now_ts;
         svm.set_sysvar::<Clock>(&clock);
-        debug!(initial_slot, "sim Clock initialised with shared mainnet slot");
+        debug!(initial_slot, "sim Clock initialised");
 
         let mut loaded = 0usize;
         let mut missing = 0usize;
@@ -149,10 +119,12 @@ impl Simulator {
 
     /// Simulate `tx` against `cache`. Returns `Ok(SimOutcome)` if the tx
     /// would succeed AND leaves at least `min_acceptable_out` lamports in
-    /// the user's WSOL ATA. `Err` otherwise -- caller should drop the send.
+    /// the user's WSOL ATA. `Err` otherwise — caller should drop the send.
     ///
-    /// `alts` is required to resolve lookup-table indexes into real pubkeys
-    /// so every account the tx touches can be injected.
+    /// **ZERO RPC calls.** Every account is read from the Yellowstone-fed
+    /// cache. Missing accounts cause the sim to fail fast (better than
+    /// adding 20-50ms RPC latency). The Clock slot comes from the
+    /// Yellowstone stream, not from `getSlot`.
     pub fn simulate(
         &self,
         tx: &VersionedTransaction,
@@ -162,29 +134,12 @@ impl Simulator {
         metrics: &Metrics,
     ) -> Result<SimOutcome> {
         metrics.sim_executed.fetch_add(1, Ordering::Relaxed);
-        // Collect every pubkey referenced by the tx (static keys + ALT entries).
-        let accounts = collect_tx_accounts(tx, alts);
 
-        // CRITICAL: Yellowstone's account subscription only streams UPDATES,
-        // not an initial snapshot. Any DEX pool that hasn't traded since
-        // bot startup is missing from the cache, and LiteSVM then rejects
-        // the tx with InvalidAccountData (DEX side) or Jupiter custom 6025
-        // (token-account side). Lazy-fetch every referenced account that
-        // is not yet in cache via a single getMultipleAccounts call. After
-        // the first sim that touches a given pool, future sims for that
-        // pool hit the cache (and Yellowstone keeps the cached entry fresh
-        // as updates flow in).
-        cache.batch_fetch_missing(&accounts);
+        let accounts = collect_tx_accounts(tx, alts);
 
         let mut svm = self.svm.lock().unwrap();
 
-        // Bump Clock.{slot,unix_timestamp} to live values BEFORE injecting
-        // accounts. PMM-style DEXes (Tessera, GoonFi, SolFi, ZeroFi) check
-        // both: `current_slot - quote.last_slot < MAX_AGE_SLOTS` AND
-        // `unix_timestamp - quote.last_ts < MAX_AGE_SECS`. If either is
-        // stale they fail their entrypoint with proprietary error codes
-        // BEFORE emitting any msg!, which matches the production logs:
-        // Tessera fails the moment Jupiter `invoke [2]`s into it.
+        // Bump Clock from the Yellowstone stream slot (zero RPC).
         let live_slot = self.current_slot.load(Ordering::Relaxed);
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -204,44 +159,23 @@ impl Simulator {
             svm.set_sysvar::<Clock>(&clock);
         }
 
-        // CRITICAL: the ALT accounts themselves must exist in LiteSVM state,
-        // otherwise `simulate_transaction` fails at sanitization time while
-        // resolving V0 lookup-table indexes (the error we saw as
-        // "Transaction sanitization failed"). Fetch the raw on-chain ALT
-        // account -- unfiltered, exactly as Solana runtime sees it -- via the
-        // AccountCache: cache hit if Yellowstone already has it, otherwise a
-        // one-time RPC fetch that is then memoized.
+        // Inject ALT raw accounts from cache (no RPC). If a given ALT is
+        // not in cache, skip it — sim will fail fast at sanitization time,
+        // which is better than adding an RPC round-trip.
         for alt in alts {
-            match cache.get_or_fetch(&alt.key) {
-                Ok(raw) => {
-                    if let Err(e) = svm.set_account(alt.key, raw) {
-                        warn!(alt = %alt.key, error = ?e, "set_account(ALT) failed");
-                    }
-                }
-                Err(e) => {
-                    warn!(alt = %alt.key, error = %e, "ALT raw fetch failed");
+            if let Some(raw) = cache.get(&alt.key) {
+                if let Err(e) = svm.set_account(alt.key, raw) {
+                    warn!(alt = %alt.key, error = ?e, "set_account(ALT) failed");
                 }
             }
         }
 
-        // Inject whatever state we have. Accounts we don't know about keep
-        // LiteSVM's default (empty). That is usually fine for read-only
-        // sysvars / token program state we already preloaded.
+        // Inject whatever state we have from cache. No RPC fallback.
         let mut injected = 0usize;
         let mut missing = 0usize;
         for pk in &accounts {
             match cache.get(pk) {
                 Some(acct) => {
-                    // Skip executable accounts. Two reasons:
-                    //   1. Our DEX programs (and Jupiter v6) were already
-                    //      loaded via `add_program_from_file` at startup,
-                    //      which sets up the program-data side correctly.
-                    //      Overwriting with `set_account` clobbers that
-                    //      and the runtime then complains that the matching
-                    //      program-data account is missing
-                    //      (`Instruction(MissingAccount)` -> Custom(65535)).
-                    //   2. Builtins (System, Token, ComputeBudget, ...) are
-                    //      pre-registered by LiteSVM and must not be touched.
                     if acct.executable {
                         continue;
                     }
@@ -258,13 +192,10 @@ impl Simulator {
         }
         debug!(injected, missing, accounts = accounts.len(), "sim prepared");
 
-        // Read the pre-execution WSOL balance from the injected state so the
-        // delta afterwards makes sense even if the ATA starts non-empty.
         let wsol_before = parse_wsol_amount(&svm, &self.wsol_ata);
 
         match svm.simulate_transaction(tx.clone()) {
             Ok(info) => {
-                // `post_accounts` holds the final state. Pick out the WSOL ATA.
                 let wsol_after = info
                     .post_accounts
                     .iter()
@@ -288,14 +219,6 @@ impl Simulator {
                 })
             }
             Err(meta) => {
-                // fail_closed: refuse to send. fail_open: allow the send so a
-                // sim bug doesn't silently block every tx.
-                //
-                // Capture FULL log stream (no truncation, no reverse) on
-                // failure so the operator can see exactly what each program
-                // emitted before erroring. Custom error codes alone don't
-                // tell us if the issue is oracle staleness, owner mismatch,
-                // signature check, etc.; the program's own `msg!` lines do.
                 metrics.sim_revert_rejected.fetch_add(1, Ordering::Relaxed);
                 if self.fail_closed {
                     anyhow::bail!(
@@ -309,7 +232,6 @@ impl Simulator {
                         logs = ?meta.meta.logs,
                         "sim reverted but fail_open=true, allowing send"
                     );
-                    // fail_open: we still forward to Jito — treat as passed
                     metrics.sim_passed.fetch_add(1, Ordering::Relaxed);
                     Ok(SimOutcome {
                         compute_units: meta.meta.compute_units_consumed,
@@ -321,8 +243,6 @@ impl Simulator {
     }
 }
 
-/// Best-effort extraction of the token amount from an SPL token account.
-/// Layout (packed, 165 bytes): mint[0..32], owner[32..64], amount[64..72] le.
 fn parse_token_amount(data: &[u8]) -> Option<u64> {
     if data.len() < 72 {
         return None;
@@ -366,67 +286,22 @@ fn collect_tx_accounts(
     out
 }
 
-/// Pool of INDEPENDENT `Simulator` instances. Each Simulator owns its own
-/// `Mutex<LiteSVM>`, so N workers = N sims running in parallel. The pool
-/// hands out a simulator via round-robin (`acquire()`), letting the caller
-/// `tokio::spawn` a background task that blocks only on *that* simulator's
-/// mutex -- not on any other worker's. The main opportunity-scanning loop
-/// never waits on sim: it just picks a worker, fires-and-forgets, and
-/// moves on to the next opportunity. This is the only way to keep the
-/// "Metis quote -> sim -> Jito send" latency under the 20-30ms MEV budget
-/// when many profitable opportunities arrive in the same scan cycle.
-///
-/// Memory note: each Simulator loads every .so from disk into LiteSVM, so
-/// N workers costs ~N × (sum of .so sizes) in RSS. For the 15 AMMs we
-/// currently keep, this is roughly 20-40 MB per worker. 8 workers = ~250
-/// MB extra, which is negligible on any modern box.
 pub struct SimulatorPool {
     sims: Vec<Arc<Simulator>>,
     next: AtomicUsize,
 }
 
 impl SimulatorPool {
-    /// Build `workers` independent Simulators. Minimum of 1 is enforced.
-    ///
-    /// A SINGLE background task refreshes the live mainnet slot once per
-    /// second and shares it with every worker via an `Arc<AtomicU64>`. Before
-    /// this, each of N workers ran its own 1-sec refresh task -> N RPCs/sec
-    /// just on `getSlot`, which combined with blockhash refresh was the main
-    /// cause of 429 rate-limit errors on the sim path.
+    /// Build `workers` independent Simulators. NO RPC calls — the slot
+    /// comes from the Yellowstone-fed `current_slot` atomic.
     pub fn new(
         workers: usize,
         so_dir: &str,
         wsol_ata: Pubkey,
         fail_closed: bool,
-        rpc: Arc<RpcClient>,
+        current_slot: Arc<AtomicU64>,
     ) -> Result<Self> {
         let workers = workers.max(1);
-
-        // One-shot initial slot for all workers so they start with the same
-        // Clock. After startup the shared refresh task keeps the atomic fresh.
-        let initial_slot = rpc
-            .get_slot()
-            .context("initial RPC get_slot for sim Clock failed")?;
-        let current_slot = Arc::new(AtomicU64::new(initial_slot));
-        info!(initial_slot, "sim pool Clock initialised with live mainnet slot");
-
-        // Single background refresher shared by every worker.
-        let slot_for_task = current_slot.clone();
-        let rpc_for_task = rpc.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                ticker.tick().await;
-                let rpc_inner = rpc_for_task.clone();
-                let res = tokio::task::spawn_blocking(move || rpc_inner.get_slot()).await;
-                match res {
-                    Ok(Ok(s)) => slot_for_task.store(s, Ordering::Relaxed),
-                    Ok(Err(e)) => warn!(error = %e, "slot RPC refresh failed"),
-                    Err(e) => warn!(error = %e, "slot refresh task panicked"),
-                }
-            }
-        });
-
         let mut sims = Vec::with_capacity(workers);
         for i in 0..workers {
             let sim = Simulator::new(so_dir, wsol_ata, fail_closed, current_slot.clone())
@@ -441,22 +316,13 @@ impl SimulatorPool {
         })
     }
 
-    /// Acquire a simulator in round-robin order. Cloning an `Arc` is
-    /// constant-time; the returned `Arc<Simulator>` can be moved into a
-    /// `tokio::spawn`'d task with no lifetime concerns.
     #[inline]
     pub fn acquire(&self) -> Arc<Simulator> {
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.sims.len();
         self.sims[idx].clone()
     }
-
-    pub fn workers(&self) -> usize {
-        self.sims.len()
-    }
 }
 
-/// Convenience: resolve every ALT referenced by a Metis swap-instructions
-/// response so the caller has a ready-to-use slice for `simulate`.
 pub fn resolve_alts(
     alt_addresses: &[String],
     alt_cache: &crate::alt_cache::AltCache,
