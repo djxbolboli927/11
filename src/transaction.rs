@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use rand::seq::SliceRandom;
+use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     address_lookup_table::AddressLookupTableAccount,
     hash::Hash,
@@ -13,6 +14,7 @@ use solana_sdk::{
 };
 use std::str::FromStr;
 
+use crate::alt_cache::AltCache;
 use crate::metis::{InstructionData, SwapInstructionsResponse};
 
 /// Jito tip account addresses -- pick one at random for each bundle.

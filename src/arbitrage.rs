@@ -17,7 +17,7 @@ use crate::metrics::Metrics;
 use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS, PMM_PROGRAM_IDS};
 use crate::rate_limiter::RateLimiter;
 use crate::tokens::WSOL_MINT;
-use crate::transaction::{self, build_arb_transaction_with_alts};
+use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 
@@ -245,28 +245,15 @@ pub async fn scan_all_tokens(
             "PROFITABLE -- building tx"
         );
 
-        // Resolve ALTs for all routes (needed for tx building, regardless of sim).
-        let resolved_alts = match litesvm_sim::resolve_alts(
-            &opp.swap_ixs.address_lookup_table_addresses,
-            alt_cache,
-            rpc_client,
-        ) {
-            Ok(a) => a,
-            Err(e) => {
-                metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, token = opp.token_mint.as_str(), "ALT resolve failed");
-                continue;
-            }
-        };
-
         let recent_blockhash = blockhash_cache.get();
-        let tx = match build_arb_transaction_with_alts(
+        let tx = match transaction::build_arb_transaction(
             &opp.swap_ixs,
             trading_keypair,
             opp.tip_lamports,
             opp.cu_limit,
             recent_blockhash,
-            &resolved_alts,
+            alt_cache,
+            rpc_client,
         ) {
             Ok(tx) => tx,
             Err(e) => {
@@ -305,22 +292,35 @@ pub async fn scan_all_tokens(
 
         let is_pmm = opp.is_pmm;
 
-        // Pre-load ALT raw accounts into sim cache for AMM routes.
-        if !is_pmm {
-            if let Some(cache) = sim_cache {
-                for alt in &resolved_alts {
-                    if cache.get(&alt.key).is_none() {
-                        if let Err(e) = cache.get_or_fetch(&alt.key) {
-                            warn!(alt = %alt.key, error = %e, "ALT raw account fetch failed");
+        // AMM routes: resolve ALTs for sim and pre-load into cache.
+        // PMM routes: skip sim entirely.
+        let alts_for_sim = if !is_pmm {
+            match (sim_cache, sim_pool) {
+                (Some(cache), Some(_)) => {
+                    match litesvm_sim::resolve_alts(
+                        &opp.swap_ixs.address_lookup_table_addresses,
+                        alt_cache,
+                        rpc_client,
+                    ) {
+                        Ok(alts) => {
+                            for alt in &alts {
+                                if cache.get(&alt.key).is_none() {
+                                    if let Err(e) = cache.get_or_fetch(&alt.key) {
+                                        warn!(alt = %alt.key, error = %e, "ALT raw account fetch failed");
+                                    }
+                                }
+                            }
+                            Some(alts)
+                        }
+                        Err(e) => {
+                            metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
+                            warn!(error = %e, token = opp.token_mint.as_str(), "sim ALT resolve failed");
+                            continue;
                         }
                     }
                 }
+                _ => None,
             }
-        }
-
-        // AMM routes get sim worker + cache; PMM routes skip sim entirely.
-        let alts_for_sim = if !is_pmm && sim_cache.is_some() && sim_pool.is_some() {
-            Some(resolved_alts)
         } else {
             None
         };
