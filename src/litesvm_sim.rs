@@ -159,14 +159,35 @@ impl Simulator {
             svm.set_sysvar::<Clock>(&clock);
         }
 
-        // Inject ALT raw accounts from cache (no RPC). If a given ALT is
-        // not in cache, skip it — sim will fail fast at sanitization time,
-        // which is better than adding an RPC round-trip.
+        // Inject ALT raw accounts from the resolved alts vector.
+        // These were fetched via alt_cache.get_or_fetch() before simulate() was called,
+        // so we have the full AddressLookupTableAccount with addresses populated.
+        // We serialize them back to RawAccount format for LiteSVM.
         for alt in alts {
-            if let Some(raw) = cache.get(&alt.key) {
-                if let Err(e) = svm.set_account(alt.key, raw) {
-                    warn!(alt = %alt.key, error = ?e, "set_account(ALT) failed");
-                }
+            // Build a minimal account data buffer for the ALT
+            // Layout: [discriminator: 8][addresses_len: 8][deactivation_slot: 8][last_extended_slot: 8][authority: 32][addresses...]
+            let mut data = Vec::with_capacity(56 + alt.addresses.len() * 32);
+            data.extend_from_slice(&[0u8; 8]); // discriminator (unused in our case)
+            data.extend_from_slice(&(alt.addresses.len() as u64).to_le_bytes());
+            data.extend_from_slice(&u64::MAX.to_le_bytes()); // deactivation_slot
+            data.extend_from_slice(&0u64.to_le_bytes()); // last_extended_slot
+            data.extend_from_slice(&[0u8; 32]); // authority (none)
+            for addr in &alt.addresses {
+                data.extend_from_slice(addr.as_ref());
+            }
+            
+            let raw_account = solana_sdk::account::Account {
+                lamports: 0,
+                data,
+                owner: solana_sdk::address_lookup_table::program::id(),
+                executable: false,
+                rent_epoch: 0,
+            };
+            
+            if let Err(e) = svm.set_account(alt.key, raw_account) {
+                warn!(alt = %alt.key, error = ?e, "set_account(ALT) failed");
+            } else {
+                debug!(alt = %alt.key, addrs = alt.addresses.len(), "ALT injected into sim");
             }
         }
 
