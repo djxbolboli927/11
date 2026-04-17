@@ -14,12 +14,32 @@ use crate::jito::JitoClient;
 use crate::litesvm_sim::{self, SimulatorPool};
 use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
 use crate::metrics::Metrics;
-use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS};
+use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS, PMM_PROGRAM_IDS};
 use crate::rate_limiter::RateLimiter;
 use crate::tokens::WSOL_MINT;
-use crate::transaction;
+use crate::transaction::{self, build_arb_transaction_with_alts};
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+
+fn extract_route_program_ids(quote: &QuoteResponse) -> Vec<String> {
+    let arr = match quote.route_plan.as_array() {
+        Some(a) => a,
+        None => return vec![],
+    };
+    let mut ids = Vec::new();
+    for hop in arr {
+        if let Some(swap_info) = hop.get("swapInfo").and_then(|s| s.as_object()) {
+            for v in swap_info.values() {
+                if let Some(s) = v.as_str() {
+                    if s.len() >= 32 && s.len() <= 44 {
+                        ids.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
 
 fn route_uses_forbidden_dex(quote: &QuoteResponse) -> bool {
     let arr = match quote.route_plan.as_array() {
@@ -53,6 +73,11 @@ fn route_uses_forbidden_dex(quote: &QuoteResponse) -> bool {
     false
 }
 
+fn route_uses_pmm(quote: &QuoteResponse) -> bool {
+    let ids = extract_route_program_ids(quote);
+    ids.iter().any(|id| PMM_PROGRAM_IDS.iter().any(|p| *p == id.as_str()))
+}
+
 fn lookup_cu_limit(hop_count: usize, cu_limits: &[u32]) -> u32 {
     if cu_limits.is_empty() {
         return 200_000;
@@ -71,6 +96,7 @@ struct Opportunity {
     swap_ixs: SwapInstructionsResponse,
     hop_count: usize,
     cu_limit: u32,
+    is_pmm: bool,
 }
 
 async fn check_opportunity(
@@ -99,9 +125,11 @@ async fn check_opportunity(
     }
 
     if route_uses_forbidden_dex(&quote1) || route_uses_forbidden_dex(&quote2) {
-        debug!(token = token_mint, "skipping route through forbidden PMM");
+        debug!(token = token_mint, "skipping route through forbidden DEX");
         return None;
     }
+
+    let is_pmm = route_uses_pmm(&quote1) || route_uses_pmm(&quote2);
 
     let raw_profit = output_wsol - amount;
     let tip = transaction::calculate_tip(raw_profit, tip_percent, tip_min, tip_max);
@@ -147,15 +175,15 @@ async fn check_opportunity(
         swap_ixs,
         hop_count,
         cu_limit,
+        is_pmm,
     })
 }
 
 /// Scan ALL (amount x token) pairs concurrently.
 ///
-/// EVERY profitable opportunity goes to the simulator — no rate limiting
-/// before sim. The Jito rate limiter only applies AFTER a sim passes,
-/// right before send_bundle. This ensures the metrics show:
-///   `metis_profitable ≈ sim_submitted = sim_executed`
+/// AMM routes: simulate → if pass → rate limit → send to Jito
+/// PMM routes: BYPASS simulation → rate limit → send directly to Jito
+///   (PMMs rely on same-slot oracle freshness that local sim can't provide)
 pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
@@ -213,18 +241,32 @@ pub async fn scan_all_tokens(
             tip_lamports = opp.tip_lamports,
             hops = opp.hop_count,
             cu_limit = opp.cu_limit,
+            pmm = opp.is_pmm,
             "PROFITABLE -- building tx"
         );
 
+        // Resolve ALTs for all routes (needed for tx building, regardless of sim).
+        let resolved_alts = match litesvm_sim::resolve_alts(
+            &opp.swap_ixs.address_lookup_table_addresses,
+            alt_cache,
+            rpc_client,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
+                warn!(error = %e, token = opp.token_mint.as_str(), "ALT resolve failed");
+                continue;
+            }
+        };
+
         let recent_blockhash = blockhash_cache.get();
-        let tx = match transaction::build_arb_transaction(
+        let tx = match build_arb_transaction_with_alts(
             &opp.swap_ixs,
             trading_keypair,
             opp.tip_lamports,
             opp.cu_limit,
             recent_blockhash,
-            alt_cache,
-            rpc_client,
+            &resolved_alts,
         ) {
             Ok(tx) => tx,
             Err(e) => {
@@ -261,44 +303,42 @@ pub async fn scan_all_tokens(
         let expected_out_for_log = opp.output_wsol;
         let min_acceptable_out = opp.amount + opp.tip_lamports + base_fee;
 
-        let alts_for_sim = match (sim_cache, sim_pool) {
-            (Some(_), Some(_)) => match litesvm_sim::resolve_alts(
-                &opp.swap_ixs.address_lookup_table_addresses,
-                alt_cache,
-                rpc_client,
-            ) {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                    warn!(error = %e, token = opp.token_mint.as_str(), "sim ALT resolve failed");
-                    continue;
-                }
-            },
-            _ => None,
-        };
+        let is_pmm = opp.is_pmm;
 
-        // Pre-load ALT raw accounts into sim cache so simulate() never
-        // hits RPC. ALTs are owned by AddressLookupTable program (not a
-        // DEX), so they don't arrive via the Yellowstone owner filter.
-        // get_or_fetch is one-time per ALT key — cached forever after.
-        if let (Some(cache), Some(alts)) = (sim_cache, &alts_for_sim) {
-            for alt in alts {
-                if cache.get(&alt.key).is_none() {
-                    if let Err(e) = cache.get_or_fetch(&alt.key) {
-                        warn!(alt = %alt.key, error = %e, "ALT raw account fetch failed");
+        // Pre-load ALT raw accounts into sim cache for AMM routes.
+        if !is_pmm {
+            if let Some(cache) = sim_cache {
+                for alt in &resolved_alts {
+                    if cache.get(&alt.key).is_none() {
+                        if let Err(e) = cache.get_or_fetch(&alt.key) {
+                            warn!(alt = %alt.key, error = %e, "ALT raw account fetch failed");
+                        }
                     }
                 }
             }
         }
 
-        let sim_cache_for_task = sim_cache.cloned();
-        let sim_worker = sim_pool.map(|p| p.acquire());
+        // AMM routes get sim worker + cache; PMM routes skip sim entirely.
+        let alts_for_sim = if !is_pmm && sim_cache.is_some() && sim_pool.is_some() {
+            Some(resolved_alts)
+        } else {
+            None
+        };
+        let sim_cache_for_task = if !is_pmm { sim_cache.cloned() } else { None };
+        let sim_worker = if !is_pmm { sim_pool.map(|p| p.acquire()) } else { None };
 
         tokio::spawn(async move {
-            // -- Simulate ALL profitable txs (no rate limit here) --
-            if let (Some(cache), Some(sim), Some(alts)) =
+            if is_pmm {
+                // PMM path: skip simulation, go directly to rate limit + Jito.
+                metrics_clone.pmm_bypass.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    token = token_for_log.as_str(),
+                    "PMM route -- bypassing sim, sending directly to Jito"
+                );
+            } else if let (Some(cache), Some(sim), Some(alts)) =
                 (sim_cache_for_task, sim_worker, alts_for_sim)
             {
+                // AMM path: full simulation gate.
                 metrics_clone.sim_submitted.fetch_add(1, Ordering::Relaxed);
                 match sim.simulate(&tx, &alts, &cache, min_acceptable_out, &metrics_clone) {
                     Ok(outcome) => {
@@ -322,10 +362,10 @@ pub async fn scan_all_tokens(
                 }
             }
 
-            // Rate limit ONLY here — after sim passed, before Jito send.
+            // Rate limit before Jito send (applies to both AMM and PMM).
             if !jito_limiter_clone.lock().unwrap().try_acquire() {
                 metrics_clone.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
-                debug!(token = token_for_log.as_str(), "jito rate limit hit after sim pass");
+                debug!(token = token_for_log.as_str(), "jito rate limit hit");
                 return;
             }
 
@@ -336,6 +376,7 @@ pub async fn scan_all_tokens(
                         uuid = %uuid,
                         token = token_for_log.as_str(),
                         profit = profit_for_log,
+                        pmm = is_pmm,
                         "bundle sent to all Jito endpoints"
                     )
                 }

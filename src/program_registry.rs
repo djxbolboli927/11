@@ -6,23 +6,17 @@
 //! If a filename is empty or the file is missing, that program is skipped
 //! and any tx touching it will bypass local simulation (logged as a miss).
 //!
-//! REMOVED (DEXes that deterministically revert under local simulation --
-//! operator-confirmed in production after the simulator went live):
-//!   - Tessera V         TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH  (PMM)
-//!   - GoonFi V2         goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE  (PMM)
-//!   - SolFi             SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe  (PMM)
-//!   - SolFi V2          SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF  (PMM)
-//!   - ZeroFi            ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY  (PMM)
+//! PMM DEXes (Tessera, GoonFi, SolFi, ZeroFi) rely on same-slot oracle
+//! freshness that local simulation cannot provide. These are listed in
+//! `PMM_PROGRAM_IDS` — routes touching them BYPASS simulation and go
+//! directly to Jito. Their .so files are still loaded so mixed routes
+//! (AMM + PMM hops) can attempt simulation, but a PMM-only route skips it.
+//!
+//! FORBIDDEN (revert for non-oracle reasons — still under investigation):
 //!   - REALQq (unknown)  REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2
 //!   - AlphaQ            ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA
 //!   - Aquifer           AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45
 //!   - Byreal CLMM       HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq
-//!
-//! PMM-class DEXes rely on same-slot oracle freshness in the Jito auction;
-//! the others revert for reasons still under investigation. In all cases
-//! the simulator never sees a pass, so keeping them just wastes CPU on a
-//! guaranteed-reject path. See FORBIDDEN_DEX_PROGRAM_IDS below for the
-//! route-plan filter that drops any Metis quote touching these.
 
 pub const PROGRAMS: &[(&str, &str)] = &[
     // --- Aggregator (top-level program the swap_instruction targets) ---
@@ -48,19 +42,33 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     ("24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi", "Invariant_Swap.so"),
     ("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB", "PancakeSwap.so"),
     ("HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt", "Meteora_Vault_Program.so"),
+
+    // --- PMM DEXes (bypass simulation, send directly to Jito) ---
+    ("TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", "Tessera_V.so"),
+    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "GoonFi_V2.so"),
+    ("SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe", "SolFi.so"),
+    ("SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF", "SolFi_V2.so"),
+    ("ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY", "ZeroFi.so"),
 ];
 
-/// Program ids the bot must REFUSE to route through, no matter what Metis
-/// returns. Defense-in-depth: even if the Metis server's DEX filter still
-/// has these enabled, every quote whose route_plan touches one of these
-/// programs is dropped before we ever spend a base fee. See the module
-/// header for the full reasoning.
+/// PMM (Proprietary Market Maker) program ids. Routes through these DEXes
+/// BYPASS local LiteSVM simulation and are sent directly to Jito.
+///
+/// PMMs rely on same-slot oracle freshness that local simulation cannot
+/// provide — every sim attempt deterministically reverts. However, they
+/// are profitable in production because Jito's block builder provides the
+/// oracle update in the same slot as the swap.
+pub const PMM_PROGRAM_IDS: &[&str] = &[
+    "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH",  // Tessera V
+    "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE",   // GoonFi V2
+    "SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe",   // SolFi
+    "SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF",   // SolFi V2
+    "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",   // ZeroFi
+];
+
+/// Program ids the bot must REFUSE to route through. These revert for
+/// non-oracle reasons still under investigation.
 pub const FORBIDDEN_DEX_PROGRAM_IDS: &[&str] = &[
-    "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH",
-    "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE",
-    "SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe",
-    "SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF",
-    "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",
     "REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2",
     "ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA",
     "AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45",
@@ -68,15 +76,8 @@ pub const FORBIDDEN_DEX_PROGRAM_IDS: &[&str] = &[
 ];
 
 /// Jupiter/Metis DEX label substrings we ask the server to exclude up-front.
-/// These are matched case-insensitively against the `swapInfo.label` field
-/// of every `route_plan` entry. Combined with `excludeDexes` on the /quote
-/// URL this should keep the routes from ever being proposed.
+/// Only non-PMM DEXes that are truly forbidden.
 pub const FORBIDDEN_DEX_LABELS: &[&str] = &[
-    "Tessera",
-    "GoonFi",
-    "Goonfi",
-    "SolFi",
-    "ZeroFi",
     "AlphaQ",
     "Aquifer",
     "Byreal",

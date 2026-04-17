@@ -36,6 +36,8 @@ pub struct Metrics {
     pub sim_revert_rejected: AtomicU64,
     /// 7. Sim passed — forwarded to Jito
     pub sim_passed: AtomicU64,
+    /// 7a. PMM routes that bypassed simulation entirely
+    pub pmm_bypass: AtomicU64,
     /// 8. Bundles successfully dispatched to Jito (all regions)
     pub jito_sent: AtomicU64,
 }
@@ -52,6 +54,7 @@ impl Metrics {
             sim_slippage_rejected: AtomicU64::new(0),
             sim_revert_rejected: AtomicU64::new(0),
             sim_passed: AtomicU64::new(0),
+            pmm_bypass: AtomicU64::new(0),
             jito_sent: AtomicU64::new(0),
         })
     }
@@ -74,6 +77,7 @@ impl Metrics {
                 let slippage   = m.sim_slippage_rejected.swap(0, Ordering::Relaxed);
                 let revert     = m.sim_revert_rejected.swap(0, Ordering::Relaxed);
                 let passed     = m.sim_passed.swap(0, Ordering::Relaxed);
+                let pmm_byp    = m.pmm_bypass.swap(0, Ordering::Relaxed);
                 let sent       = m.jito_sent.swap(0, Ordering::Relaxed);
                 let coverage_pct = if profit > 0 {
                     submitted * 100 / profit
@@ -91,6 +95,7 @@ impl Metrics {
                     sim_slippage_rej   = slippage,
                     sim_revert_rej     = revert,
                     sim_passed         = passed,
+                    pmm_bypass         = pmm_byp,
                     jito_rate_limited  = ratelim,
                     jito_sent          = sent,
                     "==[PIPELINE METRICS]==",
