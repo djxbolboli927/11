@@ -82,16 +82,14 @@ pub fn calculate_tip(
 /// #2 - Jupiter Aggregator: route/route_v2 (entire circular arb)
 /// #3 - System Program: Transfer (Jito tip, MUST be last)
 ///
-/// Uses AltCache for ALT lookups (0ns on cache hit vs ~5ms RPC call).
-/// Uses pre-cached blockhash (passed in, ~100ns read vs ~5ms RPC call).
-pub fn build_arb_transaction(
+/// Uses pre-fetched ALTs (passed in as parameter).
+pub fn build_arb_transaction_with_alts(
     swap_ixs: &SwapInstructionsResponse,
     payer: &Keypair,
     tip_lamports: u64,
     cu_limit: u32,
     recent_blockhash: Hash,
-    alt_cache: &AltCache,
-    rpc_client: &RpcClient,
+    alts: &[AddressLookupTableAccount],
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
@@ -123,26 +121,11 @@ pub fn build_arb_transaction(
         tip_lamports,
     ));
 
-    // Fetch ALTs via cache (instant on hit, RPC on first miss only)
-    let mut alt_addresses: Vec<Pubkey> = Vec::new();
-    for addr in &swap_ixs.address_lookup_table_addresses {
-        let pubkey = Pubkey::from_str(addr)?;
-        if !alt_addresses.contains(&pubkey) {
-            alt_addresses.push(pubkey);
-        }
-    }
-
-    let mut address_lookup_tables: Vec<AddressLookupTableAccount> = Vec::new();
-    for alt_pubkey in &alt_addresses {
-        let alt_account = alt_cache.get_or_fetch(alt_pubkey, rpc_client)?;
-        address_lookup_tables.push(alt_account);
-    }
-
-    // Build VersionedTransaction v0
+    // Build VersionedTransaction v0 with pre-fetched ALTs
     let message = v0::Message::try_compile(
         &payer.pubkey(),
         &instructions,
-        &address_lookup_tables,
+        alts,
         recent_blockhash,
     )
     .context("failed to compile v0 message")?;
