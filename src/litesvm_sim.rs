@@ -166,7 +166,8 @@ impl Simulator {
         for alt in alts {
             // Build the account data buffer for the ALT matching Solana's layout
             // Layout: [deactivation_slot: 8][last_extended_slot: 8][last_extended_slot_start_epoch: 8][authority: 32 or 0][addresses: ...]
-            let mut data = Vec::with_capacity(48 + alt.addresses.len() * 32);
+            // Total header size = 8 + 8 + 8 + 32 = 56 bytes (must match deserialize_alt_addresses in transaction.rs)
+            let mut data = Vec::with_capacity(56 + alt.addresses.len() * 32);
             
             // Deactivation slot (u64::MAX means active)
             data.extend_from_slice(&u64::MAX.to_le_bytes());
