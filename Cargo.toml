@@ -3,6 +3,10 @@ name = "solana-arb-bot"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "alt_loader"
+path = "src/bin/alt_loader.rs"
+
 [dependencies]
 # Solana
 solana-sdk = "2.2"
