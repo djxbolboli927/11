@@ -277,6 +277,20 @@ pub async fn scan_all_tokens(
             _ => None,
         };
 
+        // Pre-load ALT raw accounts into sim cache so simulate() never
+        // hits RPC. ALTs are owned by AddressLookupTable program (not a
+        // DEX), so they don't arrive via the Yellowstone owner filter.
+        // get_or_fetch is one-time per ALT key — cached forever after.
+        if let (Some(cache), Some(alts)) = (sim_cache, &alts_for_sim) {
+            for alt in alts {
+                if cache.get(&alt.key).is_none() {
+                    if let Err(e) = cache.get_or_fetch(&alt.key) {
+                        warn!(alt = %alt.key, error = %e, "ALT raw account fetch failed");
+                    }
+                }
+            }
+        }
+
         let sim_cache_for_task = sim_cache.cloned();
         let sim_worker = sim_pool.map(|p| p.acquire());
 
