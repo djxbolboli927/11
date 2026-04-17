@@ -159,45 +159,14 @@ impl Simulator {
             svm.set_sysvar::<Clock>(&clock);
         }
 
-        // Inject ALT accounts from the resolved alts vector.
-        // These were fetched via alt_cache.get_or_fetch() before simulate() was called,
-        // so we have the full AddressLookupTableAccount with addresses populated.
-        // We need to serialize them properly for LiteSVM.
+        // Inject ALT raw accounts from cache (no RPC). If a given ALT is
+        // not in cache, skip it — sim will fail fast at sanitization time,
+        // which is better than adding an RPC round-trip.
         for alt in alts {
-            // Build the account data buffer for the ALT matching Solana's layout
-            // Layout: [deactivation_slot: 8][last_extended_slot: 8][last_extended_slot_start_epoch: 8][authority: 32 or 0][addresses: ...]
-            // Total header size = 8 + 8 + 8 + 32 = 56 bytes (must match deserialize_alt_addresses in transaction.rs)
-            let mut data = Vec::with_capacity(56 + alt.addresses.len() * 32);
-            
-            // Deactivation slot (u64::MAX means active)
-            data.extend_from_slice(&u64::MAX.to_le_bytes());
-            
-            // Last extended slot (u64)
-            data.extend_from_slice(&0u64.to_le_bytes());
-            
-            // Last extended slot start epoch (u64) 
-            data.extend_from_slice(&0u64.to_le_bytes());
-            
-            // Authority (Pubkey or empty if none) - using 32 bytes of zeros for no authority
-            data.extend_from_slice(&[0u8; 32]);
-            
-            // All the addresses in the table
-            for addr in &alt.addresses {
-                data.extend_from_slice(addr.as_ref());
-            }
-            
-            let raw_account = solana_sdk::account::Account {
-                lamports: 1000000, // Minimum rent-exempt balance
-                data,
-                owner: solana_sdk::address_lookup_table::program::id(),
-                executable: false,
-                rent_epoch: u64::MAX,
-            };
-            
-            if let Err(e) = svm.set_account(alt.key, raw_account) {
-                warn!(alt = %alt.key, error = ?e, "set_account(ALT) failed");
-            } else {
-                debug!(alt = %alt.key, addrs = alt.addresses.len(), "ALT injected into sim");
+            if let Some(raw) = cache.get(&alt.key) {
+                if let Err(e) = svm.set_account(alt.key, raw) {
+                    warn!(alt = %alt.key, error = ?e, "set_account(ALT) failed");
+                }
             }
         }
 
