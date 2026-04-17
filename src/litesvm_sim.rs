@@ -159,29 +159,38 @@ impl Simulator {
             svm.set_sysvar::<Clock>(&clock);
         }
 
-        // Inject ALT raw accounts from the resolved alts vector.
+        // Inject ALT accounts from the resolved alts vector.
         // These were fetched via alt_cache.get_or_fetch() before simulate() was called,
         // so we have the full AddressLookupTableAccount with addresses populated.
-        // We serialize them back to RawAccount format for LiteSVM.
+        // We need to serialize them properly for LiteSVM.
         for alt in alts {
-            // Build a minimal account data buffer for the ALT
-            // Layout: [discriminator: 8][addresses_len: 8][deactivation_slot: 8][last_extended_slot: 8][authority: 32][addresses...]
-            let mut data = Vec::with_capacity(56 + alt.addresses.len() * 32);
-            data.extend_from_slice(&[0u8; 8]); // discriminator (unused in our case)
-            data.extend_from_slice(&(alt.addresses.len() as u64).to_le_bytes());
-            data.extend_from_slice(&u64::MAX.to_le_bytes()); // deactivation_slot
-            data.extend_from_slice(&0u64.to_le_bytes()); // last_extended_slot
-            data.extend_from_slice(&[0u8; 32]); // authority (none)
+            // Build the account data buffer for the ALT matching Solana's layout
+            // Layout: [deactivation_slot: 8][last_extended_slot: 8][last_extended_slot_start_epoch: 8][authority: 32 or 0][addresses: ...]
+            let mut data = Vec::with_capacity(48 + alt.addresses.len() * 32);
+            
+            // Deactivation slot (u64::MAX means active)
+            data.extend_from_slice(&u64::MAX.to_le_bytes());
+            
+            // Last extended slot (u64)
+            data.extend_from_slice(&0u64.to_le_bytes());
+            
+            // Last extended slot start epoch (u64) 
+            data.extend_from_slice(&0u64.to_le_bytes());
+            
+            // Authority (Pubkey or empty if none) - using 32 bytes of zeros for no authority
+            data.extend_from_slice(&[0u8; 32]);
+            
+            // All the addresses in the table
             for addr in &alt.addresses {
                 data.extend_from_slice(addr.as_ref());
             }
             
             let raw_account = solana_sdk::account::Account {
-                lamports: 0,
+                lamports: 1000000, // Minimum rent-exempt balance
                 data,
                 owner: solana_sdk::address_lookup_table::program::id(),
                 executable: false,
-                rent_epoch: 0,
+                rent_epoch: u64::MAX,
             };
             
             if let Err(e) = svm.set_account(alt.key, raw_account) {
