@@ -217,30 +217,14 @@ pub async fn scan_all_tokens(
         );
 
         let recent_blockhash = blockhash_cache.get();
-        
-        // Prefetch ALL ALTs BEFORE building the tx -- ensures they're in cache
-        // before simulation starts. This is critical because ALTs don't come
-        // via Yellowstone gRPC (their owner is the ALT program, not DEX).
-        let alts_for_sim = match litesvm_sim::resolve_alts(
-            &opp.swap_ixs.address_lookup_table_addresses,
-            alt_cache,
-            rpc_client,
-        ) {
-            Ok(a) => Some(a),
-            Err(e) => {
-                metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, token = opp.token_mint.as_str(), "sim ALT resolve failed");
-                continue;
-            }
-        };
-        
-        let tx = match transaction::build_arb_transaction_with_alts(
+        let tx = match transaction::build_arb_transaction(
             &opp.swap_ixs,
             trading_keypair,
             opp.tip_lamports,
             opp.cu_limit,
             recent_blockhash,
-            alts_for_sim.as_ref().unwrap_or(&Vec::new()),
+            alt_cache,
+            rpc_client,
         ) {
             Ok(tx) => tx,
             Err(e) => {
@@ -268,8 +252,6 @@ pub async fn scan_all_tokens(
             }
         }
 
-        let min_acceptable_out = opp.amount + opp.tip_lamports + base_fee;
-
         let jito_clone = jito.clone();
         let jito_limiter_clone = jito_limiter.clone();
         let metrics_clone = metrics.clone();
@@ -277,23 +259,22 @@ pub async fn scan_all_tokens(
         let profit_for_log = opp.net_profit;
         let amount_for_log = opp.amount;
         let expected_out_for_log = opp.output_wsol;
+        let min_acceptable_out = opp.amount + opp.tip_lamports + base_fee;
 
-        let recent_blockhash = blockhash_cache.get();
-        // ALTs already resolved above, reuse them
-        let tx = match transaction::build_arb_transaction_with_alts(
-            &opp.swap_ixs,
-            trading_keypair,
-            opp.tip_lamports,
-            opp.cu_limit,
-            recent_blockhash,
-            alts_for_sim.as_ref().unwrap_or(&Vec::new()),
-        ) {
-            Ok(tx) => tx,
-            Err(e) => {
-                metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, token = opp.token_mint.as_str(), "tx build failed");
-                continue;
-            }
+        let alts_for_sim = match (sim_cache, sim_pool) {
+            (Some(_), Some(_)) => match litesvm_sim::resolve_alts(
+                &opp.swap_ixs.address_lookup_table_addresses,
+                alt_cache,
+                rpc_client,
+            ) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(error = %e, token = opp.token_mint.as_str(), "sim ALT resolve failed");
+                    continue;
+                }
+            },
+            _ => None,
         };
 
         let sim_cache_for_task = sim_cache.cloned();
@@ -301,11 +282,11 @@ pub async fn scan_all_tokens(
 
         tokio::spawn(async move {
             // -- Simulate ALL profitable txs (no rate limit here) --
-            if let (Some(cache), Some(sim)) = (sim_cache_for_task, sim_worker) {
+            if let (Some(cache), Some(sim), Some(alts)) =
+                (sim_cache_for_task, sim_worker, alts_for_sim)
+            {
                 metrics_clone.sim_submitted.fetch_add(1, Ordering::Relaxed);
-                let alts_slice: &[solana_sdk::address_lookup_table::AddressLookupTableAccount] = 
-                    alts_for_sim.as_ref().map(|a| a.as_slice()).unwrap_or(&[]);
-                match sim.simulate(&tx, alts_slice, &cache, min_acceptable_out, &metrics_clone) {
+                match sim.simulate(&tx, &alts, &cache, min_acceptable_out, &metrics_clone) {
                     Ok(outcome) => {
                         info!(
                             token = token_for_log.as_str(),
