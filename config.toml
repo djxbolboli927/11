@@ -62,7 +62,7 @@ bot_cpu_cores = []
 # منبع داده‌ی sim = همان gRPC شیفت که Metis هم می‌خواند (یک اتصال جدا،
 # هیچ سربار متقابلی با Metis ندارد).
 enabled = true
-so_dir = "/home/soluser/m/so"
+so_dir = "/root/m/so"
 # fail_closed=true  (امن)  : اگر sim خطا داد ⇒ ارسال نکن
 # fail_closed=false (رول‌اوت) : اگر sim خطا داد ⇒ فقط log بزن و بفرست
 fail_closed = true
