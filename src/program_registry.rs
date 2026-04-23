@@ -43,12 +43,16 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     ("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB", "PancakeSwap.so"),
     ("HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt", "Meteora_Vault_Program.so"),
 
-    // --- PMM DEXes (bypass simulation, send directly to Jito) ---
+    // --- PMM DEXes — simulation bypass (oracle staleness check, same-slot freshness required) ---
     ("TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", "Tessera_V.so"),
-    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "GoonFi_V2.so"),
     ("SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe", "SolFi.so"),
     ("SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF", "SolFi_V2.so"),
     ("ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY", "ZeroFi.so"),
+
+    // --- PMM DEXes — LiteSVM simulatable (no oracle staleness check) ---
+    // GoonFi V2: uses sysvar_instructions whitelist (passes because we send
+    // real Jupiter txs). Token vault accounts lazily RPC-fetched on first sim.
+    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "GoonFi_V2.so"),
 ];
 
 /// PMM (Proprietary Market Maker) program ids. Routes through these DEXes
@@ -58,9 +62,10 @@ pub const PROGRAMS: &[(&str, &str)] = &[
 /// provide — every sim attempt deterministically reverts. However, they
 /// are profitable in production because Jito's block builder provides the
 /// oracle update in the same slot as the swap.
+/// GoonFi V2 was removed from this list: it has no oracle staleness check and
+/// can be simulated via LiteSVM once vault accounts are lazily RPC-fetched.
 pub const PMM_PROGRAM_IDS: &[&str] = &[
     "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH",  // Tessera V
-    "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE",   // GoonFi V2
     "SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe",   // SolFi
     "SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF",   // SolFi V2
     "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",   // ZeroFi

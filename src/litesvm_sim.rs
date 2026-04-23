@@ -137,6 +137,21 @@ impl Simulator {
 
         let accounts = collect_tx_accounts(tx, alts);
 
+        // Lazily RPC-fetch any accounts that are missing from the Yellowstone
+        // cache. For AMM routes this is a no-op (all accounts already cached).
+        // For PMM routes like GoonFi V2, token vault accounts (owned by SPL
+        // Token, outside the owner-filter) are fetched here once and stored
+        // in the DashMap so subsequent sims of the same pool need no RPC call.
+        // Runs BEFORE the svm mutex so a blocking RPC call doesn't stall
+        // other workers.
+        for pk in &accounts {
+            if cache.get(pk).is_none() {
+                if let Err(e) = cache.get_or_fetch(pk) {
+                    debug!(pubkey = %pk, error = %e, "lazy RPC fetch for missing account");
+                }
+            }
+        }
+
         let mut svm = self.svm.lock().unwrap();
 
         // Bump Clock from the Yellowstone stream slot (zero RPC).
