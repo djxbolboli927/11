@@ -6,17 +6,14 @@
 //! If a filename is empty or the file is missing, that program is skipped
 //! and any tx touching it will bypass local simulation (logged as a miss).
 //!
-//! PMM DEXes (Tessera, GoonFi, SolFi, ZeroFi) rely on same-slot oracle
-//! freshness that local simulation cannot provide. These are listed in
-//! `PMM_PROGRAM_IDS` — routes touching them BYPASS simulation and go
-//! directly to Jito. Their .so files are still loaded so mixed routes
-//! (AMM + PMM hops) can attempt simulation, but a PMM-only route skips it.
+//! PMM DEXes (Tessera, SolFi, ZeroFi) rely on same-slot oracle freshness
+//! that local simulation cannot provide. These are listed in
+//! `PMM_PROGRAM_IDS` — routes touching them BYPASS simulation (when the
+//! simulator is enabled) and go directly to Jito. Their .so files are
+//! still loaded so mixed routes (AMM + PMM hops) can attempt simulation,
+//! but a PMM-only route skips it.
 //!
-//! FORBIDDEN (revert for non-oracle reasons — still under investigation):
-//!   - REALQq (unknown)  REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2
-//!   - AlphaQ            ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA
-//!   - Aquifer           AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45
-//!   - Byreal CLMM       HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq
+//! Nothing is blocked — every DEX registered here is eligible for arbitrage.
 
 pub const PROGRAMS: &[(&str, &str)] = &[
     // --- Aggregator (top-level program the swap_instruction targets) ---
@@ -25,7 +22,7 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     // with "Program account JUP6Lkb... is not executable".
     ("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "Jupiter_Aggregator_v6.so"),
 
-    // --- high confidence ---
+    // --- AMM / CLMM / orderbook DEXes ---
     ("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG", "Meteora_DAMM_v2.so"),
     ("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", "Raydium_Concentrated_Liquidity.so"),
     ("MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms", "Manifest.so"),
@@ -37,56 +34,46 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     ("MERLuDFBMmsHnsBPZw2sDQZHvXFMwp8EdjudcU2HKky", "Mercurial_Stable_Swap.so"),
     ("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C", "Raydium_CPMM.so"),
     ("9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP", "Meteora_Pools_Program.so"),
-
-    // --- best-effort (verify against solscan / program label) ---
     ("24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi", "Invariant_Swap.so"),
     ("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB", "PancakeSwap.so"),
     ("HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt", "Meteora_Vault_Program.so"),
 
-    // --- PMM DEXes — simulation bypass (oracle staleness check, same-slot freshness required) ---
+    // --- Previously forbidden — now allowed at user's request ---
+    ("ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA", "AlphaQ.so"),
+    ("AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45", "Aquifer.so"),
+    ("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq", "Byreal_CLMM.so"),
+    ("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2", "REALQq.so"),
+
+    // --- PMM DEXes — bypass simulation when enabled, otherwise go direct ---
     ("TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", "Tessera_V.so"),
     ("SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe", "SolFi.so"),
     ("SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF", "SolFi_V2.so"),
     ("ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY", "ZeroFi.so"),
 
-    // --- PMM DEXes — LiteSVM simulatable (no oracle staleness check) ---
+    // --- PMM DEX — LiteSVM simulatable (no oracle staleness check) ---
     // GoonFi V2: uses sysvar_instructions whitelist (passes because we send
     // real Jupiter txs). Token vault accounts lazily RPC-fetched on first sim.
     ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "GoonFi_V2.so"),
 ];
 
 /// PMM (Proprietary Market Maker) program ids. Routes through these DEXes
-/// BYPASS local LiteSVM simulation and are sent directly to Jito.
-///
-/// PMMs rely on same-slot oracle freshness that local simulation cannot
-/// provide — every sim attempt deterministically reverts. However, they
-/// are profitable in production because Jito's block builder provides the
-/// oracle update in the same slot as the swap.
-/// GoonFi V2 was removed from this list: it has no oracle staleness check and
-/// can be simulated via LiteSVM once vault accounts are lazily RPC-fetched.
+/// BYPASS local LiteSVM simulation when the simulator is enabled, and are
+/// sent directly to Jito where the block builder provides same-slot oracle
+/// freshness.
 pub const PMM_PROGRAM_IDS: &[&str] = &[
-    "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH",  // Tessera V
+    "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH",   // Tessera V
     "SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe",   // SolFi
     "SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF",   // SolFi V2
     "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",   // ZeroFi
 ];
 
-/// Program ids the bot must REFUSE to route through. These revert for
-/// non-oracle reasons still under investigation.
-pub const FORBIDDEN_DEX_PROGRAM_IDS: &[&str] = &[
-    "REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2",
-    "ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA",
-    "AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45",
-    "HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq",
-];
+/// Program ids the bot refuses to route through. Currently empty — every
+/// DEX in `PROGRAMS` is allowed.
+pub const FORBIDDEN_DEX_PROGRAM_IDS: &[&str] = &[];
 
 /// Jupiter/Metis DEX label substrings we ask the server to exclude up-front.
-/// Only non-PMM DEXes that are truly forbidden.
-pub const FORBIDDEN_DEX_LABELS: &[&str] = &[
-    "AlphaQ",
-    "Aquifer",
-    "Byreal",
-];
+/// Currently empty — every DEX label is allowed.
+pub const FORBIDDEN_DEX_LABELS: &[&str] = &[];
 
 /// Program ids that the simulator should subscribe to on Yellowstone gRPC so
 /// their pool accounts end up in the hot cache. This is the superset of

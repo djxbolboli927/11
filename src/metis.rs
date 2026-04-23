@@ -106,10 +106,10 @@ impl MetisClient {
     ///   `bps: 10000` (instead of legacy `percent: 100`). When this QuoteResponse
     ///   is later sent to /swap-instructions, Metis builds a `route_v2` instruction
     ///   which costs fewer compute units and is what competing arb bots use.
-    /// - excludeDexes=AlphaQ,Aquifer,Byreal: DEXes that revert for non-oracle
-    ///   reasons still under investigation. PMM DEXes (Tessera, GoonFi, SolFi,
-    ///   ZeroFi) are NO LONGER excluded — they bypass simulation and go
-    ///   directly to Jito where oracle freshness is guaranteed.
+    /// - excludeDexes: none. Every DEX registered in program_registry is
+    ///   allowed to route. PMM DEXes (Tessera, SolFi, ZeroFi) bypass the
+    ///   local simulator when it is enabled; when disabled they go to Jito
+    ///   directly like any other route.
     pub async fn get_quote(
         &self,
         input_mint: &str,
@@ -124,8 +124,7 @@ impl MetisClient {
              &swapMode=ExactIn\
              &forJitoBundle=true\
              &restrictIntermediateTokens=false\
-             &instructionVersion=V2\
-             &excludeDexes=AlphaQ,Aquifer,Byreal",
+             &instructionVersion=V2",
             self.base_url, input_mint, output_mint, amount_lamports
         );
 
