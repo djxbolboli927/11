@@ -68,14 +68,17 @@ so_dir = "/root/m/so"
 fail_closed = true
 
 [jito_grpc]
-# مسیر دوم ارسال باندل از طریق SearcherService gRPC جیتو. همزمان با مسیر
-# REST (با uuid) اجرا می‌شود. هر مسیر rate limiter جدا دارد، پس مجموع
-# throughput = jito.max_bundles_per_second + jito_grpc.max_bundles_per_second
-# (در تنظیمات فعلی: 5 + 5 = 10 باندل در ثانیه).
+# مسیر دوم ارسال باندل از طریق SearcherService gRPC جیتو در حالت NoAuth.
+# طبق سیاست پیش‌فرض جیتو از سال ۲۰۲۵، نیازی به whitelist کردن کیف‌پول
+# نیست؛ فقط TLS وصل می‌شویم و SendBundle را بدون هدر Authorization
+# صدا می‌زنیم. (rate limit پیش‌فرض جیتو: 1 req/s/IP/region — لیمیت ربات
+# پایین‌تر از این مقدار است.)
 #
 # دقیقاً مثل REST، gRPC هم به همه ۸ ریجن همزمان فن‌اوت می‌شود (نه به
-# اندپوینت گلوبال). هر ریجن کانال و auth جداگانه دارد؛ اگر auth یک ریجن
-# fail شد، آن ریجن در no-auth mode پیام می‌فرستد.
+# اندپوینت گلوبال). هر ریجن یک کانال TLS مستقل دارد.
+#
+# مجموع throughput = jito.max_bundles_per_second + jito_grpc.max_bundles_per_second
+# (در تنظیمات فعلی: 5 + 5 = 10 باندل در ثانیه).
 #
 # تکراری ارسال نمی‌شود: dispatcher اول REST limiter را می‌چکد؛ اگر جا داشت
 # ⇒ REST، وگرنه gRPC limiter را امتحان می‌کند؛ اگر هر دو پر بودند ⇒ فرصت
@@ -91,7 +94,4 @@ endpoints = [
     "https://singapore.mainnet.block-engine.jito.wtf",
     "https://tokyo.mainnet.block-engine.jito.wtf",
 ]
-# این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
-# تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
-auth_keypair = "/root/m/wallet/grpc.json"
 max_bundles_per_second = 5

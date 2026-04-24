@@ -104,15 +104,16 @@ fn default_workers() -> usize {
     8
 }
 
-/// Second Jito submission path via SearcherService gRPC.
+/// Second Jito submission path via SearcherService gRPC (NoAuth mode).
 ///
 /// Runs alongside the REST UUID client in `jito.rs`. Each path has its
 /// own rate limiter, so the effective Jito throughput is
 /// `jito.max_bundles_per_second + jito_grpc.max_bundles_per_second`.
 ///
 /// Like the REST client, gRPC fans out to every regional Block Engine
-/// endpoint concurrently — first regional success wins. Per-region auth
-/// is attempted; regions whose auth fails fall back to no-auth mode.
+/// endpoint concurrently — first regional success wins. No authentication
+/// is performed: per Jito's 2025 default-send policy, searcher pubkeys no
+/// longer need to be whitelisted for the public bundle path.
 #[derive(Debug, Deserialize, Clone)]
 pub struct JitoGrpcConfig {
     /// If false, only the REST UUID path is used (pre-gRPC behaviour).
@@ -122,10 +123,6 @@ pub struct JitoGrpcConfig {
     /// of these per send call, mirroring the REST multi-region fan-out.
     #[serde(default = "default_jito_grpc_endpoints")]
     pub endpoints: Vec<String>,
-    /// Path to the Solana keypair JSON whose pubkey Jito has whitelisted
-    /// for gRPC auth. This wallet holds no funds — it is an identity only.
-    #[serde(default)]
-    pub auth_keypair: String,
     /// Per-second rate limit applied *before* the gRPC SendBundle call.
     /// REST and gRPC limiters operate independently.
     #[serde(default = "default_grpc_rate")]
@@ -137,7 +134,6 @@ impl Default for JitoGrpcConfig {
         Self {
             enabled: false,
             endpoints: default_jito_grpc_endpoints(),
-            auth_keypair: String::new(),
             max_bundles_per_second: default_grpc_rate(),
         }
     }
