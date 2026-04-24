@@ -109,14 +109,19 @@ fn default_workers() -> usize {
 /// Runs alongside the REST UUID client in `jito.rs`. Each path has its
 /// own rate limiter, so the effective Jito throughput is
 /// `jito.max_bundles_per_second + jito_grpc.max_bundles_per_second`.
+///
+/// Like the REST client, gRPC fans out to every regional Block Engine
+/// endpoint concurrently — first regional success wins. Per-region auth
+/// is attempted; regions whose auth fails fall back to no-auth mode.
 #[derive(Debug, Deserialize, Clone)]
 pub struct JitoGrpcConfig {
     /// If false, only the REST UUID path is used (pre-gRPC behaviour).
     #[serde(default)]
     pub enabled: bool,
-    /// Block Engine gRPC endpoint, e.g. `https://mainnet.block-engine.jito.wtf`.
-    #[serde(default = "default_jito_grpc_endpoint")]
-    pub endpoint: String,
+    /// All Jito Block Engine gRPC endpoints. Bundles are broadcast to ALL
+    /// of these per send call, mirroring the REST multi-region fan-out.
+    #[serde(default = "default_jito_grpc_endpoints")]
+    pub endpoints: Vec<String>,
     /// Path to the Solana keypair JSON whose pubkey Jito has whitelisted
     /// for gRPC auth. This wallet holds no funds — it is an identity only.
     #[serde(default)]
@@ -131,15 +136,24 @@ impl Default for JitoGrpcConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            endpoint: default_jito_grpc_endpoint(),
+            endpoints: default_jito_grpc_endpoints(),
             auth_keypair: String::new(),
             max_bundles_per_second: default_grpc_rate(),
         }
     }
 }
 
-fn default_jito_grpc_endpoint() -> String {
-    "https://mainnet.block-engine.jito.wtf".to_string()
+fn default_jito_grpc_endpoints() -> Vec<String> {
+    vec![
+        "https://amsterdam.mainnet.block-engine.jito.wtf".to_string(),
+        "https://dublin.mainnet.block-engine.jito.wtf".to_string(),
+        "https://frankfurt.mainnet.block-engine.jito.wtf".to_string(),
+        "https://london.mainnet.block-engine.jito.wtf".to_string(),
+        "https://ny.mainnet.block-engine.jito.wtf".to_string(),
+        "https://slc.mainnet.block-engine.jito.wtf".to_string(),
+        "https://singapore.mainnet.block-engine.jito.wtf".to_string(),
+        "https://tokyo.mainnet.block-engine.jito.wtf".to_string(),
+    ]
 }
 
 fn default_grpc_rate() -> u32 {

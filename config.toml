@@ -72,8 +72,25 @@ fail_closed = true
 # REST (با uuid) اجرا می‌شود. هر مسیر rate limiter جدا دارد، پس مجموع
 # throughput = jito.max_bundles_per_second + jito_grpc.max_bundles_per_second
 # (در تنظیمات فعلی: 5 + 5 = 10 باندل در ثانیه).
+#
+# دقیقاً مثل REST، gRPC هم به همه ۸ ریجن همزمان فن‌اوت می‌شود (نه به
+# اندپوینت گلوبال). هر ریجن کانال و auth جداگانه دارد؛ اگر auth یک ریجن
+# fail شد، آن ریجن در no-auth mode پیام می‌فرستد.
+#
+# تکراری ارسال نمی‌شود: dispatcher اول REST limiter را می‌چکد؛ اگر جا داشت
+# ⇒ REST، وگرنه gRPC limiter را امتحان می‌کند؛ اگر هر دو پر بودند ⇒ فرصت
+# drop می‌شود (jito_rate_limited++).
 enabled = true
-endpoint = "https://mainnet.block-engine.jito.wtf"
+endpoints = [
+    "https://amsterdam.mainnet.block-engine.jito.wtf",
+    "https://dublin.mainnet.block-engine.jito.wtf",
+    "https://frankfurt.mainnet.block-engine.jito.wtf",
+    "https://london.mainnet.block-engine.jito.wtf",
+    "https://ny.mainnet.block-engine.jito.wtf",
+    "https://slc.mainnet.block-engine.jito.wtf",
+    "https://singapore.mainnet.block-engine.jito.wtf",
+    "https://tokyo.mainnet.block-engine.jito.wtf",
+]
 # این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
 # تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
 auth_keypair = "/root/m/wallet/grpc.json"

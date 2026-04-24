@@ -134,14 +134,14 @@ async fn async_main(config: config::Config) -> Result<()> {
     // REST first and falls back to gRPC when REST is saturated.
     let (jito_grpc_client, jito_grpc_limiter) = if config.jito_grpc.enabled {
         match jito_grpc::JitoGrpcClient::new(
-            &config.jito_grpc.endpoint,
+            &config.jito_grpc.endpoints,
             &config.jito_grpc.auth_keypair,
         )
         .await
         {
             Ok(client) => {
                 info!(
-                    endpoint = %config.jito_grpc.endpoint,
+                    endpoints = config.jito_grpc.endpoints.len(),
                     rate = config.jito_grpc.max_bundles_per_second,
                     "Jito gRPC searcher client ready"
                 );

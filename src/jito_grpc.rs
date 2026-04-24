@@ -1,11 +1,21 @@
-//! Jito Block-Engine gRPC client (SearcherService).
+//! Jito Block-Engine gRPC client (SearcherService) — multi-region.
 //!
-//! Auth is attempted on startup using the whitelisted keypair. If auth fails
-//! (keypair not activated, endpoint mismatch, network error) the client falls
-//! back to no-auth mode and sends bundles without an Authorization header.
-//! This mirrors the Jito "NewNoAuth" pattern in their Go SDK.
+//! Mirrors the REST client design in `jito.rs`: each `send_bundle` call
+//! broadcasts the same bundle to ALL configured regional endpoints
+//! concurrently. The first regional success is returned to the caller.
+//!
+//! Per-region auth: each channel runs its own challenge/sign handshake
+//! at startup. If a region's auth fails (keypair not whitelisted, network,
+//! etc.) that region falls back to **no-auth mode** and sends bundles
+//! without an Authorization header — the rest of the regions are unaffected.
+//! Mirrors Jito's NewNoAuth pattern.
+//!
+//! Duplicate prevention is the dispatcher's job, not this client's: in
+//! `arbitrage.rs` each profitable opportunity goes to EITHER the REST path
+//! OR the gRPC path (REST first, gRPC fallback when REST limiter is empty).
 
 use anyhow::{anyhow, Context, Result};
+use futures::future::join_all;
 use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
@@ -54,25 +64,73 @@ struct Tokens {
     refresh_expires_at: u64,
 }
 
-pub struct JitoGrpcClient {
+/// One Jito Block Engine region: its own channel and its own auth state.
+struct Region {
+    endpoint: String,
     channel: Channel,
-    /// None = no-auth mode (auth failed or skipped at startup).
+    /// `None` = region runs in no-auth mode (auth never succeeded).
     tokens: Arc<RwLock<Option<Tokens>>>,
 }
 
+pub struct JitoGrpcClient {
+    regions: Vec<Arc<Region>>,
+}
+
 impl JitoGrpcClient {
-    /// Connect to the Jito gRPC endpoint and attempt authentication.
-    ///
-    /// If auth fails for any reason the client starts in **no-auth mode**:
-    /// bundles are sent without an Authorization header. Many Jito endpoints
-    /// accept unauthenticated gRPC bundles (equivalent to the REST UUID path).
-    pub async fn new(endpoint: &str, keypair_path: &str) -> Result<Self> {
+    /// Connect to every endpoint, attempt per-region auth, and spawn a
+    /// refresh task for each successfully-authenticated region.
+    /// Regions that fail to connect are skipped; regions that connect but
+    /// fail auth run in no-auth mode.
+    pub async fn new(endpoints: &[String], keypair_path: &str) -> Result<Self> {
         let keypair = Arc::new(
             crate::wallet::read_keypair(keypair_path)
                 .with_context(|| format!("failed to load gRPC auth keypair from {keypair_path}"))?,
         );
         let auth_pubkey = keypair.pubkey();
 
+        let mut regions: Vec<Arc<Region>> = Vec::new();
+        let mut authed = 0usize;
+        let mut no_auth = 0usize;
+
+        for endpoint in endpoints {
+            match Self::connect_region(endpoint, &keypair).await {
+                Ok((region, was_authed)) => {
+                    if was_authed {
+                        authed += 1;
+                    } else {
+                        no_auth += 1;
+                    }
+                    regions.push(Arc::new(region));
+                }
+                Err(e) => {
+                    warn!(
+                        endpoint = %endpoint,
+                        error = %e,
+                        "Jito gRPC region failed to connect, skipping"
+                    );
+                }
+            }
+        }
+
+        if regions.is_empty() {
+            anyhow::bail!("no Jito gRPC regions could be reached");
+        }
+
+        info!(
+            auth_pubkey = %auth_pubkey,
+            regions_total = regions.len(),
+            regions_authed = authed,
+            regions_no_auth = no_auth,
+            "Jito gRPC multi-region client initialized"
+        );
+
+        Ok(Self { regions })
+    }
+
+    /// Open one regional channel. Always returns successfully if the TCP/TLS
+    /// connect works — auth failure downgrades to no-auth mode rather than
+    /// erroring out.
+    async fn connect_region(endpoint: &str, keypair: &Arc<Keypair>) -> Result<(Region, bool)> {
         let tls = ClientTlsConfig::new().with_webpki_roots();
         let channel = Endpoint::from_shared(endpoint.to_string())
             .with_context(|| format!("invalid Jito gRPC endpoint {endpoint}"))?
@@ -85,78 +143,109 @@ impl JitoGrpcClient {
             .await
             .with_context(|| format!("failed to connect to Jito gRPC at {endpoint}"))?;
 
-        // Attempt auth. On failure fall through to no-auth mode instead of
-        // returning Err — this lets the gRPC path stay alive even when the
-        // keypair isn't whitelisted by Jito.
-        let tokens = match authenticate(&channel, &keypair).await {
+        let (tokens, was_authed) = match authenticate(&channel, keypair).await {
             Ok(initial) => {
                 info!(
-                    auth_pubkey = %auth_pubkey,
+                    endpoint = %endpoint,
                     access_expires_at = initial.access_expires_at,
-                    "Jito gRPC authenticated"
+                    "Jito gRPC region authenticated"
                 );
-                let t = Arc::new(RwLock::new(Some(initial)));
+                let arc = Arc::new(RwLock::new(Some(initial)));
 
-                // Background refresh loop.
+                let refresh_endpoint = endpoint.to_string();
                 let refresh_channel = channel.clone();
-                let refresh_tokens = t.clone();
+                let refresh_tokens = arc.clone();
                 let refresh_keypair = keypair.clone();
                 tokio::spawn(async move {
-                    token_refresh_loop(refresh_channel, refresh_tokens, refresh_keypair).await;
+                    token_refresh_loop(
+                        refresh_endpoint,
+                        refresh_channel,
+                        refresh_tokens,
+                        refresh_keypair,
+                    )
+                    .await;
                 });
 
-                t
+                (arc, true)
             }
             Err(e) => {
                 warn!(
+                    endpoint = %endpoint,
                     error = %e,
-                    auth_pubkey = %auth_pubkey,
-                    "Jito gRPC auth failed -- running in no-auth mode (bundles sent without token)"
+                    "Jito gRPC region auth failed -- this region will send unauthenticated"
                 );
-                Arc::new(RwLock::new(None))
+                (Arc::new(RwLock::new(None)), false)
             }
         };
 
-        Ok(Self { channel, tokens })
+        Ok((
+            Region {
+                endpoint: endpoint.to_string(),
+                channel,
+                tokens,
+            },
+            was_authed,
+        ))
     }
 
-    /// Serialize `tx`, wrap in a single-packet Bundle, and call
-    /// SearcherService.SendBundle. Uses Bearer token when available,
-    /// otherwise sends unauthenticated (no-auth mode).
-    /// Returns the bundle UUID on success.
+    /// Serialize `tx` once, broadcast to ALL regions concurrently.
+    /// Returns the first regional success, or the last error if every
+    /// region failed.
     pub async fn send_bundle(&self, tx: &VersionedTransaction) -> Result<String> {
         let tx_bytes = bincode::serialize(tx).context("failed to serialize transaction")?;
 
-        let packet = Packet {
+        let futures: Vec<_> = self
+            .regions
+            .iter()
+            .map(|r| {
+                let region = r.clone();
+                let tx_bytes = tx_bytes.clone();
+                async move { send_to_region(&region, tx_bytes).await }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+
+        let mut last_err = None;
+        for result in results {
+            match result {
+                Ok(uuid) => return Ok(uuid),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no Jito gRPC regions configured")))
+    }
+}
+
+/// SendBundle to one region. Adds Bearer token if the region authenticated.
+async fn send_to_region(region: &Region, tx_bytes: Vec<u8>) -> Result<String> {
+    let bundle = Bundle {
+        header: None,
+        packets: vec![Packet {
             data: tx_bytes,
             meta: None,
-        };
-        let bundle = Bundle {
-            header: None,
-            packets: vec![packet],
-        };
+        }],
+    };
 
-        let mut client = SearcherServiceClient::new(self.channel.clone());
-        let mut req = Request::new(SendBundleRequest {
-            bundle: Some(bundle),
-        });
+    let mut client = SearcherServiceClient::new(region.channel.clone());
+    let mut req = Request::new(SendBundleRequest {
+        bundle: Some(bundle),
+    });
 
-        // Attach Authorization header only when we have a valid token.
-        if let Some(ref t) = *self.tokens.read().await {
-            let auth_value: MetadataValue<_> = format!("Bearer {}", t.access)
-                .parse()
-                .map_err(|e| anyhow!("invalid access token: {e:?}"))?;
-            req.metadata_mut().insert("authorization", auth_value);
-        }
-
-        let resp = client
-            .send_bundle(req)
-            .await
-            .context("Jito SearcherService.SendBundle failed")?;
-        let uuid = resp.into_inner().uuid;
-        debug!(uuid = %uuid, "Jito gRPC bundle accepted");
-        Ok(uuid)
+    if let Some(ref t) = *region.tokens.read().await {
+        let auth_value: MetadataValue<_> = format!("Bearer {}", t.access)
+            .parse()
+            .map_err(|e| anyhow!("invalid access token: {e:?}"))?;
+        req.metadata_mut().insert("authorization", auth_value);
     }
+
+    let resp = client
+        .send_bundle(req)
+        .await
+        .with_context(|| format!("Jito gRPC SendBundle failed at {}", region.endpoint))?;
+    let uuid = resp.into_inner().uuid;
+    debug!(endpoint = %region.endpoint, uuid = %uuid, "gRPC bundle accepted");
+    Ok(uuid)
 }
 
 /// Run the AuthService challenge/sign/exchange dance and return fresh tokens.
@@ -204,10 +293,11 @@ async fn authenticate(channel: &Channel, keypair: &Keypair) -> Result<Tokens> {
     })
 }
 
-/// Background loop that refreshes the access token well before it expires.
-/// Falls back to a full re-auth if RefreshAccessToken fails or the refresh
-/// token itself is close to expiry.
+/// Per-region background loop that refreshes the access token before it
+/// expires, falling back to a full re-auth when the refresh token is also
+/// stale or RefreshAccessToken errors.
 async fn token_refresh_loop(
+    endpoint: String,
     channel: Channel,
     tokens: Arc<RwLock<Option<Tokens>>>,
     keypair: Arc<Keypair>,
@@ -240,10 +330,10 @@ async fn token_refresh_loop(
             match authenticate(&channel, &keypair).await {
                 Ok(new) => {
                     *tokens.write().await = Some(new);
-                    info!("Jito gRPC tokens re-issued via full auth");
+                    info!(endpoint = %endpoint, "Jito gRPC tokens re-issued via full auth");
                 }
                 Err(e) => {
-                    error!(error = %e, "Jito gRPC re-auth failed, retrying in 30s");
+                    error!(endpoint = %endpoint, error = %e, "Jito gRPC re-auth failed, retry in 30s");
                     tokio::time::sleep(Duration::from_secs(30)).await;
                 }
             }
@@ -271,19 +361,19 @@ async fn token_refresh_loop(
                         t.access_expires_at = timestamp_secs(new_access.expires_at_utc.as_ref());
                         t.access = new_access.value;
                     }
-                    debug!("Jito gRPC access token refreshed");
+                    debug!(endpoint = %endpoint, "Jito gRPC access token refreshed");
                 } else {
-                    warn!("RefreshAccessToken returned empty access token, will re-auth");
+                    warn!(endpoint = %endpoint, "RefreshAccessToken returned empty access token, will re-auth");
                 }
             }
             Err(e) => {
-                warn!(error = %e, "RefreshAccessToken failed, falling back to full auth");
+                warn!(endpoint = %endpoint, error = %e, "RefreshAccessToken failed, falling back to full auth");
                 match authenticate(&channel, &keypair).await {
                     Ok(new) => {
                         *tokens.write().await = Some(new);
                     }
                     Err(e2) => {
-                        error!(error = %e2, "Jito gRPC re-auth also failed");
+                        error!(endpoint = %endpoint, error = %e2, "Jito gRPC re-auth also failed");
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
                 }
