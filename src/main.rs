@@ -83,7 +83,7 @@ async fn async_main(config: config::Config) -> Result<()> {
     let token_mints = tokens::load_tokens(&config.trading.tokens_file)?;
     info!(count = token_mints.len(), "tokens loaded");
 
-    let trading_keypair = wallet::read_keypair(&config.jito.trading_keypair)?;
+    let trading_keypair = Arc::new(wallet::read_keypair(&config.jito.trading_keypair)?);
     info!(trading_wallet = %trading_keypair.pubkey(), "keypair loaded");
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));

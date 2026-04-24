@@ -185,13 +185,16 @@ async fn check_opportunity(
 /// AMM routes: simulate → if pass → rate limit → send to Jito
 /// PMM routes: BYPASS simulation → rate limit → send directly to Jito
 ///   (PMMs rely on same-slot oracle freshness that local sim can't provide)
+///
+/// All per-opportunity work (tx build, serialization, simulation, dispatch)
+/// is spawned immediately so the scan loop is never blocked.
 pub async fn scan_all_tokens(
     metis: &MetisClient,
     token_mints: &[String],
     config: &Config,
     jito: &Arc<JitoClient>,
-    trading_keypair: &Keypair,
-    rpc_client: &RpcClient,
+    trading_keypair: &Arc<Keypair>,
+    rpc_client: &Arc<RpcClient>,
     jito_limiter: &Arc<Mutex<RateLimiter>>,
     blockhash_cache: &BlockhashCache,
     alt_cache: &AltCache,
@@ -248,104 +251,102 @@ pub async fn scan_all_tokens(
             "PROFITABLE -- building tx"
         );
 
+        // Capture everything the spawned task needs. The main loop returns
+        // immediately so the next opportunity is processed without waiting
+        // for tx build, serialization, simulation, or Jito network I/O.
         let recent_blockhash = blockhash_cache.get();
-        let tx = match transaction::build_arb_transaction(
-            &opp.swap_ixs,
-            trading_keypair,
-            opp.tip_lamports,
-            opp.cu_limit,
-            recent_blockhash,
-            alt_cache,
-            rpc_client,
-        ) {
-            Ok(tx) => tx,
-            Err(e) => {
-                metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, token = opp.token_mint.as_str(), "tx build failed");
-                continue;
-            }
-        };
-
-        match bincode::serialize(&tx) {
-            Ok(bytes) if bytes.len() > 1232 => {
-                metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    token = opp.token_mint.as_str(),
-                    bytes = bytes.len(),
-                    "tx too large, dropping"
-                );
-                continue;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, token = opp.token_mint.as_str(), "tx serialize failed");
-                continue;
-            }
-        }
-
+        let keypair_clone = trading_keypair.clone();
+        let rpc_clone = rpc_client.clone();
+        let alt_clone = alt_cache.clone();
         let jito_clone = jito.clone();
         let jito_limiter_clone = jito_limiter.clone();
         let jito_grpc_clone = jito_grpc.cloned();
         let jito_grpc_limiter_clone = jito_grpc_limiter.cloned();
         let metrics_clone = metrics.clone();
+        let sim_cache_clone = sim_cache.cloned();
+        let sim_pool_clone = sim_pool.cloned();
+
         let token_for_log = opp.token_mint.clone();
         let profit_for_log = opp.net_profit;
         let amount_for_log = opp.amount;
         let expected_out_for_log = opp.output_wsol;
+        let tip_lamports = opp.tip_lamports;
+        let cu_limit = opp.cu_limit;
         let min_acceptable_out = opp.amount + opp.tip_lamports + base_fee;
-
         let is_pmm = opp.is_pmm;
-
-        // AMM routes: resolve ALTs for sim and pre-load into cache.
-        // PMM routes: skip sim entirely.
-        let alts_for_sim = if !is_pmm {
-            match (sim_cache, sim_pool) {
-                (Some(cache), Some(_)) => {
-                    match litesvm_sim::resolve_alts(
-                        &opp.swap_ixs.address_lookup_table_addresses,
-                        alt_cache,
-                        rpc_client,
-                    ) {
-                        Ok(alts) => {
-                            for alt in &alts {
-                                if cache.get(&alt.key).is_none() {
-                                    if let Err(e) = cache.get_or_fetch(&alt.key) {
-                                        warn!(alt = %alt.key, error = %e, "ALT raw account fetch failed");
-                                    }
-                                }
-                            }
-                            Some(alts)
-                        }
-                        Err(e) => {
-                            metrics.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                            warn!(error = %e, token = opp.token_mint.as_str(), "sim ALT resolve failed");
-                            continue;
-                        }
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let sim_cache_for_task = if !is_pmm { sim_cache.cloned() } else { None };
-        let sim_worker = if !is_pmm { sim_pool.map(|p| p.acquire()) } else { None };
+        let swap_ixs = opp.swap_ixs;
 
         tokio::spawn(async move {
+            // ── Step 1: build versioned transaction ───────────────────────
+            let tx = match transaction::build_arb_transaction(
+                &swap_ixs,
+                &keypair_clone,
+                tip_lamports,
+                cu_limit,
+                recent_blockhash,
+                &alt_clone,
+                &*rpc_clone,
+            ) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(error = %e, token = token_for_log.as_str(), "tx build failed");
+                    return;
+                }
+            };
+
+            // ── Step 2: size guard (Solana hard limit 1232 bytes) ─────────
+            match bincode::serialize(&tx) {
+                Ok(bytes) if bytes.len() > 1232 => {
+                    metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        token = token_for_log.as_str(),
+                        bytes = bytes.len(),
+                        "tx too large, dropping"
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(error = %e, token = token_for_log.as_str(), "tx serialize failed");
+                    return;
+                }
+            }
+
+            // ── Step 3: PMM bypass OR AMM simulation gate ─────────────────
             if is_pmm {
-                // PMM path: skip simulation, go directly to rate limit + Jito.
                 metrics_clone.pmm_bypass.fetch_add(1, Ordering::Relaxed);
                 info!(
                     token = token_for_log.as_str(),
                     "PMM route -- bypassing sim, sending directly to Jito"
                 );
-            } else if let (Some(cache), Some(sim), Some(alts)) =
-                (sim_cache_for_task, sim_worker, alts_for_sim)
-            {
-                // AMM path: full simulation gate.
+            } else if let (Some(cache), Some(pool)) = (&sim_cache_clone, &sim_pool_clone) {
+                let alts = match litesvm_sim::resolve_alts(
+                    &swap_ixs.address_lookup_table_addresses,
+                    &alt_clone,
+                    &*rpc_clone,
+                ) {
+                    Ok(alts) => {
+                        for alt in &alts {
+                            if cache.get(&alt.key).is_none() {
+                                if let Err(e) = cache.get_or_fetch(&alt.key) {
+                                    warn!(alt = %alt.key, error = %e, "ALT raw account fetch failed");
+                                }
+                            }
+                        }
+                        alts
+                    }
+                    Err(e) => {
+                        metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
+                        warn!(error = %e, token = token_for_log.as_str(), "sim ALT resolve failed");
+                        return;
+                    }
+                };
+
+                let sim = pool.acquire();
                 metrics_clone.sim_submitted.fetch_add(1, Ordering::Relaxed);
-                match sim.simulate(&tx, &alts, &cache, min_acceptable_out, &metrics_clone) {
+                match sim.simulate(&tx, &alts, cache, min_acceptable_out, &metrics_clone) {
                     Ok(outcome) => {
                         info!(
                             token = token_for_log.as_str(),
@@ -367,9 +368,7 @@ pub async fn scan_all_tokens(
                 }
             }
 
-            // Dispatch across both Jito paths. Try REST (UUID) first; if
-            // its rate limiter is saturated, fall through to gRPC. Both
-            // limiters refuse → jito_rate_limited++.
+            // ── Step 4: dispatch — REST first, gRPC fallback ──────────────
             let use_rest = jito_limiter_clone.lock().unwrap().try_acquire();
             let use_grpc = if use_rest {
                 false

@@ -58,3 +58,12 @@ impl AltCache {
         warn!("ALT cache cleared");
     }
 }
+
+impl Clone for AltCache {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            tip_pubkeys: self.tip_pubkeys.clone(),
+        }
+    }
+}

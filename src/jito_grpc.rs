@@ -1,23 +1,9 @@
 //! Jito Block-Engine gRPC client (SearcherService).
 //!
-//! Alternative submission path that coexists with the REST UUID client
-//! in `jito.rs`. Each path has its own rate limiter, so the bot can
-//! submit up to `rest_rate + grpc_rate` bundles per second — ~10/s in
-//! the production config.
-//!
-//! Auth flow (SEARCHER role):
-//!   1. `GenerateAuthChallenge(role=SEARCHER, pubkey=<whitelisted>)`
-//!   2. sign `"{pubkey_base58}-{challenge}"` with the keypair
-//!   3. `GenerateAuthTokens(challenge, client_pubkey, signed_challenge)`
-//!      → `access_token` (~30 min) and `refresh_token` (~1 h)
-//!   4. send `authorization: Bearer <access_token>` on every SendBundle
-//!
-//! A background task refreshes the access token before expiry so hot-path
-//! callers never block on auth.
-//!
-//! The whitelisted wallet holds NO funds and NEVER signs transactions —
-//! it is purely an identity credential that Jito uses to authorise the
-//! connection. Transactions are still signed by the trading wallet.
+//! Auth is attempted on startup using the whitelisted keypair. If auth fails
+//! (keypair not activated, endpoint mismatch, network error) the client falls
+//! back to no-auth mode and sends bundles without an Authorization header.
+//! This mirrors the Jito "NewNoAuth" pattern in their Go SDK.
 
 use anyhow::{anyhow, Context, Result};
 use solana_sdk::{
@@ -70,16 +56,16 @@ struct Tokens {
 
 pub struct JitoGrpcClient {
     channel: Channel,
-    tokens: Arc<RwLock<Tokens>>,
+    /// None = no-auth mode (auth failed or skipped at startup).
+    tokens: Arc<RwLock<Option<Tokens>>>,
 }
 
 impl JitoGrpcClient {
-    /// Connect, authenticate, and spawn a token-refresh task.
+    /// Connect to the Jito gRPC endpoint and attempt authentication.
     ///
-    /// `endpoint` is the Jito Block-Engine gRPC URL, typically
-    /// `https://mainnet.block-engine.jito.wtf` (TLS on port 443).
-    /// `keypair_path` is the Solana JSON keypair of the wallet Jito has
-    /// whitelisted for gRPC auth — not the trading wallet.
+    /// If auth fails for any reason the client starts in **no-auth mode**:
+    /// bundles are sent without an Authorization header. Many Jito endpoints
+    /// accept unauthenticated gRPC bundles (equivalent to the REST UUID path).
     pub async fn new(endpoint: &str, keypair_path: &str) -> Result<Self> {
         let keypair = Arc::new(
             crate::wallet::read_keypair(keypair_path)
@@ -99,35 +85,50 @@ impl JitoGrpcClient {
             .await
             .with_context(|| format!("failed to connect to Jito gRPC at {endpoint}"))?;
 
-        let initial = authenticate(&channel, &keypair)
-            .await
-            .context("initial Jito gRPC authentication failed")?;
-        info!(
-            auth_pubkey = %auth_pubkey,
-            access_expires_at = initial.access_expires_at,
-            "Jito gRPC authenticated"
-        );
-        let tokens = Arc::new(RwLock::new(initial));
+        // Attempt auth. On failure fall through to no-auth mode instead of
+        // returning Err — this lets the gRPC path stay alive even when the
+        // keypair isn't whitelisted by Jito.
+        let tokens = match authenticate(&channel, &keypair).await {
+            Ok(initial) => {
+                info!(
+                    auth_pubkey = %auth_pubkey,
+                    access_expires_at = initial.access_expires_at,
+                    "Jito gRPC authenticated"
+                );
+                let t = Arc::new(RwLock::new(Some(initial)));
 
-        // Background refresh loop.
-        let refresh_channel = channel.clone();
-        let refresh_tokens = tokens.clone();
-        let refresh_keypair = keypair.clone();
-        tokio::spawn(async move {
-            token_refresh_loop(refresh_channel, refresh_tokens, refresh_keypair).await;
-        });
+                // Background refresh loop.
+                let refresh_channel = channel.clone();
+                let refresh_tokens = t.clone();
+                let refresh_keypair = keypair.clone();
+                tokio::spawn(async move {
+                    token_refresh_loop(refresh_channel, refresh_tokens, refresh_keypair).await;
+                });
+
+                t
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    auth_pubkey = %auth_pubkey,
+                    "Jito gRPC auth failed -- running in no-auth mode (bundles sent without token)"
+                );
+                Arc::new(RwLock::new(None))
+            }
+        };
 
         Ok(Self { channel, tokens })
     }
 
     /// Serialize `tx`, wrap in a single-packet Bundle, and call
-    /// SearcherService.SendBundle with the current access token.
+    /// SearcherService.SendBundle. Uses Bearer token when available,
+    /// otherwise sends unauthenticated (no-auth mode).
     /// Returns the bundle UUID on success.
     pub async fn send_bundle(&self, tx: &VersionedTransaction) -> Result<String> {
         let tx_bytes = bincode::serialize(tx).context("failed to serialize transaction")?;
 
         let packet = Packet {
-            data: tx_bytes.clone(),
+            data: tx_bytes,
             meta: None,
         };
         let bundle = Bundle {
@@ -135,16 +136,18 @@ impl JitoGrpcClient {
             packets: vec![packet],
         };
 
-        let access = self.tokens.read().await.access.clone();
-        let auth_value: MetadataValue<_> = format!("Bearer {}", access)
-            .parse()
-            .map_err(|e| anyhow!("invalid access token: {e:?}"))?;
-
         let mut client = SearcherServiceClient::new(self.channel.clone());
         let mut req = Request::new(SendBundleRequest {
             bundle: Some(bundle),
         });
-        req.metadata_mut().insert("authorization", auth_value);
+
+        // Attach Authorization header only when we have a valid token.
+        if let Some(ref t) = *self.tokens.read().await {
+            let auth_value: MetadataValue<_> = format!("Bearer {}", t.access)
+                .parse()
+                .map_err(|e| anyhow!("invalid access token: {e:?}"))?;
+            req.metadata_mut().insert("authorization", auth_value);
+        }
 
         let resp = client
             .send_bundle(req)
@@ -206,32 +209,37 @@ async fn authenticate(channel: &Channel, keypair: &Keypair) -> Result<Tokens> {
 /// token itself is close to expiry.
 async fn token_refresh_loop(
     channel: Channel,
-    tokens: Arc<RwLock<Tokens>>,
+    tokens: Arc<RwLock<Option<Tokens>>>,
     keypair: Arc<Keypair>,
 ) {
     loop {
         let sleep_secs = {
             let t = tokens.read().await;
-            let now = now_secs();
-            // refresh 60 s before expiry, but wake up at least every 5 min
-            t.access_expires_at
-                .saturating_sub(now)
-                .saturating_sub(60)
-                .max(10)
-                .min(300)
+            if let Some(ref t) = *t {
+                let now = now_secs();
+                t.access_expires_at
+                    .saturating_sub(now)
+                    .saturating_sub(60)
+                    .max(10)
+                    .min(300)
+            } else {
+                300
+            }
         };
         tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
 
-        // If the refresh token is also about to expire, do a full re-auth.
         let needs_full_reauth = {
             let t = tokens.read().await;
-            t.refresh_expires_at.saturating_sub(now_secs()) < 120
+            match *t {
+                Some(ref t) => t.refresh_expires_at.saturating_sub(now_secs()) < 120,
+                None => true,
+            }
         };
 
         if needs_full_reauth {
             match authenticate(&channel, &keypair).await {
                 Ok(new) => {
-                    *tokens.write().await = new;
+                    *tokens.write().await = Some(new);
                     info!("Jito gRPC tokens re-issued via full auth");
                 }
                 Err(e) => {
@@ -242,7 +250,14 @@ async fn token_refresh_loop(
             continue;
         }
 
-        let refresh_token = tokens.read().await.refresh.clone();
+        let refresh_token = {
+            let t = tokens.read().await;
+            t.as_ref().map(|t| t.refresh.clone())
+        };
+        let Some(refresh_token) = refresh_token else {
+            continue;
+        };
+
         let mut auth = AuthServiceClient::new(channel.clone());
         match auth
             .refresh_access_token(RefreshAccessTokenRequest { refresh_token })
@@ -252,8 +267,10 @@ async fn token_refresh_loop(
                 let inner = resp.into_inner();
                 if let Some(new_access) = inner.access_token {
                     let mut w = tokens.write().await;
-                    w.access_expires_at = timestamp_secs(new_access.expires_at_utc.as_ref());
-                    w.access = new_access.value;
+                    if let Some(ref mut t) = *w {
+                        t.access_expires_at = timestamp_secs(new_access.expires_at_utc.as_ref());
+                        t.access = new_access.value;
+                    }
                     debug!("Jito gRPC access token refreshed");
                 } else {
                     warn!("RefreshAccessToken returned empty access token, will re-auth");
@@ -263,7 +280,7 @@ async fn token_refresh_loop(
                 warn!(error = %e, "RefreshAccessToken failed, falling back to full auth");
                 match authenticate(&channel, &keypair).await {
                     Ok(new) => {
-                        *tokens.write().await = new;
+                        *tokens.write().await = Some(new);
                     }
                     Err(e2) => {
                         error!(error = %e2, "Jito gRPC re-auth also failed");
