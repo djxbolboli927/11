@@ -4,6 +4,7 @@ mod arbitrage;
 mod blockhash_cache;
 mod config;
 mod jito;
+mod jito_grpc;
 mod litesvm_sim;
 mod metis;
 mod metrics;
@@ -128,6 +129,40 @@ async fn async_main(config: config::Config) -> Result<()> {
         RateLimiter::new(config.jito.max_bundles_per_second),
     ));
 
+    // Optional second submission path: SearcherService gRPC.
+    // Each path has its own rate limiter; the arbitrage dispatcher tries
+    // REST first and falls back to gRPC when REST is saturated.
+    let (jito_grpc_client, jito_grpc_limiter) = if config.jito_grpc.enabled {
+        match jito_grpc::JitoGrpcClient::new(
+            &config.jito_grpc.endpoint,
+            &config.jito_grpc.auth_keypair,
+        )
+        .await
+        {
+            Ok(client) => {
+                info!(
+                    endpoint = %config.jito_grpc.endpoint,
+                    rate = config.jito_grpc.max_bundles_per_second,
+                    "Jito gRPC searcher client ready"
+                );
+                let limiter = Arc::new(Mutex::new(RateLimiter::new(
+                    config.jito_grpc.max_bundles_per_second,
+                )));
+                (Some(Arc::new(client)), Some(limiter))
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Jito gRPC init failed, continuing with REST-only path"
+                );
+                (None, None)
+            }
+        }
+    } else {
+        info!("Jito gRPC path disabled via config");
+        (None, None)
+    };
+
     let (sim_cache, sim_pool) = if config.simulation.enabled {
         let cache = account_cache::AccountCache::new(rpc_client.clone());
 
@@ -208,6 +243,8 @@ async fn async_main(config: config::Config) -> Result<()> {
             &alt_cache,
             sim_cache.as_ref(),
             sim_pool.as_ref(),
+            jito_grpc_client.as_ref(),
+            jito_grpc_limiter.as_ref(),
             &metrics,
         )
         .await

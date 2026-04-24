@@ -38,8 +38,11 @@ pub struct Metrics {
     pub sim_passed: AtomicU64,
     /// 7a. PMM routes that bypassed simulation entirely
     pub pmm_bypass: AtomicU64,
-    /// 8. Bundles successfully dispatched to Jito (all regions)
+    /// 8. Bundles successfully dispatched via the REST (UUID) Jito path.
     pub jito_sent: AtomicU64,
+    /// 8b. Bundles successfully dispatched via the SearcherService gRPC path.
+    ///     `jito_sent + jito_grpc_sent` is the real submission throughput.
+    pub jito_grpc_sent: AtomicU64,
 }
 
 impl Metrics {
@@ -56,6 +59,7 @@ impl Metrics {
             sim_passed: AtomicU64::new(0),
             pmm_bypass: AtomicU64::new(0),
             jito_sent: AtomicU64::new(0),
+            jito_grpc_sent: AtomicU64::new(0),
         })
     }
 
@@ -79,6 +83,7 @@ impl Metrics {
                 let passed     = m.sim_passed.swap(0, Ordering::Relaxed);
                 let pmm_byp    = m.pmm_bypass.swap(0, Ordering::Relaxed);
                 let sent       = m.jito_sent.swap(0, Ordering::Relaxed);
+                let grpc_sent  = m.jito_grpc_sent.swap(0, Ordering::Relaxed);
                 let coverage_pct = if profit > 0 {
                     submitted * 100 / profit
                 } else {
@@ -98,6 +103,7 @@ impl Metrics {
                     pmm_bypass         = pmm_byp,
                     jito_rate_limited  = ratelim,
                     jito_sent          = sent,
+                    jito_grpc_sent     = grpc_sent,
                     "==[PIPELINE METRICS]==",
                 );
             }

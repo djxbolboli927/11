@@ -66,3 +66,15 @@ so_dir = "/root/m/so"
 # fail_closed=true  (امن)  : اگر sim خطا داد ⇒ ارسال نکن
 # fail_closed=false (رول‌اوت) : اگر sim خطا داد ⇒ فقط log بزن و بفرست
 fail_closed = true
+
+[jito_grpc]
+# مسیر دوم ارسال باندل از طریق SearcherService gRPC جیتو. همزمان با مسیر
+# REST (با uuid) اجرا می‌شود. هر مسیر rate limiter جدا دارد، پس مجموع
+# throughput = jito.max_bundles_per_second + jito_grpc.max_bundles_per_second
+# (در تنظیمات فعلی: 5 + 5 = 10 باندل در ثانیه).
+enabled = true
+endpoint = "https://mainnet.block-engine.jito.wtf"
+# این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
+# تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
+auth_keypair = "/root/m/wallet/grpc.json"
+max_bundles_per_second = 5

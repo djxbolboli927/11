@@ -12,6 +12,8 @@ pub struct Config {
     pub performance: PerformanceConfig,
     #[serde(default)]
     pub simulation: SimulationConfig,
+    #[serde(default)]
+    pub jito_grpc: JitoGrpcConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -100,6 +102,48 @@ fn default_true() -> bool {
 
 fn default_workers() -> usize {
     8
+}
+
+/// Second Jito submission path via SearcherService gRPC.
+///
+/// Runs alongside the REST UUID client in `jito.rs`. Each path has its
+/// own rate limiter, so the effective Jito throughput is
+/// `jito.max_bundles_per_second + jito_grpc.max_bundles_per_second`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct JitoGrpcConfig {
+    /// If false, only the REST UUID path is used (pre-gRPC behaviour).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Block Engine gRPC endpoint, e.g. `https://mainnet.block-engine.jito.wtf`.
+    #[serde(default = "default_jito_grpc_endpoint")]
+    pub endpoint: String,
+    /// Path to the Solana keypair JSON whose pubkey Jito has whitelisted
+    /// for gRPC auth. This wallet holds no funds — it is an identity only.
+    #[serde(default)]
+    pub auth_keypair: String,
+    /// Per-second rate limit applied *before* the gRPC SendBundle call.
+    /// REST and gRPC limiters operate independently.
+    #[serde(default = "default_grpc_rate")]
+    pub max_bundles_per_second: u32,
+}
+
+impl Default for JitoGrpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_jito_grpc_endpoint(),
+            auth_keypair: String::new(),
+            max_bundles_per_second: default_grpc_rate(),
+        }
+    }
+}
+
+fn default_jito_grpc_endpoint() -> String {
+    "https://mainnet.block-engine.jito.wtf".to_string()
+}
+
+fn default_grpc_rate() -> u32 {
+    5
 }
 
 #[derive(Debug, Deserialize, Clone)]

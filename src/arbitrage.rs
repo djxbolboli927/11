@@ -11,6 +11,7 @@ use crate::alt_cache::AltCache;
 use crate::blockhash_cache::BlockhashCache;
 use crate::config::Config;
 use crate::jito::JitoClient;
+use crate::jito_grpc::JitoGrpcClient;
 use crate::litesvm_sim::{self, SimulatorPool};
 use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
 use crate::metrics::Metrics;
@@ -196,6 +197,8 @@ pub async fn scan_all_tokens(
     alt_cache: &AltCache,
     sim_cache: Option<&Arc<AccountCache>>,
     sim_pool: Option<&Arc<SimulatorPool>>,
+    jito_grpc: Option<&Arc<JitoGrpcClient>>,
+    jito_grpc_limiter: Option<&Arc<Mutex<RateLimiter>>>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     let min_lamports = (config.trading.min_amount_sol * LAMPORTS_PER_SOL) as u64;
@@ -283,6 +286,8 @@ pub async fn scan_all_tokens(
 
         let jito_clone = jito.clone();
         let jito_limiter_clone = jito_limiter.clone();
+        let jito_grpc_clone = jito_grpc.cloned();
+        let jito_grpc_limiter_clone = jito_grpc_limiter.cloned();
         let metrics_clone = metrics.clone();
         let token_for_log = opp.token_mint.clone();
         let profit_for_log = opp.net_profit;
@@ -362,29 +367,63 @@ pub async fn scan_all_tokens(
                 }
             }
 
-            // Rate limit before Jito send (applies to both AMM and PMM).
-            if !jito_limiter_clone.lock().unwrap().try_acquire() {
-                metrics_clone.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
-                debug!(token = token_for_log.as_str(), "jito rate limit hit");
-                return;
-            }
-
-            match jito_clone.send_bundle(&tx).await {
-                Ok(uuid) => {
-                    metrics_clone.jito_sent.fetch_add(1, Ordering::Relaxed);
-                    info!(
-                        uuid = %uuid,
-                        token = token_for_log.as_str(),
-                        profit = profit_for_log,
-                        pmm = is_pmm,
-                        "bundle sent to all Jito endpoints"
-                    )
+            // Dispatch across both Jito paths. Try REST (UUID) first; if
+            // its rate limiter is saturated, fall through to gRPC. Both
+            // limiters refuse → jito_rate_limited++.
+            let use_rest = jito_limiter_clone.lock().unwrap().try_acquire();
+            let use_grpc = if use_rest {
+                false
+            } else {
+                match (&jito_grpc_clone, &jito_grpc_limiter_clone) {
+                    (Some(_), Some(lim)) => lim.lock().unwrap().try_acquire(),
+                    _ => false,
                 }
-                Err(e) => warn!(
-                    error = %e,
-                    token = token_for_log.as_str(),
-                    "execution failed"
-                ),
+            };
+
+            if use_rest {
+                match jito_clone.send_bundle(&tx).await {
+                    Ok(uuid) => {
+                        metrics_clone.jito_sent.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            uuid = %uuid,
+                            token = token_for_log.as_str(),
+                            profit = profit_for_log,
+                            pmm = is_pmm,
+                            path = "rest",
+                            "bundle sent to Jito"
+                        );
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        token = token_for_log.as_str(),
+                        path = "rest",
+                        "execution failed"
+                    ),
+                }
+            } else if use_grpc {
+                let grpc = jito_grpc_clone.as_ref().expect("grpc client set when use_grpc");
+                match grpc.send_bundle(&tx).await {
+                    Ok(uuid) => {
+                        metrics_clone.jito_grpc_sent.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            uuid = %uuid,
+                            token = token_for_log.as_str(),
+                            profit = profit_for_log,
+                            pmm = is_pmm,
+                            path = "grpc",
+                            "bundle sent to Jito"
+                        );
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        token = token_for_log.as_str(),
+                        path = "grpc",
+                        "execution failed"
+                    ),
+                }
+            } else {
+                metrics_clone.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
+                debug!(token = token_for_log.as_str(), "jito rate limit hit on both paths");
             }
         });
     }
