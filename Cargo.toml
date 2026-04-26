@@ -3,6 +3,17 @@ name = "solana-arb-bot"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+# Maximum runtime performance for the hot path. Compile time goes up
+# significantly (LTO + single codegen unit), but every microsecond saved
+# in tx build / ALT walk / Jito broadcast is worth it on a long-running
+# arbitrage bot.
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = true
+
 [dependencies]
 # Solana
 solana-sdk = "2.2"

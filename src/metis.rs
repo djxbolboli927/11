@@ -82,7 +82,10 @@ impl MetisClient {
     pub fn new(base_url: &str, timeout_ms: u64) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
-            .pool_max_idle_per_host(10)
+            // Each scan cycle fires (max-min)/step × tokens quote pairs
+            // concurrently. Keeping 64 idle connections warm avoids
+            // ~20-50ms TCP/TLS handshake on cold reuse.
+            .pool_max_idle_per_host(64)
             .tcp_nodelay(true)
             .build()
             .expect("failed to build http client");

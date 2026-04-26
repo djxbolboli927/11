@@ -48,6 +48,11 @@ impl JitoClient {
 
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(5))
+            // 8 regional endpoints × concurrent bundle sends — keep 16
+            // idle connections per region so consecutive sends reuse the
+            // warm TLS session instead of paying ~30ms handshake cost.
+            .pool_max_idle_per_host(16)
+            .tcp_nodelay(true)
             .build()
             .expect("failed to build http client");
 

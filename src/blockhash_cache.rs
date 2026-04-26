@@ -1,17 +1,20 @@
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::hash::Hash;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::time::{interval, Duration};
 use tracing::{debug, warn};
 
+/// Single-writer / many-reader blockhash cache. The hot-path `get()` is
+/// a tiny RwLock read (no contention with other readers); only the 300ms
+/// refresh task takes the write lock briefly.
 pub struct BlockhashCache {
-    inner: Arc<Mutex<Hash>>,
+    inner: Arc<RwLock<Hash>>,
 }
 
 impl BlockhashCache {
     pub fn new(rpc: Arc<RpcClient>) -> Self {
         let initial = rpc.get_latest_blockhash().unwrap_or_default();
-        let inner = Arc::new(Mutex::new(initial));
+        let inner = Arc::new(RwLock::new(initial));
         let shared = inner.clone();
 
         tokio::spawn(async move {
@@ -25,7 +28,7 @@ impl BlockhashCache {
 
                 match result {
                     Ok(Ok(h)) => {
-                        *shared.lock().unwrap() = h;
+                        *shared.write().unwrap() = h;
                         debug!("blockhash refreshed");
                     }
                     Ok(Err(e)) => warn!(error = %e, "blockhash RPC failed"),
@@ -39,6 +42,6 @@ impl BlockhashCache {
 
     #[inline]
     pub fn get(&self) -> Hash {
-        *self.inner.lock().unwrap()
+        *self.inner.read().unwrap()
     }
 }
