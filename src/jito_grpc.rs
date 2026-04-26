@@ -277,12 +277,15 @@ async fn authenticate(channel: &Channel, keypair: &Keypair) -> Result<Tokens> {
         .await
         .map_err(status_to_anyhow("GenerateAuthChallenge"))?
         .into_inner();
-    let challenge = challenge_resp.challenge;
 
-    // Jito's canonical signing format: sign("{pubkey_base58}-{challenge}")
-    // as raw UTF-8 bytes, send the 64-byte signature unchanged.
-    let to_sign = format!("{}-{}", pubkey, challenge);
-    let signed = keypair.sign_message(to_sign.as_bytes());
+    // Jito's auth service stores the challenge keyed by the pubkey-prefixed
+    // form. BOTH the signed bytes AND the `challenge` field on the token
+    // request must be `"{pubkey_base58}-{challenge}"` — sending the raw
+    // `challenge_resp.challenge` back gives PermissionDenied "challenge not
+    // found". Matches the variable shadowing in
+    // jito-labs/searcher-examples/searcher_client/src/token_authenticator.rs.
+    let challenge = format!("{}-{}", pubkey, challenge_resp.challenge);
+    let signed = keypair.sign_message(challenge.as_bytes());
     let signed_bytes = signed.as_ref().to_vec();
 
     let token_resp = auth
