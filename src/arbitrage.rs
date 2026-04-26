@@ -239,6 +239,33 @@ pub async fn scan_all_tokens(
             None => continue,
         };
 
+        // ── Pre-spawn rate-limit gate ─────────────────────────────────────
+        // Reserve a slot on EXACTLY ONE path before doing any work. Try REST
+        // first; on REST-exhausted, try gRPC. If both are saturated, drop
+        // the opportunity here with zero spawn cost. This prevents the scan
+        // loop from queuing work that will only be discarded after tx build.
+        let use_grpc = if jito_limiter.lock().unwrap().try_acquire() {
+            false
+        } else if let Some(grpc_lim) = jito_grpc_limiter {
+            if grpc_lim.lock().unwrap().try_acquire() {
+                true
+            } else {
+                metrics.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    token = opp.token_mint.as_str(),
+                    "both Jito paths rate-limited, dropping"
+                );
+                continue;
+            }
+        } else {
+            metrics.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                token = opp.token_mint.as_str(),
+                "REST rate-limited, no gRPC available"
+            );
+            continue;
+        };
+
         info!(
             token = opp.token_mint.as_str(),
             input_sol = opp.amount as f64 / LAMPORTS_PER_SOL,
@@ -248,7 +275,8 @@ pub async fn scan_all_tokens(
             hops = opp.hop_count,
             cu_limit = opp.cu_limit,
             pmm = opp.is_pmm,
-            "PROFITABLE -- building tx"
+            path = if use_grpc { "grpc" } else { "rest" },
+            "PROFITABLE -- dispatching"
         );
 
         // Capture everything the spawned task needs. The main loop returns
@@ -259,9 +287,7 @@ pub async fn scan_all_tokens(
         let rpc_clone = rpc_client.clone();
         let alt_clone = alt_cache.clone();
         let jito_clone = jito.clone();
-        let jito_limiter_clone = jito_limiter.clone();
         let jito_grpc_clone = jito_grpc.cloned();
-        let jito_grpc_limiter_clone = jito_grpc_limiter.cloned();
         let metrics_clone = metrics.clone();
         let sim_cache_clone = sim_cache.cloned();
         let sim_pool_clone = sim_pool.cloned();
@@ -277,20 +303,39 @@ pub async fn scan_all_tokens(
         let swap_ixs = opp.swap_ixs;
 
         tokio::spawn(async move {
-            // ── Step 1: build versioned transaction ───────────────────────
-            let tx = match transaction::build_arb_transaction(
-                &swap_ixs,
-                &keypair_clone,
-                tip_lamports,
-                cu_limit,
-                recent_blockhash,
-                &alt_clone,
-                &*rpc_clone,
-            ) {
-                Ok(tx) => tx,
-                Err(e) => {
+            // The sim path needs ALT addresses again; clone them before
+            // moving `swap_ixs` into the build closure.
+            let alt_addresses = swap_ixs.address_lookup_table_addresses.clone();
+
+            // ── Step 1: build versioned tx in spawn_blocking ──────────────
+            // ALT cache-miss inside build_arb_transaction triggers a
+            // synchronous RpcClient::get_account; running it here on a
+            // dedicated blocking thread keeps tokio worker threads free.
+            let alt_for_build = alt_clone.clone();
+            let rpc_for_build = rpc_clone.clone();
+            let keypair_for_build = keypair_clone.clone();
+            let tx = match tokio::task::spawn_blocking(move || {
+                transaction::build_arb_transaction(
+                    &swap_ixs,
+                    &keypair_for_build,
+                    tip_lamports,
+                    cu_limit,
+                    recent_blockhash,
+                    &alt_for_build,
+                    &rpc_for_build,
+                )
+            })
+            .await
+            {
+                Ok(Ok(tx)) => tx,
+                Ok(Err(e)) => {
                     metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
                     warn!(error = %e, token = token_for_log.as_str(), "tx build failed");
+                    return;
+                }
+                Err(e) => {
+                    metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(error = %e, token = token_for_log.as_str(), "tx build task panicked");
                     return;
                 }
             };
@@ -317,29 +362,41 @@ pub async fn scan_all_tokens(
             // ── Step 3: PMM bypass OR AMM simulation gate ─────────────────
             if is_pmm {
                 metrics_clone.pmm_bypass.fetch_add(1, Ordering::Relaxed);
-                info!(
+                debug!(
                     token = token_for_log.as_str(),
-                    "PMM route -- bypassing sim, sending directly to Jito"
+                    "PMM route -- bypassing sim"
                 );
             } else if let (Some(cache), Some(pool)) = (&sim_cache_clone, &sim_pool_clone) {
-                let alts = match litesvm_sim::resolve_alts(
-                    &swap_ixs.address_lookup_table_addresses,
-                    &alt_clone,
-                    &*rpc_clone,
-                ) {
-                    Ok(alts) => {
-                        for alt in &alts {
-                            if cache.get(&alt.key).is_none() {
-                                if let Err(e) = cache.get_or_fetch(&alt.key) {
-                                    warn!(alt = %alt.key, error = %e, "ALT raw account fetch failed");
-                                }
+                // ALT resolve also does sync RPC on miss → spawn_blocking.
+                let alt_for_sim = alt_clone.clone();
+                let rpc_for_sim = rpc_clone.clone();
+                let cache_for_warm = cache.clone();
+                let alts = match tokio::task::spawn_blocking(move || {
+                    let alts = litesvm_sim::resolve_alts(
+                        &alt_addresses,
+                        &alt_for_sim,
+                        &rpc_for_sim,
+                    )?;
+                    for alt in &alts {
+                        if cache_for_warm.get(&alt.key).is_none() {
+                            if let Err(e) = cache_for_warm.get_or_fetch(&alt.key) {
+                                warn!(alt = %alt.key, error = %e, "ALT raw account fetch failed");
                             }
                         }
-                        alts
+                    }
+                    Ok::<_, anyhow::Error>(alts)
+                })
+                .await
+                {
+                    Ok(Ok(a)) => a,
+                    Ok(Err(e)) => {
+                        metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
+                        warn!(error = %e, token = token_for_log.as_str(), "sim ALT resolve failed");
+                        return;
                     }
                     Err(e) => {
                         metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                        warn!(error = %e, token = token_for_log.as_str(), "sim ALT resolve failed");
+                        warn!(error = %e, token = token_for_log.as_str(), "sim ALT task panicked");
                         return;
                     }
                 };
@@ -368,39 +425,11 @@ pub async fn scan_all_tokens(
                 }
             }
 
-            // ── Step 4: dispatch — REST first, gRPC fallback ──────────────
-            let use_rest = jito_limiter_clone.lock().unwrap().try_acquire();
-            let use_grpc = if use_rest {
-                false
-            } else {
-                match (&jito_grpc_clone, &jito_grpc_limiter_clone) {
-                    (Some(_), Some(lim)) => lim.lock().unwrap().try_acquire(),
-                    _ => false,
-                }
-            };
-
-            if use_rest {
-                match jito_clone.send_bundle(&tx).await {
-                    Ok(uuid) => {
-                        metrics_clone.jito_sent.fetch_add(1, Ordering::Relaxed);
-                        info!(
-                            uuid = %uuid,
-                            token = token_for_log.as_str(),
-                            profit = profit_for_log,
-                            pmm = is_pmm,
-                            path = "rest",
-                            "bundle sent to Jito"
-                        );
-                    }
-                    Err(e) => warn!(
-                        error = %e,
-                        token = token_for_log.as_str(),
-                        path = "rest",
-                        "execution failed"
-                    ),
-                }
-            } else if use_grpc {
-                let grpc = jito_grpc_clone.as_ref().expect("grpc client set when use_grpc");
+            // ── Step 4: dispatch on the path reserved up-front ────────────
+            if use_grpc {
+                let grpc = jito_grpc_clone
+                    .as_ref()
+                    .expect("grpc client set when use_grpc=true");
                 match grpc.send_bundle(&tx).await {
                     Ok(uuid) => {
                         metrics_clone.jito_grpc_sent.fetch_add(1, Ordering::Relaxed);
@@ -421,8 +450,25 @@ pub async fn scan_all_tokens(
                     ),
                 }
             } else {
-                metrics_clone.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
-                debug!(token = token_for_log.as_str(), "jito rate limit hit on both paths");
+                match jito_clone.send_bundle(&tx).await {
+                    Ok(uuid) => {
+                        metrics_clone.jito_sent.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            uuid = %uuid,
+                            token = token_for_log.as_str(),
+                            profit = profit_for_log,
+                            pmm = is_pmm,
+                            path = "rest",
+                            "bundle sent to Jito"
+                        );
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        token = token_for_log.as_str(),
+                        path = "rest",
+                        "execution failed"
+                    ),
+                }
             }
         });
     }
