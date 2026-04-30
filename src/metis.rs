@@ -100,7 +100,9 @@ impl MetisClient {
     /// Parameters:
     /// - slippageBps=0: zero slippage at quote layer; the real on-chain floor
     ///   is set via `other_amount_threshold` in `merge_quotes`.
-    /// - onlyDirectRoutes=false: allow multi-hop for better routes
+    /// - onlyDirectRoutes=true: restrict to single-hop routes only; multi-hop
+    ///   routes from Metis often contain stale math that causes Jito revert due
+    ///   to slippage errors.
     /// - maxAccounts=50: leave room for tip account in final tx
     /// - forJitoBundle=true: excludes Jito-incompatible DEXes
     /// - swapMode=ExactIn: exact input amount
@@ -122,7 +124,7 @@ impl MetisClient {
         let url = format!(
             "{}/quote?inputMint={}&outputMint={}&amount={}\
              &slippageBps=0\
-             &onlyDirectRoutes=false\
+             &onlyDirectRoutes=true\
              &maxAccounts=50\
              &swapMode=ExactIn\
              &forJitoBundle=true\
