@@ -43,6 +43,16 @@ pub struct Metrics {
     /// 8b. Bundles successfully dispatched via the SearcherService gRPC path.
     ///     `jito_sent + jito_grpc_sent` is the real submission throughput.
     pub jito_grpc_sent: AtomicU64,
+
+    // ── Latency tracking ────────────────────────────────────────────────────
+    /// Sum of total Metis interaction time per opportunity (µs).
+    /// Covers: get_quote×2 + get_swap_instructions.
+    pub metis_latency_sum_us: AtomicU64,
+    pub metis_latency_count: AtomicU64,
+    /// Sum of time from Metis response to the moment the bundle is dispatched
+    /// to the network (tx build + sim + queue wait), in µs.
+    pub dispatch_latency_sum_us: AtomicU64,
+    pub dispatch_latency_count: AtomicU64,
 }
 
 impl Metrics {
@@ -60,6 +70,10 @@ impl Metrics {
             pmm_bypass: AtomicU64::new(0),
             jito_sent: AtomicU64::new(0),
             jito_grpc_sent: AtomicU64::new(0),
+            metis_latency_sum_us: AtomicU64::new(0),
+            metis_latency_count: AtomicU64::new(0),
+            dispatch_latency_sum_us: AtomicU64::new(0),
+            dispatch_latency_count: AtomicU64::new(0),
         })
     }
 
@@ -84,6 +98,15 @@ impl Metrics {
                 let pmm_byp    = m.pmm_bypass.swap(0, Ordering::Relaxed);
                 let sent       = m.jito_sent.swap(0, Ordering::Relaxed);
                 let grpc_sent  = m.jito_grpc_sent.swap(0, Ordering::Relaxed);
+
+                let metis_lat_sum  = m.metis_latency_sum_us.swap(0, Ordering::Relaxed);
+                let metis_lat_cnt  = m.metis_latency_count.swap(0, Ordering::Relaxed);
+                let disp_lat_sum   = m.dispatch_latency_sum_us.swap(0, Ordering::Relaxed);
+                let disp_lat_cnt   = m.dispatch_latency_count.swap(0, Ordering::Relaxed);
+
+                let avg_metis_us    = if metis_lat_cnt > 0 { metis_lat_sum / metis_lat_cnt } else { 0 };
+                let avg_dispatch_us = if disp_lat_cnt  > 0 { disp_lat_sum  / disp_lat_cnt  } else { 0 };
+
                 let coverage_pct = if profit > 0 {
                     submitted * 100 / profit
                 } else {
@@ -105,6 +128,15 @@ impl Metrics {
                     jito_sent          = sent,
                     jito_grpc_sent     = grpc_sent,
                     "==[PIPELINE METRICS]==",
+                );
+
+                // Yellow (33m) for Metis round-trip, blue (34m) for build-to-dispatch.
+                eprintln!(
+                    "\x1b[33m[LATENCY] metis_quote_avg={}ms (n={})  |  \x1b[34mbuild_to_dispatch_avg={}ms (n={})\x1b[0m",
+                    avg_metis_us / 1000,
+                    metis_lat_cnt,
+                    avg_dispatch_us / 1000,
+                    disp_lat_cnt,
                 );
             }
         });

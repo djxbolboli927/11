@@ -4,6 +4,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::{signature::Keypair, signer::Signer};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::account_cache::AccountCache;
@@ -98,6 +99,9 @@ struct Opportunity {
     hop_count: usize,
     cu_limit: u32,
     is_pmm: bool,
+    /// Wall-clock time at which the last Metis call (get_swap_instructions) returned.
+    /// Used to measure build-to-dispatch latency in the spawned send task.
+    quote_done_at: Instant,
 }
 
 async fn check_opportunity(
@@ -114,6 +118,8 @@ async fn check_opportunity(
     metrics: &Metrics,
 ) -> Option<Opportunity> {
     metrics.metis_quotes.fetch_add(1, Ordering::Relaxed);
+
+    let t_metis_start = Instant::now();
 
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
@@ -163,6 +169,12 @@ async fn check_opportunity(
         .await
         .ok()?;
 
+    // Record total Metis interaction time (quote×2 + swap_instructions).
+    let metis_elapsed_us = t_metis_start.elapsed().as_micros() as u64;
+    metrics.metis_latency_sum_us.fetch_add(metis_elapsed_us, Ordering::Relaxed);
+    metrics.metis_latency_count.fetch_add(1, Ordering::Relaxed);
+    let quote_done_at = Instant::now();
+
     let cu_limit = lookup_cu_limit(hop_count, cu_limits);
 
     metrics.metis_profitable.fetch_add(1, Ordering::Relaxed);
@@ -177,6 +189,7 @@ async fn check_opportunity(
         hop_count,
         cu_limit,
         is_pmm,
+        quote_done_at,
     })
 }
 
@@ -301,6 +314,7 @@ pub async fn scan_all_tokens(
         let min_acceptable_out = opp.amount + opp.tip_lamports + base_fee;
         let is_pmm = opp.is_pmm;
         let swap_ixs = opp.swap_ixs;
+        let quote_done_at = opp.quote_done_at;
 
         tokio::spawn(async move {
             // The sim path needs ALT addresses again; clone them before
@@ -426,6 +440,12 @@ pub async fn scan_all_tokens(
             }
 
             // ── Step 4: dispatch on the path reserved up-front ────────────
+            // Record time from Metis response to this point (tx build + sim +
+            // task queue wait). This is how long before the bundle hits the wire.
+            let dispatch_us = Instant::now().duration_since(quote_done_at).as_micros() as u64;
+            metrics_clone.dispatch_latency_sum_us.fetch_add(dispatch_us, Ordering::Relaxed);
+            metrics_clone.dispatch_latency_count.fetch_add(1, Ordering::Relaxed);
+
             if use_grpc {
                 let grpc = jito_grpc_clone
                     .as_ref()
