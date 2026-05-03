@@ -1,7 +1,9 @@
 [workspace]
-# Workspace root.  The LiteSVM source is mirrored as a git submodule at
-# vendor/litesvm for local browsing; the actual Cargo dependency uses the git
-# source directly (see litesvm dep below) for correct workspace resolution.
+# Workspace root.  The LiteSVM source lives at vendor/litesvm (committed
+# directly to this repo for reference).  Cargo pulls litesvm via git dep
+# (see litesvm = { git = ... } below) — the path dep cannot be used here
+# because Cargo resolves 'workspace = true' from the patching workspace root,
+# not litesvm's own workspace root.
 resolver = "2"
 
 [package]
@@ -56,9 +58,8 @@ thiserror = "1"
 core_affinity = "0.8"
 
 # Local SVM simulation (pre-flight filter before Jito send).
-# Sourced directly from the LiteSVM GitHub repo (master branch) so we always
-# use the latest mainnet-accurate simulator — the git submodule at
-# vendor/litesvm is a local mirror for browsing and future patching.
+# Git dep so Cargo resolves litesvm's own workspace dependencies correctly.
+# The vendored source at vendor/litesvm is a reference copy at the same commit.
 litesvm = { git = "https://github.com/LiteSVM/litesvm", branch = "master" }
 # solana-account must match litesvm's workspace pin (3.2.0) so the Account
 # type that crosses the Yellowstone cache → LiteSVM boundary is the same type.

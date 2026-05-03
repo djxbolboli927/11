@@ -53,7 +53,7 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     // --- PMM DEX — LiteSVM simulatable (no oracle staleness check) ---
     // GoonFi V2: uses sysvar_instructions whitelist (passes because we send
     // real Jupiter txs). Token vault accounts lazily RPC-fetched on first sim.
-    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "GoonFi_V2.so"),
+    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "goofni_v2.so"),
 ];
 
 /// PMM (Proprietary Market Maker) program ids. Routes through these DEXes
