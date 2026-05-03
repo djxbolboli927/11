@@ -3,6 +3,7 @@ mod alt_cache;
 mod arbitrage;
 mod blockhash_cache;
 mod config;
+mod dex_accounts;
 mod jito;
 mod jito_grpc;
 mod litesvm_sim;
@@ -176,18 +177,33 @@ async fn async_main(config: config::Config) -> Result<()> {
             Err(e) => warn!(error = %e, "initial get_slot failed, sims start at slot 0"),
         }
 
+        // Load per-pool account files from vendor/litesvm/dex/<DEX>/<pool>.toml.
+        // vault_a / vault_b from each pool are subscribed for live Yellowstone
+        // updates (they change on every swap; the DEX owner-filter does not
+        // cover them because they are owned by SPL Token, not the DEX program).
+        let dex_pools = dex_accounts::load(&config.simulation.dex_dir);
+
+        // Yellowstone subscription: owner-filter for all DEX programs + direct
+        // subscription for wsol_ata and all pool vault accounts.
+        let mut live_extra = vec![wsol_ata];
+        live_extra.extend_from_slice(&dex_pools.subscribe_accounts);
+
         cache.spawn_subscription(
             config.yellowstone_grpc.endpoint.clone(),
             config.yellowstone_grpc.x_token.clone(),
             program_registry::all_program_ids(),
-            vec![wsol_ata],
+            live_extra,
         );
         info!(
             endpoint = %config.yellowstone_grpc.endpoint,
             dex_programs = program_registry::PROGRAMS.len(),
+            vault_subs = dex_pools.subscribe_accounts.len(),
             "Yellowstone account cache subscribed"
         );
 
+        // RPC pre-warm: token mints, user ATAs, and all pool accounts from
+        // the dex pool files.  This ensures the sim cache is fully populated
+        // before the first trade rather than waiting for lazy RPC fetches.
         let mut warm: Vec<solana_sdk::pubkey::Pubkey> = token_mints
             .iter()
             .filter_map(|s| solana_sdk::pubkey::Pubkey::try_from(s.as_str()).ok())
@@ -204,6 +220,8 @@ async fn async_main(config: config::Config) -> Result<()> {
                 warm.push(ata);
             }
         }
+        // Pool vaults, mints, and protocol accounts from dex pool files
+        warm.extend_from_slice(&dex_pools.all_accounts);
         cache.prefetch(&warm);
         info!(warmed = cache.len(), "account cache pre-warmed");
 

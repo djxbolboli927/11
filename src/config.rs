@@ -67,6 +67,11 @@ pub struct SimulationConfig {
     /// Directory containing the DEX .so binaries listed in `program_registry`.
     #[serde(default = "default_so_dir")]
     pub so_dir: String,
+    /// Directory containing per-pool account files (`dex/<DEX>/<pool>.toml`).
+    /// These are pre-fetched at startup and the vault accounts within are
+    /// subscribed for live Yellowstone updates.
+    #[serde(default = "default_dex_dir")]
+    pub dex_dir: String,
     /// When sim reverts or errors, `fail_closed=true` drops the send (safest);
     /// `false` logs and forwards to Jito anyway (useful during rollout).
     #[serde(default = "default_true")]
@@ -86,6 +91,7 @@ impl Default for SimulationConfig {
         Self {
             enabled: false,
             so_dir: default_so_dir(),
+            dex_dir: default_dex_dir(),
             fail_closed: true,
             workers: default_workers(),
         }
@@ -94,6 +100,10 @@ impl Default for SimulationConfig {
 
 fn default_so_dir() -> String {
     "/home/soluser/m/so".to_string()
+}
+
+fn default_dex_dir() -> String {
+    "vendor/litesvm/dex".to_string()
 }
 
 fn default_true() -> bool {
