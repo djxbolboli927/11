@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use solana_account::Account;
+use solana_address::Address;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
@@ -83,7 +84,7 @@ impl AccountCache {
         let account = Account {
             lamports: acct.lamports,
             data: acct.data,
-            owner: acct.owner,
+            owner: Address::from(acct.owner.to_bytes()),
             executable: acct.executable,
             rent_epoch: acct.rent_epoch,
         };
@@ -219,12 +220,13 @@ async fn run_stream(
                         Ok(p) => p,
                         Err(_) => continue,
                     };
-                    let owner = Pubkey::try_from(info.owner.as_slice())
-                        .unwrap_or_default();
+                    let owner_bytes: [u8; 32] = info.owner.as_slice()
+                        .try_into()
+                        .unwrap_or([0u8; 32]);
                     let account = Account {
                         lamports: info.lamports,
                         data: info.data,
-                        owner,
+                        owner: Address::from(owner_bytes),
                         executable: info.executable,
                         rent_epoch: info.rent_epoch,
                     };

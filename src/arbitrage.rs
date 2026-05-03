@@ -373,14 +373,10 @@ pub async fn scan_all_tokens(
                 }
             }
 
-            // ── Step 3: PMM bypass OR AMM simulation gate ─────────────────
-            if is_pmm {
-                metrics_clone.pmm_bypass.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    token = token_for_log.as_str(),
-                    "PMM route -- bypassing sim"
-                );
-            } else if let (Some(cache), Some(pool)) = (&sim_cache_clone, &sim_pool_clone) {
+            // ── Step 3: simulation gate (ALL routes — AMM and PMM) ───────────
+            // PMM bypass removed: LiteSVM 0.11 with with_mainnet_features()
+            // handles PMM DEX programs correctly. Every route is simulated.
+            if let (Some(cache), Some(pool)) = (&sim_cache_clone, &sim_pool_clone) {
                 // ALT resolve also does sync RPC on miss → spawn_blocking.
                 let alt_for_sim = alt_clone.clone();
                 let rpc_for_sim = rpc_clone.clone();
