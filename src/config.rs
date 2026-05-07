@@ -31,7 +31,15 @@ pub struct TradingConfig {
     pub min_profit_lamports: u64,
     /// Base Solana network fee in lamports (e.g. 10000 = 0.00001 SOL).
     pub base_fee_lamports: u64,
+    /// Fraction of expected net profit to sacrifice in the output floor.
+    /// 0.70 means sacrifice 70% and retain 30% as guaranteed profit.
+    #[serde(default = "default_profit_sacrifice_percent")]
+    pub profit_sacrifice_percent: f64,
     pub tokens_file: String,
+}
+
+fn default_profit_sacrifice_percent() -> f64 {
+    0.0
 }
 
 #[derive(Debug, Deserialize, Clone)]

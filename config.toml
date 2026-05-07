@@ -8,6 +8,9 @@ max_amount_sol = 0.2
 step_sol = 0.01
 min_profit_lamports = 1000
 base_fee_lamports = 10000
+# Fraction of expected net profit to sacrifice in the output floor.
+# 0.70 means sacrifice 70% and keep 30% as guaranteed profit.
+profit_sacrifice_percent = 0.70
 tokens_file = "tokens.txt"
 
 [jito]

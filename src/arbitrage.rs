@@ -95,6 +95,7 @@ struct Opportunity {
     output_wsol: u64,
     tip_lamports: u64,
     net_profit: u64,
+    min_acceptable_out: u64,
     swap_ixs: SwapInstructionsResponse,
     hop_count: usize,
     cu_limit: u32,
@@ -113,6 +114,7 @@ async fn check_opportunity(
     tip_min: u64,
     tip_max: u64,
     min_profit: u64,
+    profit_sacrifice_percent: f64,
     user_pubkey: &str,
     cu_limits: &[u32],
     metrics: &Metrics,
@@ -146,7 +148,11 @@ async fn check_opportunity(
         return None;
     }
 
-    let min_acceptable_out = amount + total_costs;
+    let net_profit = raw_profit - total_costs;
+    let clamped_sacrifice = profit_sacrifice_percent.clamp(0.0, 1.0);
+    let retain_ratio = 1.0 - clamped_sacrifice;
+    let retained_profit = ((net_profit as f64) * retain_ratio) as u64;
+    let min_acceptable_out = amount + total_costs + retained_profit;
 
     let merged_quote =
         MetisClient::merge_quotes(&quote1, &quote2, min_acceptable_out).ok()?;
@@ -184,7 +190,8 @@ async fn check_opportunity(
         amount,
         output_wsol,
         tip_lamports: tip,
-        net_profit: raw_profit - total_costs,
+        net_profit,
+        min_acceptable_out,
         swap_ixs,
         hop_count,
         cu_limit,
@@ -238,6 +245,7 @@ pub async fn scan_all_tokens(
                 config.jito.tip_min_lamports,
                 config.jito.tip_max_lamports,
                 config.trading.min_profit_lamports,
+                config.trading.profit_sacrifice_percent,
                 &user_pubkey,
                 &config.performance.cu_limits,
                 metrics,
@@ -311,7 +319,7 @@ pub async fn scan_all_tokens(
         let expected_out_for_log = opp.output_wsol;
         let tip_lamports = opp.tip_lamports;
         let cu_limit = opp.cu_limit;
-        let min_acceptable_out = opp.amount + opp.tip_lamports + base_fee;
+        let min_acceptable_out = opp.min_acceptable_out;
         let is_pmm = opp.is_pmm;
         let swap_ixs = opp.swap_ixs;
         let quote_done_at = opp.quote_done_at;
