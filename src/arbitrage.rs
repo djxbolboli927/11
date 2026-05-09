@@ -134,7 +134,7 @@ async fn check_opportunity(
     let quote2 = metis.get_quote(token_mint, WSOL_MINT, token_amount).await.ok()?;
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
-    if output_wsol <= amount {
+    if output_wsol < amount {
         return None;
     }
 
@@ -149,11 +149,8 @@ async fn check_opportunity(
     let tip = transaction::calculate_tip(raw_profit, tip_percent, tip_min, tip_max);
     let total_costs = tip + base_fee;
 
-    // Forward opportunities as long as they are not loss-making after tip+fee.
-    if raw_profit < total_costs {
-        return None;
-    }
-
+    // Keep the filter soft: as long as the round-trip output is not below input,
+    // let it continue (even if expected net after fees/tip is near zero).
     let net_profit = raw_profit.saturating_sub(total_costs);
     let clamped_sacrifice = profit_sacrifice_percent.clamp(0.0, 1.0);
     let retain_ratio = 1.0 - clamped_sacrifice;
