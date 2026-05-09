@@ -22,6 +22,7 @@ use crate::tokens::WSOL_MINT;
 use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+const EXECUTION_SIZE_DIVISOR: u64 = 10;
 
 fn extract_route_program_ids(quote: &QuoteResponse) -> Vec<String> {
     let arr = match quote.route_plan.as_array() {
@@ -108,12 +109,12 @@ struct Opportunity {
 async fn check_opportunity(
     metis: &MetisClient,
     token_mint: &str,
-    amount: u64,
+    configured_amount: u64,
     base_fee: u64,
     tip_percent: f64,
     tip_min: u64,
     tip_max: u64,
-    min_profit: u64,
+    _min_profit: u64,
     profit_sacrifice_percent: f64,
     user_pubkey: &str,
     cu_limits: &[u32],
@@ -122,6 +123,10 @@ async fn check_opportunity(
     metrics.metis_quotes.fetch_add(1, Ordering::Relaxed);
 
     let t_metis_start = Instant::now();
+
+    // Run the live trade at 1/10th of the configured scan size to reduce
+    // market impact and lower negative slippage reverts.
+    let amount = (configured_amount / EXECUTION_SIZE_DIVISOR).max(1);
 
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
@@ -144,15 +149,16 @@ async fn check_opportunity(
     let tip = transaction::calculate_tip(raw_profit, tip_percent, tip_min, tip_max);
     let total_costs = tip + base_fee;
 
-    if raw_profit <= total_costs + min_profit {
+    // Forward opportunities as long as they are not loss-making after tip+fee.
+    if raw_profit < total_costs {
         return None;
     }
 
-    let net_profit = raw_profit - total_costs;
+    let net_profit = raw_profit.saturating_sub(total_costs);
     let clamped_sacrifice = profit_sacrifice_percent.clamp(0.0, 1.0);
     let retain_ratio = 1.0 - clamped_sacrifice;
-    let retained_profit = ((net_profit as f64) * retain_ratio) as u64;
-    let min_acceptable_out = amount + total_costs + retained_profit;
+    let retained_raw_profit = ((raw_profit as f64) * retain_ratio) as u64;
+    let min_acceptable_out = amount + retained_raw_profit;
 
     let merged_quote =
         MetisClient::merge_quotes(&quote1, &quote2, min_acceptable_out).ok()?;
@@ -169,6 +175,10 @@ async fn check_opportunity(
         .as_array()
         .map(|a| a.len())
         .unwrap_or(2);
+    if hop_count != 2 {
+        debug!(token = token_mint, hop_count, "skipping non-2-hop route");
+        return None;
+    }
 
     let swap_ixs = metis
         .get_swap_instructions(user_pubkey, &merged_quote)
