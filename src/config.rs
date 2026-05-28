@@ -180,11 +180,16 @@ pub struct PerformanceConfig {
     /// CU limits per hop count: index 0 = 2 hops, index 1 = 3 hops, etc.
     /// If hops exceed the array, the last value is used.
     pub cu_limits: Vec<u32>,
-    /// Optional CPU affinity for each worker thread.
-    /// If non-empty, worker i is pinned to core `bot_cpu_cores[i % len]`.
-    /// Leave empty `[]` to disable pinning.
+    /// Maximum in-flight Metis quote requests per scan chunk.
+    /// Keeps the HTTP connection pool from being overwhelmed.
+    #[serde(default = "default_max_concurrent_quotes")]
+    pub max_concurrent_quotes: usize,
     #[serde(default)]
     pub bot_cpu_cores: Vec<usize>,
+}
+
+fn default_max_concurrent_quotes() -> usize {
+    512
 }
 
 impl Config {

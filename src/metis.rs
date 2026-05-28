@@ -85,7 +85,7 @@ impl MetisClient {
             // Each scan cycle fires (max-min)/step × tokens quote pairs
             // concurrently. Keeping 64 idle connections warm avoids
             // ~20-50ms TCP/TLS handshake on cold reuse.
-            .pool_max_idle_per_host(64)
+            .pool_max_idle_per_host(1024)
             .tcp_nodelay(true)
             .build()
             .expect("failed to build http client");

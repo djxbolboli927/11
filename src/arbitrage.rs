@@ -217,23 +217,28 @@ pub async fn scan_all_tokens(
 
     let user_pubkey = trading_keypair.pubkey().to_string();
 
-    let mut futs = FuturesUnordered::new();
-
+    let mut all_pairs: Vec<(u64, String)> = Vec::new();
     let mut amount = min_lamports;
     while amount <= max_lamports {
         for token_mint in token_mints {
+            all_pairs.push((amount, token_mint.clone()));
+        }
+        amount += step_lamports;
+    }
+
+    let max_concurrent = config.performance.max_concurrent_quotes;
+    for chunk in all_pairs.chunks(max_concurrent) {
+        let mut futs = FuturesUnordered::new();
+        for (amt, tok) in chunk {
             futs.push(check_opportunity(
                 metis,
-                token_mint,
-                amount,
+                tok,
+                *amt,
                 &user_pubkey,
                 &config.performance.cu_limits,
                 metrics,
             ));
         }
-        amount += step_lamports;
-    }
-
     while let Some(result) = futs.next().await {
         let opp = match result {
             Some(opp) => opp,
@@ -476,6 +481,7 @@ pub async fn scan_all_tokens(
             }
         });
     }
+    } // end chunk
 
     Ok(())
 }
