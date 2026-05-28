@@ -145,6 +145,11 @@ async fn check_opportunity(
     let tip = transaction::calculate_tip(raw_profit, tip_percent, tip_min, tip_max);
     let total_costs = tip + base_fee;
 
+    // Drop if the quoted output doesn't cover costs -- sending would be a guaranteed loss.
+    if output_wsol < amount + total_costs {
+        return None;
+    }
+
     let net_profit = raw_profit.saturating_sub(total_costs);
     // min_acceptable_out: the swap must return at least input + Jito tip + network fee.
     let min_acceptable_out = amount + tip + base_fee;
