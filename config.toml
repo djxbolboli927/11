@@ -53,7 +53,7 @@ swap_instructions_timeout_ms = 300
 # مثال: 131/sec × 0.3s = 40 → 50 با headroom
 calc_workers = 50
 # CU limit بر اساس تعداد هاپ: [2 hops, 3 hops, 4 hops, 5 hops, 6 hops]
-cu_limits = [300000, 400000, 500000, 600000, 700000]
+cu_limits = [170000, 220000, 280000, 330000, 390000]
 # حداکثر درخواست‌های همزمان به Metis در هر chunk.
 max_concurrent_quotes = 4096
 # اگر سرور 16 هسته دارد: متیس روی 0-11، ربات روی 12-15
