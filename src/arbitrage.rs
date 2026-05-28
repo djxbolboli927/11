@@ -22,6 +22,7 @@ use crate::tokens::WSOL_MINT;
 use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+const JITO_TIP_LAMPORTS: u64 = 5_000;
 
 fn extract_route_program_ids(quote: &QuoteResponse) -> Vec<String> {
     let arr = match quote.route_plan.as_array() {
@@ -109,11 +110,6 @@ async fn check_opportunity(
     metis: &MetisClient,
     token_mint: &str,
     configured_amount: u64,
-    base_fee: u64,
-    tip_percent: f64,
-    tip_min: u64,
-    tip_max: u64,
-    _min_profit: u64,
     user_pubkey: &str,
     cu_limits: &[u32],
     metrics: &Metrics,
@@ -141,12 +137,8 @@ async fn check_opportunity(
 
     let is_pmm = route_uses_pmm(&quote1) || route_uses_pmm(&quote2);
 
-    let raw_profit = output_wsol - amount;
-    let tip = transaction::calculate_tip(raw_profit, tip_percent, tip_min, tip_max);
-    let total_costs = tip + base_fee;
-    let net_profit = raw_profit.saturating_sub(total_costs);
-
-    // Floor = exactly the input amount: accept any swap that returns at least what we put in.
+    let tip = JITO_TIP_LAMPORTS;
+    let net_profit = output_wsol - amount;
     let min_acceptable_out = amount;
 
     let merged_quote =
@@ -226,7 +218,6 @@ pub async fn scan_all_tokens(
     let min_lamports = (config.trading.min_amount_sol * LAMPORTS_PER_SOL) as u64;
     let max_lamports = (config.trading.max_amount_sol * LAMPORTS_PER_SOL) as u64;
     let step_lamports = (config.trading.step_sol * LAMPORTS_PER_SOL) as u64;
-    let base_fee = config.trading.base_fee_lamports;
 
     let user_pubkey = trading_keypair.pubkey().to_string();
 
@@ -239,11 +230,6 @@ pub async fn scan_all_tokens(
                 metis,
                 token_mint,
                 amount,
-                base_fee,
-                config.jito.tip_profit_percent,
-                config.jito.tip_min_lamports,
-                config.jito.tip_max_lamports,
-                config.trading.min_profit_lamports,
                 &user_pubkey,
                 &config.performance.cu_limits,
                 metrics,

@@ -65,17 +65,6 @@ fn to_sdk_instruction(ix: &InstructionData) -> Result<Instruction> {
     })
 }
 
-/// Calculate the Jito tip amount.
-pub fn calculate_tip(
-    profit_lamports: u64,
-    tip_percent: f64,
-    tip_min: u64,
-    tip_max: u64,
-) -> u64 {
-    let dynamic_tip = (profit_lamports as f64 * tip_percent) as u64;
-    dynamic_tip.max(tip_min).min(tip_max)
-}
-
 /// Build a versioned transaction with exactly 3 instructions:
 ///
 /// #1 - Compute Budget: SetComputeUnitLimit
