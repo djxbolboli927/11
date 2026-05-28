@@ -124,7 +124,6 @@ impl MetisClient {
         let url = format!(
             "{}/quote?inputMint={}&outputMint={}&amount={}\
              &slippageBps=0\
-             &onlyDirectRoutes=true\
              &maxAccounts=50\
              &swapMode=ExactIn\
              &forJitoBundle=true\

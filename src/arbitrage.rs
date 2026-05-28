@@ -156,10 +156,6 @@ async fn check_opportunity(
         .as_array()
         .map(|a| a.len())
         .unwrap_or(2);
-    if hop_count != 2 {
-        debug!(token = token_mint, hop_count, "skipping non-2-hop route");
-        return None;
-    }
 
     let swap_ixs = metis
         .get_swap_instructions(user_pubkey, &merged_quote)
