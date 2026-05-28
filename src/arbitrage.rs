@@ -22,7 +22,6 @@ use crate::tokens::WSOL_MINT;
 use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
-const EXECUTION_SIZE_DIVISOR: u64 = 10;
 
 fn extract_route_program_ids(quote: &QuoteResponse) -> Vec<String> {
     let arr = match quote.route_plan.as_array() {
@@ -115,7 +114,6 @@ async fn check_opportunity(
     tip_min: u64,
     tip_max: u64,
     _min_profit: u64,
-    profit_sacrifice_percent: f64,
     user_pubkey: &str,
     cu_limits: &[u32],
     metrics: &Metrics,
@@ -124,9 +122,7 @@ async fn check_opportunity(
 
     let t_metis_start = Instant::now();
 
-    // Run the live trade at 1/10th of the configured scan size to reduce
-    // market impact and lower negative slippage reverts.
-    let amount = (configured_amount / EXECUTION_SIZE_DIVISOR).max(1);
+    let amount = configured_amount;
 
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
@@ -149,13 +145,9 @@ async fn check_opportunity(
     let tip = transaction::calculate_tip(raw_profit, tip_percent, tip_min, tip_max);
     let total_costs = tip + base_fee;
 
-    // Keep the filter soft: as long as the round-trip output is not below input,
-    // let it continue (even if expected net after fees/tip is near zero).
     let net_profit = raw_profit.saturating_sub(total_costs);
-    let clamped_sacrifice = profit_sacrifice_percent.clamp(0.0, 1.0);
-    let retain_ratio = 1.0 - clamped_sacrifice;
-    let retained_raw_profit = ((raw_profit as f64) * retain_ratio) as u64;
-    let min_acceptable_out = amount + retained_raw_profit;
+    // min_acceptable_out: the swap must return at least input + Jito tip + network fee.
+    let min_acceptable_out = amount + tip + base_fee;
 
     let merged_quote =
         MetisClient::merge_quotes(&quote1, &quote2, min_acceptable_out).ok()?;
@@ -252,7 +244,6 @@ pub async fn scan_all_tokens(
                 config.jito.tip_min_lamports,
                 config.jito.tip_max_lamports,
                 config.trading.min_profit_lamports,
-                config.trading.profit_sacrifice_percent,
                 &user_pubkey,
                 &config.performance.cu_limits,
                 metrics,
