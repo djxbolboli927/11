@@ -44,12 +44,12 @@ x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
 # تعداد worker thread های tokio برای ربات. در سرور 16 هسته‌ای،
 # 3 هسته برای ربات و 13 هسته برای متیس توصیه می‌شود.
 threads = 4
-quote_timeout_ms = 200
+quote_timeout_ms = 50
 # CU limit بر اساس تعداد هاپ: [2 hops, 3 hops, 4 hops, 5 hops, 6 hops]
 cu_limits = [300000, 400000, 500000, 600000, 700000]
 # حداکثر درخواست‌های همزمان به Metis در هر chunk.
 # مثال: 8347 ترکیب / 512 = ۱۷ chunk × ~5ms = ~85ms per cycle
-max_concurrent_quotes = 512
+max_concurrent_quotes = 4096
 # اگر سرور 16 هسته دارد: متیس روی 0-11، ربات روی 12-15
 bot_cpu_cores = []
 

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{self, StreamExt};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{signature::Keypair, signer::Signer};
 use std::sync::atomic::Ordering;
@@ -227,19 +227,16 @@ pub async fn scan_all_tokens(
     }
 
     let max_concurrent = config.performance.max_concurrent_quotes;
-    for chunk in all_pairs.chunks(max_concurrent) {
-        let mut futs = FuturesUnordered::new();
-        for (amt, tok) in chunk {
-            futs.push(check_opportunity(
-                metis,
-                tok,
-                *amt,
-                &user_pubkey,
-                &config.performance.cu_limits,
-                metrics,
-            ));
-        }
-    while let Some(result) = futs.next().await {
+    let upk: &str = &user_pubkey;
+    let cu: &[u32] = &config.performance.cu_limits;
+
+    let mut opps = stream::iter(all_pairs)
+        .map(move |(amt, tok)| async move {
+            check_opportunity(metis, &tok, amt, upk, cu, metrics).await
+        })
+        .buffer_unordered(max_concurrent);
+
+    while let Some(result) = opps.next().await {
         let opp = match result {
             Some(opp) => opp,
             None => continue,
@@ -481,7 +478,6 @@ pub async fn scan_all_tokens(
             }
         });
     }
-    } // end chunk
 
     Ok(())
 }
