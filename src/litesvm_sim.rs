@@ -171,8 +171,6 @@ impl Simulator {
         min_acceptable_out: u64,
         metrics: &Metrics,
     ) -> Result<SimOutcome> {
-        metrics.sim_executed.fetch_add(1, Ordering::Relaxed);
-
         let accounts = collect_tx_accounts(tx, alts);
 
         // Lazy-fetch any accounts missing from the Yellowstone cache.
@@ -246,21 +244,19 @@ impl Simulator {
                 let cu = info.meta.compute_units_consumed;
 
                 if wsol_after < min_acceptable_out {
-                    metrics.sim_slippage_rejected.fetch_add(1, Ordering::Relaxed);
+                    metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
                     anyhow::bail!(
                         "sim unprofitable: wsol_after={} < min={}",
                         wsol_after,
                         min_acceptable_out
                     );
                 }
-                metrics.sim_passed.fetch_add(1, Ordering::Relaxed);
                 Ok(SimOutcome {
                     compute_units: cu,
                     wsol_after,
                 })
             }
             Err(meta) => {
-                metrics.sim_revert_rejected.fetch_add(1, Ordering::Relaxed);
                 if self.fail_closed {
                     anyhow::bail!(
                         "sim reverted: err={:?} logs={:#?}",
@@ -273,7 +269,6 @@ impl Simulator {
                         logs = ?meta.meta.logs,
                         "sim reverted but fail_open=true, allowing send"
                     );
-                    metrics.sim_passed.fetch_add(1, Ordering::Relaxed);
                     Ok(SimOutcome {
                         compute_units: meta.meta.compute_units_consumed,
                         wsol_after: 0,

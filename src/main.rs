@@ -22,23 +22,24 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use tracing::{error, info, warn};
+use tokio::sync::Semaphore;
+use tracing::error;
 
 use alt_cache::AltCache;
 use blockhash_cache::BlockhashCache;
 use rate_limiter::RateLimiter;
 
 fn main() -> Result<()> {
+    // Default to ERROR so the terminal is silent except for the 60s report.
+    // Override with RUST_LOG=info/debug if you need verbose output.
+    let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "error".to_string());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::new(
-                "info,hyper_util=warn,hyper=warn,reqwest=warn,h2=warn,tonic=warn",
-            ),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            format!("{log_filter},hyper_util=error,hyper=error,reqwest=error,h2=error,tonic=error"),
+        ))
         .init();
 
     let config = config::Config::load("config.toml")?;
-    info!("config loaded");
 
     let worker_threads = config.performance.threads.max(1);
     let pinned_cores: Vec<usize> = config.performance.bot_cpu_cores.clone();
@@ -57,35 +58,19 @@ fn main() -> Result<()> {
             let idx = counter.fetch_add(1, Ordering::SeqCst);
             let target = cores[idx % cores.len()];
             if let Some(core_id) = available.iter().find(|c| c.id == target) {
-                let ok = core_affinity::set_for_current(*core_id);
-                if ok {
-                    tracing::info!(worker = idx, core = target, "pinned tokio worker to core");
-                } else {
-                    tracing::warn!(worker = idx, core = target, "failed to pin worker to core");
-                }
-            } else {
-                tracing::warn!(worker = idx, core = target, "requested core not available");
+                core_affinity::set_for_current(*core_id);
             }
         });
     }
 
     let runtime = builder.build()?;
-    info!(
-        worker_threads,
-        pinned = !pinned_cores.is_empty(),
-        cores = ?pinned_cores,
-        "tokio runtime built"
-    );
-
     runtime.block_on(async_main(config))
 }
 
 async fn async_main(config: config::Config) -> Result<()> {
     let token_mints = tokens::load_tokens(&config.trading.tokens_file)?;
-    info!(count = token_mints.len(), "tokens loaded");
 
     let trading_keypair = Arc::new(wallet::read_keypair(&config.jito.trading_keypair)?);
-    info!(trading_wallet = %trading_keypair.pubkey(), "keypair loaded");
 
     let rpc_client = Arc::new(RpcClient::new(config.rpc.url.clone()));
 
@@ -94,45 +79,26 @@ async fn async_main(config: config::Config) -> Result<()> {
         &trading_keypair.pubkey(),
         &wsol_mint,
     );
-    match rpc_client.get_account(&wsol_ata) {
-        Ok(_) => info!(ata = %wsol_ata, "WSOL ATA verified"),
-        Err(e) => {
-            warn!(
-                ata = %wsol_ata,
-                error = %e,
-                "WSOL ATA not found -- run: spl-token wrap <amount>"
-            );
-        }
-    }
 
     let metrics = metrics::Metrics::new();
     metrics.spawn_reporter();
-    info!("pipeline metrics reporter started (120s window)");
 
-    let blockhash_cache = BlockhashCache::new(rpc_client.clone());
-    info!("blockhash cache initialized (refresh every 300ms)");
+    let blockhash_cache = Arc::new(BlockhashCache::new(rpc_client.clone()));
 
     let tip_pubkeys = transaction::jito_tip_pubkeys();
     let alt_cache = AltCache::new(tip_pubkeys);
-    info!("ALT cache initialized");
 
-    let metis = metis::MetisClient::new(&config.metis.url, config.performance.quote_timeout_ms);
+    let metis = Arc::new(metis::MetisClient::new(
+        &config.metis.url,
+        config.performance.quote_timeout_ms,
+    ));
 
     let jito_client = Arc::new(jito::JitoClient::new(&config.jito.urls, &config.jito.uuid));
-    info!(
-        regions = config.jito.urls.len(),
-        urls = ?config.jito.urls,
-        "Jito multi-region client ready"
-    );
 
-    // Arc<Mutex<>> so spawned sim tasks can acquire after sim passes.
     let jito_limiter = Arc::new(Mutex::new(
         RateLimiter::new(config.jito.max_bundles_per_second),
     ));
 
-    // Optional second submission path: SearcherService gRPC.
-    // Each path has its own rate limiter; the arbitrage dispatcher tries
-    // REST first and falls back to gRPC when REST is saturated.
     let (jito_grpc_client, jito_grpc_limiter) = if config.jito_grpc.enabled {
         match jito_grpc::JitoGrpcClient::new(
             &config.jito_grpc.endpoints,
@@ -141,50 +107,28 @@ async fn async_main(config: config::Config) -> Result<()> {
         .await
         {
             Ok(client) => {
-                info!(
-                    endpoints = config.jito_grpc.endpoints.len(),
-                    rate = config.jito_grpc.max_bundles_per_second,
-                    "Jito gRPC searcher client ready"
-                );
                 let limiter = Arc::new(Mutex::new(RateLimiter::new(
                     config.jito_grpc.max_bundles_per_second,
                 )));
                 (Some(Arc::new(client)), Some(limiter))
             }
             Err(e) => {
-                warn!(
-                    error = %e,
-                    "Jito gRPC init failed, continuing with REST-only path"
-                );
+                eprintln!("Jito gRPC init failed: {e} — continuing REST-only");
                 (None, None)
             }
         }
     } else {
-        info!("Jito gRPC path disabled via config");
         (None, None)
     };
 
     let (sim_cache, sim_pool) = if config.simulation.enabled {
         let cache = account_cache::AccountCache::new(rpc_client.clone());
 
-        // Seed the Yellowstone slot with a one-time RPC call so sims have
-        // a valid Clock.slot before the first gRPC message arrives.
-        match rpc_client.get_slot() {
-            Ok(s) => {
-                cache.seed_slot(s);
-                info!(initial_slot = s, "sim Clock seeded from RPC (one-time)");
-            }
-            Err(e) => warn!(error = %e, "initial get_slot failed, sims start at slot 0"),
+        if let Ok(s) = rpc_client.get_slot() {
+            cache.seed_slot(s);
         }
 
-        // Load per-pool account files from vendor/litesvm/dex/<DEX>/<pool>.toml.
-        // vault_a / vault_b from each pool are subscribed for live Yellowstone
-        // updates (they change on every swap; the DEX owner-filter does not
-        // cover them because they are owned by SPL Token, not the DEX program).
         let dex_pools = dex_accounts::load(&config.simulation.dex_dir);
-
-        // Yellowstone subscription: owner-filter for all DEX programs + direct
-        // subscription for wsol_ata and all pool vault accounts.
         let mut live_extra = vec![wsol_ata];
         live_extra.extend_from_slice(&dex_pools.subscribe_accounts);
 
@@ -194,16 +138,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             program_registry::all_program_ids(),
             live_extra,
         );
-        info!(
-            endpoint = %config.yellowstone_grpc.endpoint,
-            dex_programs = program_registry::PROGRAMS.len(),
-            vault_subs = dex_pools.subscribe_accounts.len(),
-            "Yellowstone account cache subscribed"
-        );
 
-        // RPC pre-warm: token mints, user ATAs, and all pool accounts from
-        // the dex pool files.  This ensures the sim cache is fully populated
-        // before the first trade rather than waiting for lazy RPC fetches.
         let mut warm: Vec<solana_sdk::pubkey::Pubkey> = token_mints
             .iter()
             .filter_map(|s| solana_sdk::pubkey::Pubkey::try_from(s.as_str()).ok())
@@ -220,12 +155,9 @@ async fn async_main(config: config::Config) -> Result<()> {
                 warm.push(ata);
             }
         }
-        // Pool vaults, mints, and protocol accounts from dex pool files
         warm.extend_from_slice(&dex_pools.all_accounts);
         cache.prefetch(&warm);
-        info!(warmed = cache.len(), "account cache pre-warmed");
 
-        // SimulatorPool gets its slot from the Yellowstone stream — zero RPC.
         let pool = litesvm_sim::SimulatorPool::new(
             config.simulation.workers,
             &config.simulation.so_dir,
@@ -235,34 +167,56 @@ async fn async_main(config: config::Config) -> Result<()> {
         )?;
         (Some(Arc::new(cache)), Some(Arc::new(pool)))
     } else {
-        info!("LiteSVM simulation disabled via config");
         (None, None)
     };
 
-    info!(
-        tokens = token_mints.len(),
-        min_sol = config.trading.min_amount_sol,
-        max_sol = config.trading.max_amount_sol,
-        step = config.trading.step_sol,
-        sim = config.simulation.enabled,
-        "starting arbitrage scanner"
+    // ── Build shared CalcCtx (used by Stage-2 workers every scan cycle) ──────
+    let calc_ctx = Arc::new(arbitrage::CalcCtx {
+        metis: metis.clone(),
+        blockhash_cache: blockhash_cache.clone(),
+        trading_keypair: trading_keypair.clone(),
+        rpc_client: rpc_client.clone(),
+        alt_cache: alt_cache.clone(),
+        jito_limiter: jito_limiter.clone(),
+        jito_grpc_limiter: jito_grpc_limiter.clone(),
+        cu_limits: config.performance.cu_limits.clone(),
+        user_pubkey: trading_keypair.pubkey().to_string(),
+        sim_cache,
+        sim_pool,
+    });
+
+    // ── Create Jito dispatch channel + spawn persistent Stage-3 worker ────────
+    let (jito_tx, jito_rx) =
+        tokio::sync::mpsc::channel::<arbitrage::ReadyBundle>(64);
+
+    tokio::spawn(arbitrage::jito_dispatch_task(
+        jito_rx,
+        jito_client,
+        jito_grpc_client,
+        metrics.clone(),
+    ));
+
+    // ── Calc semaphore: at most 6 concurrent Stage-2 workers per scan cycle ───
+    let calc_sem = Arc::new(Semaphore::new(6));
+
+    eprintln!(
+        "scanner ready | tokens={} | pairs_per_scan={} | calc_workers=6",
+        token_mints.len(),
+        {
+            let steps = ((config.trading.max_amount_sol - config.trading.min_amount_sol)
+                / config.trading.step_sol) as usize
+                + 1;
+            steps * token_mints.len()
+        }
     );
 
     loop {
         if let Err(e) = arbitrage::scan_all_tokens(
-            &metis,
             &token_mints,
             &config,
-            &jito_client,
-            &trading_keypair,
-            &rpc_client,
-            &jito_limiter,
-            &blockhash_cache,
-            &alt_cache,
-            sim_cache.as_ref(),
-            sim_pool.as_ref(),
-            jito_grpc_client.as_ref(),
-            jito_grpc_limiter.as_ref(),
+            &calc_ctx,
+            &jito_tx,
+            &calc_sem,
             &metrics,
         )
         .await

@@ -1,11 +1,11 @@
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{signature::Keypair, signer::Signer};
+use solana_sdk::{signature::Keypair, transaction::VersionedTransaction};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::account_cache::AccountCache;
 use crate::alt_cache::AltCache;
@@ -13,8 +13,8 @@ use crate::blockhash_cache::BlockhashCache;
 use crate::config::Config;
 use crate::jito::JitoClient;
 use crate::jito_grpc::JitoGrpcClient;
-use crate::litesvm_sim::{self, SimulatorPool};
-use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
+use crate::litesvm_sim::SimulatorPool;
+use crate::metis::{MetisClient, QuoteResponse};
 use crate::metrics::Metrics;
 use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS, PMM_PROGRAM_IDS};
 use crate::rate_limiter::RateLimiter;
@@ -23,26 +23,10 @@ use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 const JITO_TIP_LAMPORTS: u64 = 5_000;
+/// Bundles older than this are stale and dropped before sending to Jito.
+const BUNDLE_MAX_AGE_MS: u64 = 15;
 
-fn extract_route_program_ids(quote: &QuoteResponse) -> Vec<String> {
-    let arr = match quote.route_plan.as_array() {
-        Some(a) => a,
-        None => return vec![],
-    };
-    let mut ids = Vec::new();
-    for hop in arr {
-        if let Some(swap_info) = hop.get("swapInfo").and_then(|s| s.as_object()) {
-            for v in swap_info.values() {
-                if let Some(s) = v.as_str() {
-                    if s.len() >= 32 && s.len() <= 44 {
-                        ids.push(s.to_string());
-                    }
-                }
-            }
-        }
-    }
-    ids
-}
+// ─── Route helpers ───────────────────────────────────────────────────────────
 
 fn route_uses_forbidden_dex(quote: &QuoteResponse) -> bool {
     let arr = match quote.route_plan.as_array() {
@@ -77,8 +61,22 @@ fn route_uses_forbidden_dex(quote: &QuoteResponse) -> bool {
 }
 
 fn route_uses_pmm(quote: &QuoteResponse) -> bool {
-    let ids = extract_route_program_ids(quote);
-    ids.iter().any(|id| PMM_PROGRAM_IDS.iter().any(|p| *p == id.as_str()))
+    let arr = match quote.route_plan.as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    for hop in arr {
+        if let Some(swap_info) = hop.get("swapInfo").and_then(|s| s.as_object()) {
+            for v in swap_info.values() {
+                if let Some(s) = v.as_str() {
+                    if PMM_PROGRAM_IDS.iter().any(|p| *p == s) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn lookup_cu_limit(hop_count: usize, cu_limits: &[u32]) -> u32 {
@@ -86,39 +84,55 @@ fn lookup_cu_limit(hop_count: usize, cu_limits: &[u32]) -> u32 {
         return 200_000;
     }
     let index = hop_count.saturating_sub(2);
-    let clamped = index.min(cu_limits.len() - 1);
-    cu_limits[clamped]
+    cu_limits[index.min(cu_limits.len() - 1)]
 }
 
-struct Opportunity {
+// ─── Stage 1 output ──────────────────────────────────────────────────────────
+
+struct QuotePair {
     token_mint: String,
     amount: u64,
     output_wsol: u64,
-    tip_lamports: u64,
-    net_profit: u64,
-    min_acceptable_out: u64,
-    swap_ixs: SwapInstructionsResponse,
+    quote1: QuoteResponse,
+    quote2: QuoteResponse,
     hop_count: usize,
-    cu_limit: u32,
+    #[allow(dead_code)]
     is_pmm: bool,
-    /// Wall-clock time at which the last Metis call (get_swap_instructions) returned.
-    /// Used to measure build-to-dispatch latency in the spawned send task.
-    quote_done_at: Instant,
 }
 
-async fn check_opportunity(
+// ─── Stage 2 output ──────────────────────────────────────────────────────────
+
+pub struct ReadyBundle {
+    pub tx: VersionedTransaction,
+    pub use_grpc: bool,
+    pub built_at: Instant,
+}
+
+// ─── Dependencies for Stage-2 calc workers ───────────────────────────────────
+
+pub struct CalcCtx {
+    pub metis: Arc<MetisClient>,
+    pub blockhash_cache: Arc<BlockhashCache>,
+    pub trading_keypair: Arc<Keypair>,
+    pub rpc_client: Arc<RpcClient>,
+    pub alt_cache: AltCache,
+    pub jito_limiter: Arc<Mutex<RateLimiter>>,
+    pub jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
+    pub cu_limits: Vec<u32>,
+    pub user_pubkey: String,
+    pub sim_cache: Option<Arc<AccountCache>>,
+    pub sim_pool: Option<Arc<SimulatorPool>>,
+}
+
+// ─── Stage 1: Quote scanner ───────────────────────────────────────────────────
+
+async fn quote_check(
     metis: &MetisClient,
     token_mint: &str,
-    configured_amount: u64,
-    user_pubkey: &str,
-    cu_limits: &[u32],
+    amount: u64,
     metrics: &Metrics,
-) -> Option<Opportunity> {
-    metrics.metis_quotes.fetch_add(1, Ordering::Relaxed);
-
-    let t_metis_start = Instant::now();
-
-    let amount = configured_amount;
+) -> Option<QuotePair> {
+    metrics.metis_req_sent.fetch_add(2, Ordering::Relaxed); // quote1 + quote2
 
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
@@ -126,361 +140,200 @@ async fn check_opportunity(
     let quote2 = metis.get_quote(token_mint, WSOL_MINT, token_amount).await.ok()?;
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
-    if output_wsol < amount {
+    if output_wsol <= amount {
         return None;
     }
 
     if route_uses_forbidden_dex(&quote1) || route_uses_forbidden_dex(&quote2) {
-        debug!(token = token_mint, "skipping route through forbidden DEX");
         return None;
     }
 
     let is_pmm = route_uses_pmm(&quote1) || route_uses_pmm(&quote2);
+    let hop_count = {
+        let n1 = quote1.route_plan.as_array().map(|a| a.len()).unwrap_or(1);
+        let n2 = quote2.route_plan.as_array().map(|a| a.len()).unwrap_or(1);
+        n1 + n2
+    };
 
-    let tip = JITO_TIP_LAMPORTS;
-    let net_profit = output_wsol - amount;
-    let min_acceptable_out = amount;
+    metrics.metis_resp_ok.fetch_add(1, Ordering::Relaxed);
 
-    let merged_quote =
-        MetisClient::merge_quotes(&quote1, &quote2, min_acceptable_out).ok()?;
-
-    if merged_quote.instruction_version.as_deref() != Some("V2") {
-        debug!(
-            token = token_mint,
-            got = ?merged_quote.instruction_version,
-            "quote did NOT report instructionVersion=V2 -- Metis binary may be outdated"
-        );
-    }
-    let hop_count = merged_quote
-        .route_plan
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(2);
-
-    let swap_ixs = metis
-        .get_swap_instructions(user_pubkey, &merged_quote)
-        .await
-        .ok()?;
-
-    // Record total Metis interaction time (quote×2 + swap_instructions).
-    let metis_elapsed_us = t_metis_start.elapsed().as_micros() as u64;
-    metrics.metis_latency_sum_us.fetch_add(metis_elapsed_us, Ordering::Relaxed);
-    metrics.metis_latency_count.fetch_add(1, Ordering::Relaxed);
-    let quote_done_at = Instant::now();
-
-    let cu_limit = lookup_cu_limit(hop_count, cu_limits);
-
-    metrics.metis_profitable.fetch_add(1, Ordering::Relaxed);
-
-    Some(Opportunity {
-        token_mint: token_mint.to_string(),
-        amount,
-        output_wsol,
-        tip_lamports: tip,
-        net_profit,
-        min_acceptable_out,
-        swap_ixs,
-        hop_count,
-        cu_limit,
-        is_pmm,
-        quote_done_at,
-    })
+    Some(QuotePair { token_mint: token_mint.to_string(), amount, output_wsol, quote1, quote2, hop_count, is_pmm })
 }
 
-/// Scan ALL (amount x token) pairs concurrently.
+// ─── Stage 2: Calc + tx build ─────────────────────────────────────────────────
+
+async fn calc_and_build(
+    pair: QuotePair,
+    ctx: Arc<CalcCtx>,
+    jito_tx: mpsc::Sender<ReadyBundle>,
+    metrics: Arc<Metrics>,
+    _permit: OwnedSemaphorePermit, // released on drop → frees calc slot
+) {
+    // 1. Reserve a Jito rate-limit slot first (cheap; avoids building tx we can't send).
+    let use_grpc = if ctx.jito_limiter.lock().unwrap().try_acquire() {
+        false
+    } else if let Some(gl) = &ctx.jito_grpc_limiter {
+        if gl.lock().unwrap().try_acquire() {
+            true
+        } else {
+            metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    } else {
+        metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+
+    // 2. Merge quotes + get swap instructions.
+    let merged = match MetisClient::merge_quotes(&pair.quote1, &pair.quote2, pair.amount) {
+        Ok(m) => m,
+        Err(_) => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
+    };
+
+    metrics.metis_req_sent.fetch_add(1, Ordering::Relaxed); // swap_instructions HTTP call
+    let swap_ixs = match ctx.metis.get_swap_instructions(&ctx.user_pubkey, &merged).await {
+        Ok(s) => s,
+        Err(_) => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
+    };
+
+    // 3. Build versioned transaction (CPU-bound + possible ALT RPC → spawn_blocking).
+    let cu_limit = lookup_cu_limit(pair.hop_count, &ctx.cu_limits);
+    let recent_blockhash = ctx.blockhash_cache.get();
+    let keypair = ctx.trading_keypair.clone();
+    let alt = ctx.alt_cache.clone();
+    let rpc = ctx.rpc_client.clone();
+
+    let tx = match tokio::task::spawn_blocking(move || {
+        transaction::build_arb_transaction(
+            &swap_ixs, &keypair, JITO_TIP_LAMPORTS, cu_limit, recent_blockhash, &alt, &rpc,
+        )
+    })
+    .await
+    {
+        Ok(Ok(tx)) => tx,
+        _ => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
+    };
+
+    // 4. Size guard (Solana hard limit: 1232 bytes).
+    match bincode::serialize(&tx) {
+        Ok(bytes) if bytes.len() > 1232 => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
+        Err(_) => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
+        Ok(_) => {}
+    }
+
+    // 5. Send to Stage-3 Jito worker (non-blocking; drop if channel full).
+    let bundle = ReadyBundle { tx, use_grpc, built_at: Instant::now() };
+    if jito_tx.try_send(bundle).is_ok() {
+        metrics.calc_done.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// ─── Stage 3: Persistent Jito dispatcher ────────────────────────────────────
+
+/// Receives ready bundles from Stage 2 and dispatches them to Jito.
+/// Stale bundles (older than BUNDLE_MAX_AGE_MS) are dropped.
+/// Each Jito HTTP send is spawned independently to avoid blocking on network I/O.
+pub async fn jito_dispatch_task(
+    mut rx: mpsc::Receiver<ReadyBundle>,
+    jito: Arc<JitoClient>,
+    jito_grpc: Option<Arc<JitoGrpcClient>>,
+    metrics: Arc<Metrics>,
+) {
+    while let Some(bundle) = rx.recv().await {
+        if bundle.built_at.elapsed().as_millis() as u64 > BUNDLE_MAX_AGE_MS {
+            metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        let jito_c = jito.clone();
+        let grpc_c = jito_grpc.clone();
+        let met = metrics.clone();
+
+        tokio::spawn(async move {
+            if bundle.use_grpc {
+                if let Some(grpc) = grpc_c {
+                    match grpc.send_bundle(&bundle.tx).await {
+                        Ok(_) => { met.jito_sent.fetch_add(1, Ordering::Relaxed); }
+                        Err(_) => { met.tx_dropped.fetch_add(1, Ordering::Relaxed); }
+                    }
+                }
+            } else {
+                match jito_c.send_bundle(&bundle.tx).await {
+                    Ok(_) => { met.jito_sent.fetch_add(1, Ordering::Relaxed); }
+                    Err(_) => { met.tx_dropped.fetch_add(1, Ordering::Relaxed); }
+                }
+            }
+        });
+    }
+}
+
+// ─── Main scan entry ─────────────────────────────────────────────────────────
+
+/// One scan cycle over all (token × amount) pairs.
 ///
-/// AMM routes: simulate → if pass → rate limit → send to Jito
-/// PMM routes: BYPASS simulation → rate limit → send directly to Jito
-///   (PMMs rely on same-slot oracle freshness that local sim can't provide)
-///
-/// All per-opportunity work (tx build, serialization, simulation, dispatch)
-/// is spawned immediately so the scan loop is never blocked.
+/// Stage 1 (here): buffer_unordered quote scanner
+/// Stage 2 (spawned tasks, max CALC_WORKERS concurrent): swap_instructions + tx build
+/// Stage 3 (jito_dispatch_task, persistent): Jito send with age-check
 pub async fn scan_all_tokens(
-    metis: &MetisClient,
     token_mints: &[String],
     config: &Config,
-    jito: &Arc<JitoClient>,
-    trading_keypair: &Arc<Keypair>,
-    rpc_client: &Arc<RpcClient>,
-    jito_limiter: &Arc<Mutex<RateLimiter>>,
-    blockhash_cache: &BlockhashCache,
-    alt_cache: &AltCache,
-    sim_cache: Option<&Arc<AccountCache>>,
-    sim_pool: Option<&Arc<SimulatorPool>>,
-    jito_grpc: Option<&Arc<JitoGrpcClient>>,
-    jito_grpc_limiter: Option<&Arc<Mutex<RateLimiter>>>,
+    ctx: &Arc<CalcCtx>,
+    jito_tx: &mpsc::Sender<ReadyBundle>,
+    calc_sem: &Arc<Semaphore>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     let min_lamports = (config.trading.min_amount_sol * LAMPORTS_PER_SOL) as u64;
     let max_lamports = (config.trading.max_amount_sol * LAMPORTS_PER_SOL) as u64;
     let step_lamports = (config.trading.step_sol * LAMPORTS_PER_SOL) as u64;
-
-    let user_pubkey = trading_keypair.pubkey().to_string();
-
-    let mut all_pairs: Vec<(u64, String)> = Vec::new();
-    let mut amount = min_lamports;
-    while amount <= max_lamports {
-        for token_mint in token_mints {
-            all_pairs.push((amount, token_mint.clone()));
-        }
-        amount += step_lamports;
-    }
-
     let max_concurrent = config.performance.max_concurrent_quotes;
-    let upk: &str = &user_pubkey;
-    let cu: &[u32] = &config.performance.cu_limits;
 
+    // Pairs interleaved across tokens: (0.001,A),(0.001,B),...,(0.001,Q),(0.0011,A),...
+    // This ensures all tokens get equal opportunity regardless of which complete first.
+    let all_pairs: Vec<(u64, String)> = {
+        let mut pairs = Vec::new();
+        let mut amount = min_lamports;
+        while amount <= max_lamports {
+            for token_mint in token_mints {
+                pairs.push((amount, token_mint.clone()));
+            }
+            amount += step_lamports;
+        }
+        pairs
+    };
+
+    let metis_ref: &MetisClient = &ctx.metis;
+    let met_ref: &Metrics = metrics;
+
+    // Stage 1: stream quotes with bounded concurrency.
     let mut opps = stream::iter(all_pairs)
         .map(move |(amt, tok)| async move {
-            check_opportunity(metis, &tok, amt, upk, cu, metrics).await
+            quote_check(metis_ref, &tok, amt, met_ref).await
         })
         .buffer_unordered(max_concurrent);
 
     while let Some(result) = opps.next().await {
-        let opp = match result {
-            Some(opp) => opp,
+        let pair = match result {
+            Some(p) => p,
             None => continue,
         };
 
-        // ── Pre-spawn rate-limit gate ─────────────────────────────────────
-        // Reserve a slot on EXACTLY ONE path before doing any work. Try REST
-        // first; on REST-exhausted, try gRPC. If both are saturated, drop
-        // the opportunity here with zero spawn cost. This prevents the scan
-        // loop from queuing work that will only be discarded after tx build.
-        let use_grpc = if jito_limiter.lock().unwrap().try_acquire() {
-            false
-        } else if let Some(grpc_lim) = jito_grpc_limiter {
-            if grpc_lim.lock().unwrap().try_acquire() {
-                true
-            } else {
-                metrics.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    token = opp.token_mint.as_str(),
-                    "both Jito paths rate-limited, dropping"
-                );
+        // Stage 2: try calc slot immediately (no queue — drop if all workers busy).
+        let permit = match calc_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-        } else {
-            metrics.jito_rate_limited.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                token = opp.token_mint.as_str(),
-                "REST rate-limited, no gRPC available"
-            );
-            continue;
         };
 
-        // Capture everything the spawned task needs. The main loop returns
-        // immediately so the next opportunity is processed without waiting
-        // for tx build, serialization, simulation, or Jito network I/O.
-        // NOTE: info!() is intentionally moved inside the spawn below so
-        // the scan loop yields back to buffer_unordered as fast as possible.
-        let recent_blockhash = blockhash_cache.get();
-        let keypair_clone = trading_keypair.clone();
-        let rpc_clone = rpc_client.clone();
-        let alt_clone = alt_cache.clone();
-        let jito_clone = jito.clone();
-        let jito_grpc_clone = jito_grpc.cloned();
-        let metrics_clone = metrics.clone();
-        let sim_cache_clone = sim_cache.cloned();
-        let sim_pool_clone = sim_pool.cloned();
-
-        let token_for_log = opp.token_mint.clone();
-        let profit_for_log = opp.net_profit;
-        let amount_for_log = opp.amount;
-        let expected_out_for_log = opp.output_wsol;
-        let tip_lamports = opp.tip_lamports;
-        let cu_limit = opp.cu_limit;
-        let hop_count_for_log = opp.hop_count;
-        let min_acceptable_out = opp.min_acceptable_out;
-        let is_pmm = opp.is_pmm;
-        let swap_ixs = opp.swap_ixs;
-        let quote_done_at = opp.quote_done_at;
+        let ctx_c = ctx.clone();
+        let jito_tx_c = jito_tx.clone();
+        let met_c = metrics.clone();
 
         tokio::spawn(async move {
-            // Log here (not in the scan loop) so the scan loop yields back
-            // to buffer_unordered as fast as possible after finding an opp.
-            info!(
-                token = token_for_log.as_str(),
-                input_sol = amount_for_log as f64 / LAMPORTS_PER_SOL,
-                output_sol = expected_out_for_log as f64 / LAMPORTS_PER_SOL,
-                profit_lamports = profit_for_log,
-                tip_lamports,
-                hops = hop_count_for_log,
-                cu_limit,
-                pmm = is_pmm,
-                path = if use_grpc { "grpc" } else { "rest" },
-                "PROFITABLE -- dispatching"
-            );
-
-            // The sim path needs ALT addresses again; clone them before
-            // moving `swap_ixs` into the build closure.
-            let alt_addresses = swap_ixs.address_lookup_table_addresses.clone();
-
-            // ── Step 1: build versioned tx in spawn_blocking ──────────────
-            // ALT cache-miss inside build_arb_transaction triggers a
-            // synchronous RpcClient::get_account; running it here on a
-            // dedicated blocking thread keeps tokio worker threads free.
-            let alt_for_build = alt_clone.clone();
-            let rpc_for_build = rpc_clone.clone();
-            let keypair_for_build = keypair_clone.clone();
-            let tx = match tokio::task::spawn_blocking(move || {
-                transaction::build_arb_transaction(
-                    &swap_ixs,
-                    &keypair_for_build,
-                    tip_lamports,
-                    cu_limit,
-                    recent_blockhash,
-                    &alt_for_build,
-                    &rpc_for_build,
-                )
-            })
-            .await
-            {
-                Ok(Ok(tx)) => tx,
-                Ok(Err(e)) => {
-                    metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                    warn!(error = %e, token = token_for_log.as_str(), "tx build failed");
-                    return;
-                }
-                Err(e) => {
-                    metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                    warn!(error = %e, token = token_for_log.as_str(), "tx build task panicked");
-                    return;
-                }
-            };
-
-            // ── Step 2: size guard (Solana hard limit 1232 bytes) ─────────
-            match bincode::serialize(&tx) {
-                Ok(bytes) if bytes.len() > 1232 => {
-                    metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        token = token_for_log.as_str(),
-                        bytes = bytes.len(),
-                        "tx too large, dropping"
-                    );
-                    return;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                    warn!(error = %e, token = token_for_log.as_str(), "tx serialize failed");
-                    return;
-                }
-            }
-
-            // ── Step 3: simulation gate (ALL routes — AMM and PMM) ───────────
-            // PMM bypass removed: LiteSVM 0.11 with with_mainnet_features()
-            // handles PMM DEX programs correctly. Every route is simulated.
-            if let (Some(cache), Some(pool)) = (&sim_cache_clone, &sim_pool_clone) {
-                // ALT resolve also does sync RPC on miss → spawn_blocking.
-                let alt_for_sim = alt_clone.clone();
-                let rpc_for_sim = rpc_clone.clone();
-                let cache_for_warm = cache.clone();
-                let alts = match tokio::task::spawn_blocking(move || {
-                    let alts = litesvm_sim::resolve_alts(
-                        &alt_addresses,
-                        &alt_for_sim,
-                        &rpc_for_sim,
-                    )?;
-                    for alt in &alts {
-                        if cache_for_warm.get(&alt.key).is_none() {
-                            if let Err(e) = cache_for_warm.get_or_fetch(&alt.key) {
-                                warn!(alt = %alt.key, error = %e, "ALT raw account fetch failed");
-                            }
-                        }
-                    }
-                    Ok::<_, anyhow::Error>(alts)
-                })
-                .await
-                {
-                    Ok(Ok(a)) => a,
-                    Ok(Err(e)) => {
-                        metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                        warn!(error = %e, token = token_for_log.as_str(), "sim ALT resolve failed");
-                        return;
-                    }
-                    Err(e) => {
-                        metrics_clone.tx_build_failed.fetch_add(1, Ordering::Relaxed);
-                        warn!(error = %e, token = token_for_log.as_str(), "sim ALT task panicked");
-                        return;
-                    }
-                };
-
-                let sim = pool.acquire();
-                metrics_clone.sim_submitted.fetch_add(1, Ordering::Relaxed);
-                match sim.simulate(&tx, &alts, cache, min_acceptable_out, &metrics_clone) {
-                    Ok(outcome) => {
-                        info!(
-                            token = token_for_log.as_str(),
-                            cu = outcome.compute_units,
-                            wsol_after = outcome.wsol_after,
-                            "sim PASSED"
-                        );
-                    }
-                    Err(e) => {
-                        info!(
-                            error = %e,
-                            token = token_for_log.as_str(),
-                            amount = amount_for_log,
-                            expected_out = expected_out_for_log,
-                            "sim REJECTED, dropping"
-                        );
-                        return;
-                    }
-                }
-            }
-
-            // ── Step 4: dispatch on the path reserved up-front ────────────
-            // Record time from Metis response to this point (tx build + sim +
-            // task queue wait). This is how long before the bundle hits the wire.
-            let dispatch_us = Instant::now().duration_since(quote_done_at).as_micros() as u64;
-            metrics_clone.dispatch_latency_sum_us.fetch_add(dispatch_us, Ordering::Relaxed);
-            metrics_clone.dispatch_latency_count.fetch_add(1, Ordering::Relaxed);
-
-            if use_grpc {
-                let grpc = jito_grpc_clone
-                    .as_ref()
-                    .expect("grpc client set when use_grpc=true");
-                match grpc.send_bundle(&tx).await {
-                    Ok(uuid) => {
-                        metrics_clone.jito_grpc_sent.fetch_add(1, Ordering::Relaxed);
-                        info!(
-                            uuid = %uuid,
-                            token = token_for_log.as_str(),
-                            profit = profit_for_log,
-                            pmm = is_pmm,
-                            path = "grpc",
-                            "bundle sent to Jito"
-                        );
-                    }
-                    Err(e) => warn!(
-                        error = %e,
-                        token = token_for_log.as_str(),
-                        path = "grpc",
-                        "execution failed"
-                    ),
-                }
-            } else {
-                match jito_clone.send_bundle(&tx).await {
-                    Ok(uuid) => {
-                        metrics_clone.jito_sent.fetch_add(1, Ordering::Relaxed);
-                        info!(
-                            uuid = %uuid,
-                            token = token_for_log.as_str(),
-                            profit = profit_for_log,
-                            pmm = is_pmm,
-                            path = "rest",
-                            "bundle sent to Jito"
-                        );
-                    }
-                    Err(e) => warn!(
-                        error = %e,
-                        token = token_for_log.as_str(),
-                        path = "rest",
-                        "execution failed"
-                    ),
-                }
-            }
+            calc_and_build(pair, ctx_c, jito_tx_c, met_c, permit).await;
         });
     }
 
