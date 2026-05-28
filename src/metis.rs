@@ -6,7 +6,11 @@ use std::time::Duration;
 /// Client for the Metis (Jupiter self-hosted) routing engine.
 pub struct MetisClient {
     base_url: String,
-    http: Client,
+    /// Short timeout — used for /quote calls (simple lookups, ~5-20ms).
+    http_quote: Client,
+    /// Longer timeout — used for /swap-instructions (Metis must compile the
+    /// full on-chain instruction, which takes longer than a plain quote).
+    http_swap: Client,
 }
 
 // ---------- Quote types ----------
@@ -79,19 +83,19 @@ pub struct AccountMeta {
 }
 
 impl MetisClient {
-    pub fn new(base_url: &str, timeout_ms: u64) -> Self {
-        let http = Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            // Each scan cycle fires (max-min)/step × tokens quote pairs
-            // concurrently. Keeping 64 idle connections warm avoids
-            // ~20-50ms TCP/TLS handshake on cold reuse.
-            .pool_max_idle_per_host(1024)
-            .tcp_nodelay(true)
-            .build()
-            .expect("failed to build http client");
+    pub fn new(base_url: &str, quote_timeout_ms: u64, swap_timeout_ms: u64) -> Self {
+        let build_client = |timeout_ms: u64| {
+            Client::builder()
+                .timeout(Duration::from_millis(timeout_ms))
+                .pool_max_idle_per_host(1024)
+                .tcp_nodelay(true)
+                .build()
+                .expect("failed to build http client")
+        };
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            http,
+            http_quote: build_client(quote_timeout_ms),
+            http_swap: build_client(swap_timeout_ms),
         }
     }
 
@@ -133,7 +137,7 @@ impl MetisClient {
         );
 
         let resp = self
-            .http
+            .http_quote
             .get(&url)
             .send()
             .await
@@ -229,7 +233,7 @@ impl MetisClient {
 
         let url = format!("{}/swap-instructions", self.base_url);
         let resp = self
-            .http
+            .http_swap
             .post(&url)
             .json(&body)
             .send()

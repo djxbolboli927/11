@@ -45,10 +45,16 @@ x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
 # 3 هسته برای ربات و 13 هسته برای متیس توصیه می‌شود.
 threads = 8
 quote_timeout_ms = 50
+# swap_instructions از Metis سنگین‌تر از یک quote ساده است —
+# Metis باید instruction کامل on-chain را compile کند.
+# اگر این timeout کوچک‌تر از زمان واقعی Metis باشد، ۸۰٪+ calc drops می‌شوند.
+swap_instructions_timeout_ms = 300
+# Stage-2 concurrent workers. فرمول: profitable_per_sec × swap_timeout_sec
+# مثال: 131/sec × 0.3s = 40 → 50 با headroom
+calc_workers = 50
 # CU limit بر اساس تعداد هاپ: [2 hops, 3 hops, 4 hops, 5 hops, 6 hops]
 cu_limits = [300000, 400000, 500000, 600000, 700000]
 # حداکثر درخواست‌های همزمان به Metis در هر chunk.
-# مثال: 8347 ترکیب / 512 = ۱۷ chunk × ~5ms = ~85ms per cycle
 max_concurrent_quotes = 4096
 # اگر سرور 16 هسته دارد: متیس روی 0-11، ربات روی 12-15
 # هسته‌های 12-15 فیزیکی + جفت HT آن‌ها (thread 28-31)
