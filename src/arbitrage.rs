@@ -269,22 +269,11 @@ pub async fn scan_all_tokens(
             continue;
         };
 
-        info!(
-            token = opp.token_mint.as_str(),
-            input_sol = opp.amount as f64 / LAMPORTS_PER_SOL,
-            output_sol = opp.output_wsol as f64 / LAMPORTS_PER_SOL,
-            profit_lamports = opp.net_profit,
-            tip_lamports = opp.tip_lamports,
-            hops = opp.hop_count,
-            cu_limit = opp.cu_limit,
-            pmm = opp.is_pmm,
-            path = if use_grpc { "grpc" } else { "rest" },
-            "PROFITABLE -- dispatching"
-        );
-
         // Capture everything the spawned task needs. The main loop returns
         // immediately so the next opportunity is processed without waiting
         // for tx build, serialization, simulation, or Jito network I/O.
+        // NOTE: info!() is intentionally moved inside the spawn below so
+        // the scan loop yields back to buffer_unordered as fast as possible.
         let recent_blockhash = blockhash_cache.get();
         let keypair_clone = trading_keypair.clone();
         let rpc_clone = rpc_client.clone();
@@ -301,12 +290,28 @@ pub async fn scan_all_tokens(
         let expected_out_for_log = opp.output_wsol;
         let tip_lamports = opp.tip_lamports;
         let cu_limit = opp.cu_limit;
+        let hop_count_for_log = opp.hop_count;
         let min_acceptable_out = opp.min_acceptable_out;
         let is_pmm = opp.is_pmm;
         let swap_ixs = opp.swap_ixs;
         let quote_done_at = opp.quote_done_at;
 
         tokio::spawn(async move {
+            // Log here (not in the scan loop) so the scan loop yields back
+            // to buffer_unordered as fast as possible after finding an opp.
+            info!(
+                token = token_for_log.as_str(),
+                input_sol = amount_for_log as f64 / LAMPORTS_PER_SOL,
+                output_sol = expected_out_for_log as f64 / LAMPORTS_PER_SOL,
+                profit_lamports = profit_for_log,
+                tip_lamports,
+                hops = hop_count_for_log,
+                cu_limit,
+                pmm = is_pmm,
+                path = if use_grpc { "grpc" } else { "rest" },
+                "PROFITABLE -- dispatching"
+            );
+
             // The sim path needs ALT addresses again; clone them before
             // moving `swap_ixs` into the build closure.
             let alt_addresses = swap_ixs.address_lookup_table_addresses.clone();
