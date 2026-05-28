@@ -140,6 +140,9 @@ async fn quote_check(
     let quote2 = metis.get_quote(token_mint, WSOL_MINT, token_amount).await.ok()?;
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
+    // Both quotes returned — count Metis throughput regardless of profitability.
+    metrics.metis_resp_total.fetch_add(1, Ordering::Relaxed);
+
     if output_wsol <= amount {
         return None;
     }
@@ -176,11 +179,11 @@ async fn calc_and_build(
         if gl.lock().unwrap().try_acquire() {
             true
         } else {
-            metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            metrics.dropped_rate_limit.fetch_add(1, Ordering::Relaxed);
             return;
         }
     } else {
-        metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+        metrics.dropped_rate_limit.fetch_add(1, Ordering::Relaxed);
         return;
     };
 
@@ -323,7 +326,7 @@ pub async fn scan_all_tokens(
         let permit = match calc_sem.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                metrics.dropped_busy.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
