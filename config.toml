@@ -25,7 +25,7 @@ urls = [
     "https://tokyo.mainnet.block-engine.jito.wtf",
 ]
 uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
-trading_keypair = "/root/g/wallet/wallet.json"
+trading_keypair = "/root/c/wallet/wallet.json"
 tip_min_lamports = 1000
 tip_max_lamports = 1000000
 tip_profit_percent = 0.50
@@ -62,7 +62,7 @@ bot_cpu_cores = []
 # منبع داده‌ی sim = همان gRPC شیفت که Metis هم می‌خواند (یک اتصال جدا،
 # هیچ سربار متقابلی با Metis ندارد).
 enabled = false
-so_dir = "/root/g/so"
+so_dir = "/root/c/so"
 # fail_closed=true  (امن)  : اگر sim خطا داد ⇒ ارسال نکن
 # fail_closed=false (رول‌اوت) : اگر sim خطا داد ⇒ فقط log بزن و بفرست
 fail_closed = true
@@ -95,5 +95,5 @@ endpoints = [
 ]
 # این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
 # تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
-auth_keypair = "/root/g/wallet/grpc.json"
+auth_keypair = "/root/c/wallet/grpc.json"
 max_bundles_per_second = 5
