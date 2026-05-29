@@ -23,6 +23,10 @@ use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 const JITO_TIP_LAMPORTS: u64 = 5_000;
+const NETWORK_FEE_LAMPORTS: u64 = 5_000;
+/// Minimum lamports profit required at quote stage before requesting swap instructions.
+/// = jito tip + network fee + 1000 safety margin
+const MIN_PROFIT_LAMPORTS: u64 = 11_000;
 /// Bundles older than this are stale and dropped before sending to Jito.
 const BUNDLE_MAX_AGE_MS: u64 = 15;
 
@@ -143,7 +147,9 @@ async fn quote_check(
     // Both quotes returned — count Metis throughput regardless of profitability.
     metrics.metis_resp_total.fetch_add(1, Ordering::Relaxed);
 
-    if output_wsol <= amount {
+    // Fast pre-filter: output must cover fees AND minimum profit before we
+    // spend a calc slot on swap_instructions. Discard immediately if not met.
+    if output_wsol < amount + MIN_PROFIT_LAMPORTS {
         return None;
     }
 
@@ -188,7 +194,12 @@ async fn calc_and_build(
     };
 
     // 2. Merge quotes + get swap instructions.
-    let merged = match MetisClient::merge_quotes(&pair.quote1, &pair.quote2, pair.amount) {
+    // other_amount_threshold = input + fees: the on-chain slippage floor.
+    // The tx reverts only if the swap returns less than this — we are willing
+    // to land even at break-even (input + fees), sacrificing the 1000-lamport
+    // margin we checked at quote stage to tolerate slight price movement.
+    let on_chain_floor = pair.amount + JITO_TIP_LAMPORTS + NETWORK_FEE_LAMPORTS;
+    let merged = match MetisClient::merge_quotes(&pair.quote1, &pair.quote2, on_chain_floor) {
         Ok(m) => m,
         Err(_) => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
     };
