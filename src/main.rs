@@ -91,7 +91,6 @@ async fn async_main(config: config::Config) -> Result<()> {
     let metis = Arc::new(metis::MetisClient::new(
         &config.metis.url,
         config.performance.quote_timeout_ms,
-        config.performance.swap_instructions_timeout_ms,
     ));
 
     let jito_client = Arc::new(jito::JitoClient::new(&config.jito.urls, &config.jito.uuid));
@@ -197,20 +196,18 @@ async fn async_main(config: config::Config) -> Result<()> {
         metrics.clone(),
     ));
 
-    // ── Calc semaphore: bounded Stage-2 concurrency from config ─────────────
-    let calc_workers = config.performance.calc_workers.max(1);
-    let calc_sem = Arc::new(Semaphore::new(calc_workers));
+    // ── Calc semaphore: at most 6 concurrent Stage-2 workers per scan cycle ───
+    let calc_sem = Arc::new(Semaphore::new(6));
 
     eprintln!(
-        "scanner ready | tokens={} | pairs_per_scan={} | calc_workers={}",
+        "scanner ready | tokens={} | pairs_per_scan={} | calc_workers=6",
         token_mints.len(),
         {
             let steps = ((config.trading.max_amount_sol - config.trading.min_amount_sol)
                 / config.trading.step_sol) as usize
                 + 1;
             steps * token_mints.len()
-        },
-        calc_workers
+        }
     );
 
     loop {
