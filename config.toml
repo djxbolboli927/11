@@ -5,7 +5,7 @@ binary_key = "5b945476-f95d-4403-a2b5-156db4ee3212"
 [trading]
 min_amount_sol = 0.001
 max_amount_sol = 0.05
-step_sol = 0.0001
+step_sol = 0.0002
 min_profit_lamports = 1
 base_fee_lamports = 5000
 tokens_file = "tokens.txt"
