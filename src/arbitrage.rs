@@ -22,7 +22,7 @@ use crate::tokens::WSOL_MINT;
 use crate::transaction;
 
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
-const JITO_TIP_LAMPORTS: u64 = 5_000;
+const JITO_TIP_LAMPORTS: u64 = 1_600;
 const NETWORK_FEE_LAMPORTS: u64 = 5_000;
 /// Bundles older than this are stale and dropped before sending to Jito.
 const BUNDLE_MAX_AGE_MS: u64 = 15;
