@@ -98,6 +98,7 @@ struct QuotePair {
     token_mint: String,
     amount: u64,
     output_wsol: u64,
+    net_profit: i64, // output_wsol - (amount + on_chain_floor); negative = unprofitable after fees
     quote1: QuoteResponse,
     quote2: QuoteResponse,
     hop_count: usize,
@@ -148,8 +149,13 @@ async fn quote_check(
     // Both quotes returned — count Metis throughput regardless of profitability.
     metrics.metis_resp_total.fetch_add(1, Ordering::Relaxed);
 
-    // Pre-filter: discard immediately if the quoted round-trip is not profitable.
-    if output_wsol <= amount {
+    // Pre-filter: match Stage-2 on-chain floor exactly.
+    // Only proceed if the quote covers jito tip + network fee; anything less
+    // will revert on-chain so there is no point requesting swap_instructions.
+    let on_chain_floor = amount
+        .saturating_add(JITO_TIP_LAMPORTS)
+        .saturating_add(NETWORK_FEE_LAMPORTS);
+    if output_wsol <= on_chain_floor {
         return None;
     }
 
@@ -166,7 +172,8 @@ async fn quote_check(
 
     metrics.metis_resp_ok.fetch_add(1, Ordering::Relaxed);
 
-    Some(QuotePair { token_mint: token_mint.to_string(), amount, output_wsol, quote1, quote2, hop_count, is_pmm })
+    let net_profit = output_wsol as i64 - on_chain_floor as i64;
+    Some(QuotePair { token_mint: token_mint.to_string(), amount, output_wsol, net_profit, quote1, quote2, hop_count, is_pmm })
 }
 
 // ─── Stage 2: Calc + tx build ─────────────────────────────────────────────────
@@ -199,6 +206,14 @@ async fn calc_and_build(
     // With slippage_bps=0, quotedOutAmount IS the on-chain minimum, so the tx
     // reverts only if actual output < input + tip + network_fee.
     let on_chain_floor = pair.amount + JITO_TIP_LAMPORTS + NETWORK_FEE_LAMPORTS;
+    tracing::debug!(
+        token = %pair.token_mint,
+        amount = pair.amount,
+        output = pair.output_wsol,
+        quoted_edge = pair.output_wsol as i64 - pair.amount as i64,
+        floor_edge = pair.net_profit,
+        "send_candidate"
+    );
     let merged = match MetisClient::merge_quotes(&pair.quote1, &pair.quote2, on_chain_floor) {
         Ok(m) => m,
         Err(_) => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
