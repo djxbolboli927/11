@@ -179,15 +179,18 @@ impl MetisClient {
 
         // Build merged quote:
         // - inputMint, inAmount from quote1 (WSOL input)
-        // - outputMint, outAmount from quote2 (WSOL output)
-        // - routePlan = concatenated
-        // - otherAmountThreshold = min_acceptable_out (break-even floor, NOT quote2.outAmount)
+        // - outputMint from quote2 (WSOL output)
+        // - outAmount = min_acceptable_out: Metis copies this directly into the route_v2
+        //   instruction's quotedOutAmount field, which with slippage_bps=0 becomes the
+        //   on-chain minimum. Setting it to our floor (input + fees) lets the tx land
+        //   at break-even rather than requiring Metis's exact optimistic prediction.
+        // - otherAmountThreshold = same floor (belt-and-suspenders)
         // - instructionVersion propagates from quote1 (must be "V2" for route_v2)
         Ok(QuoteResponse {
             input_mint: quote1.input_mint.clone(),
             in_amount: quote1.in_amount.clone(),
             output_mint: quote2.output_mint.clone(),
-            out_amount: quote2.out_amount.clone(),
+            out_amount: min_acceptable_out.to_string(),
             other_amount_threshold: min_acceptable_out.to_string(),
             swap_mode: quote1.swap_mode.clone(),
             price_impact_pct: "0".to_string(),

@@ -38,40 +38,6 @@ pub fn jito_tip_pubkeys() -> Vec<Pubkey> {
         .collect()
 }
 
-/// Overwrite `quoted_out_amount` in a Jupiter route_v2 instruction.
-///
-/// Binary layout of route_v2 instruction data (Anchor):
-///   [0..8]   discriminator
-///   [8..16]  in_amount       (u64 LE)
-///   [16..24] quoted_out_amount (u64 LE)  ← patched here
-///   [24..26] slippage_bps    (u16 LE)
-///   ...
-///
-/// With slippage_bps=0 the EVM minimum = quoted_out_amount.
-/// We set it to our own floor (input + fees) instead of Metis's quote.
-fn patch_swap_min_out(ix: &InstructionData, min_out: u64) -> Result<InstructionData> {
-    let mut data = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &ix.data,
-    )
-    .context("failed to decode swap instruction data")?;
-
-    const QUOTED_OUT_OFFSET: usize = 16; // 8 discriminator + 8 in_amount
-    if data.len() < QUOTED_OUT_OFFSET + 8 {
-        anyhow::bail!(
-            "swap instruction data too short ({} bytes) to patch quoted_out_amount",
-            data.len()
-        );
-    }
-    data[QUOTED_OUT_OFFSET..QUOTED_OUT_OFFSET + 8].copy_from_slice(&min_out.to_le_bytes());
-
-    Ok(InstructionData {
-        program_id: ix.program_id.clone(),
-        accounts: ix.accounts.clone(),
-        data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data),
-    })
-}
-
 /// Convert a Metis instruction into a Solana SDK Instruction.
 fn to_sdk_instruction(ix: &InstructionData) -> Result<Instruction> {
     let program_id = Pubkey::from_str(&ix.program_id)?;
@@ -102,16 +68,15 @@ fn to_sdk_instruction(ix: &InstructionData) -> Result<Instruction> {
 /// Build a versioned transaction with exactly 3 instructions:
 ///
 /// #1 - Compute Budget: SetComputeUnitLimit
-/// #2 - Jupiter Aggregator: route/route_v2 (entire circular arb)
+/// #2 - Jupiter Aggregator: route_v2 (entire circular arb)
 /// #3 - System Program: Transfer (Jito tip, MUST be last)
 ///
 /// Uses AltCache for ALT lookups (0ns on cache hit vs ~5ms RPC call).
 /// Uses pre-cached blockhash (passed in, ~100ns read vs ~5ms RPC call).
 ///
-/// `min_out` is written into the route_v2 instruction's `quoted_out_amount`
-/// field (bytes 16-23 after the 8-byte Anchor discriminator).  With
-/// slippage_bps=0 that field IS the on-chain minimum output, so the tx
-/// reverts if and only if actual output < min_out.
+/// The on-chain minimum output (quotedOutAmount in the route_v2 instruction)
+/// is controlled by setting out_amount in the merged quote passed to Metis
+/// before calling this function — do not patch instruction bytes here.
 pub fn build_arb_transaction(
     swap_ixs: &SwapInstructionsResponse,
     payer: &Keypair,
@@ -120,7 +85,6 @@ pub fn build_arb_transaction(
     recent_blockhash: Hash,
     alt_cache: &AltCache,
     rpc_client: &RpcClient,
-    min_out: u64,
 ) -> Result<VersionedTransaction> {
     let mut instructions: Vec<Instruction> = Vec::new();
 
@@ -137,10 +101,7 @@ pub fn build_arb_transaction(
     instructions.push(cu_limit_ix);
 
     // #2 -- Single route_v2 for the entire circular swap
-    // Patch quoted_out_amount so the on-chain minimum = min_out (our floor),
-    // not Metis's optimistic quote which may no longer be achievable.
-    let patched_swap_ix = patch_swap_min_out(&swap_ixs.swap_instruction, min_out)?;
-    instructions.push(to_sdk_instruction(&patched_swap_ix)?);
+    instructions.push(to_sdk_instruction(&swap_ixs.swap_instruction)?);
 
     // #3 -- Jito tip (MUST be last, MUST NOT be in ALT)
     let tip_account = {

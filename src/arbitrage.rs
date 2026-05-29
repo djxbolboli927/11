@@ -194,10 +194,10 @@ async fn calc_and_build(
     };
 
     // 2. Merge quotes + get swap instructions.
-    // other_amount_threshold = input + fees: the on-chain slippage floor.
-    // The tx reverts only if the swap returns less than this — we are willing
-    // to land even at break-even (input + fees), sacrificing the 1000-lamport
-    // margin we checked at quote stage to tolerate slight price movement.
+    // on_chain_floor is passed as out_amount to the merged quote — Metis copies
+    // it into the route_v2 instruction's quotedOutAmount field verbatim.
+    // With slippage_bps=0, quotedOutAmount IS the on-chain minimum, so the tx
+    // reverts only if actual output < input + tip + network_fee.
     let on_chain_floor = pair.amount + JITO_TIP_LAMPORTS + NETWORK_FEE_LAMPORTS;
     let merged = match MetisClient::merge_quotes(&pair.quote1, &pair.quote2, on_chain_floor) {
         Ok(m) => m,
@@ -216,11 +216,10 @@ async fn calc_and_build(
     let keypair = ctx.trading_keypair.clone();
     let alt = ctx.alt_cache.clone();
     let rpc = ctx.rpc_client.clone();
-    let floor = on_chain_floor; // u64 is Copy — captured into spawn_blocking closure
 
     let tx = match tokio::task::spawn_blocking(move || {
         transaction::build_arb_transaction(
-            &swap_ixs, &keypair, JITO_TIP_LAMPORTS, cu_limit, recent_blockhash, &alt, &rpc, floor,
+            &swap_ixs, &keypair, JITO_TIP_LAMPORTS, cu_limit, recent_blockhash, &alt, &rpc,
         )
     })
     .await
