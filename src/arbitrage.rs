@@ -216,10 +216,11 @@ async fn calc_and_build(
     let keypair = ctx.trading_keypair.clone();
     let alt = ctx.alt_cache.clone();
     let rpc = ctx.rpc_client.clone();
+    let floor = on_chain_floor; // u64 is Copy — captured into spawn_blocking closure
 
     let tx = match tokio::task::spawn_blocking(move || {
         transaction::build_arb_transaction(
-            &swap_ixs, &keypair, JITO_TIP_LAMPORTS, cu_limit, recent_blockhash, &alt, &rpc,
+            &swap_ixs, &keypair, JITO_TIP_LAMPORTS, cu_limit, recent_blockhash, &alt, &rpc, floor,
         )
     })
     .await
