@@ -24,11 +24,12 @@ use crate::transaction;
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 const JITO_TIP_LAMPORTS: u64 = 5_000;
 const NETWORK_FEE_LAMPORTS: u64 = 5_000;
-/// Minimum lamports profit required at quote stage before requesting swap instructions.
-/// = jito tip + network fee + 1000 safety margin
-const MIN_PROFIT_LAMPORTS: u64 = 11_000;
 /// Bundles older than this are stale and dropped before sending to Jito.
 const BUNDLE_MAX_AGE_MS: u64 = 15;
+/// Pause this many milliseconds after every N swap_instructions spawns to
+/// give Metis time to drain its queue between bursts.
+const SWAP_IX_BURST: usize = 6;
+const SWAP_IX_PAUSE_MS: u64 = 2;
 
 // ─── Route helpers ───────────────────────────────────────────────────────────
 
@@ -147,9 +148,8 @@ async fn quote_check(
     // Both quotes returned — count Metis throughput regardless of profitability.
     metrics.metis_resp_total.fetch_add(1, Ordering::Relaxed);
 
-    // Fast pre-filter: output must cover fees AND minimum profit before we
-    // spend a calc slot on swap_instructions. Discard immediately if not met.
-    if output_wsol < amount + MIN_PROFIT_LAMPORTS {
+    // Pre-filter: discard immediately if the quoted round-trip is not profitable.
+    if output_wsol <= amount {
         return None;
     }
 
@@ -327,6 +327,7 @@ pub async fn scan_all_tokens(
         })
         .buffer_unordered(max_concurrent);
 
+    let mut spawn_count: usize = 0;
     while let Some(result) = opps.next().await {
         let pair = match result {
             Some(p) => p,
@@ -341,6 +342,11 @@ pub async fn scan_all_tokens(
                 continue;
             }
         };
+
+        spawn_count += 1;
+        if spawn_count % SWAP_IX_BURST == 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(SWAP_IX_PAUSE_MS)).await;
+        }
 
         let ctx_c = ctx.clone();
         let jito_tx_c = jito_tx.clone();
