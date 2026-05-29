@@ -100,9 +100,6 @@ impl MetisClient {
     /// Parameters:
     /// - slippageBps=0: zero slippage at quote layer; the real on-chain floor
     ///   is set via `other_amount_threshold` in `merge_quotes`.
-    /// - onlyDirectRoutes=true: restrict to single-hop routes only; multi-hop
-    ///   routes from Metis often contain stale math that causes Jito revert due
-    ///   to slippage errors.
     /// - maxAccounts=50: leave room for tip account in final tx
     /// - forJitoBundle=true: excludes Jito-incompatible DEXes
     /// - swapMode=ExactIn: exact input amount
@@ -111,10 +108,8 @@ impl MetisClient {
     ///   `bps: 10000` (instead of legacy `percent: 100`). When this QuoteResponse
     ///   is later sent to /swap-instructions, Metis builds a `route_v2` instruction
     ///   which costs fewer compute units and is what competing arb bots use.
-    /// - excludeDexes: none. Every DEX registered in program_registry is
-    ///   allowed to route. PMM DEXes (Tessera, SolFi, ZeroFi) bypass the
-    ///   local simulator when it is enabled; when disabled they go to Jito
-    ///   directly like any other route.
+    /// NOTE: onlyDirectRoutes intentionally omitted. Add &onlyDirectRoutes=true
+    ///   to test if single-hop restriction improves swap_ix latency vs fewer profitable hits.
     pub async fn get_quote(
         &self,
         input_mint: &str,
