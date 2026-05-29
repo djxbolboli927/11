@@ -176,37 +176,20 @@ fn default_grpc_rate() -> u32 {
 pub struct PerformanceConfig {
     /// Number of tokio worker threads (multi-thread runtime).
     pub threads: usize,
-    /// Timeout for /quote requests (ms). Keep tight — quotes are simple lookups.
     pub quote_timeout_ms: u64,
-    /// Timeout for /swap-instructions requests (ms). Must be larger than
-    /// quote_timeout_ms because Metis has to compile the full on-chain instruction.
-    #[serde(default = "default_swap_timeout_ms")]
-    pub swap_instructions_timeout_ms: u64,
     /// CU limits per hop count: index 0 = 2 hops, index 1 = 3 hops, etc.
     /// If hops exceed the array, the last value is used.
     pub cu_limits: Vec<u32>,
     /// Maximum in-flight Metis quote requests per scan chunk.
+    /// Keeps the HTTP connection pool from being overwhelmed.
     #[serde(default = "default_max_concurrent_quotes")]
     pub max_concurrent_quotes: usize,
-    /// Max concurrent Stage-2 calc workers (swap_instructions + tx build).
-    /// Should be large enough to absorb profitable burst arrivals.
-    /// Rule of thumb: profitable_per_sec × swap_instructions_timeout_sec
-    #[serde(default = "default_calc_workers")]
-    pub calc_workers: usize,
     #[serde(default)]
     pub bot_cpu_cores: Vec<usize>,
 }
 
-fn default_swap_timeout_ms() -> u64 {
-    300
-}
-
 fn default_max_concurrent_quotes() -> usize {
     512
-}
-
-fn default_calc_workers() -> usize {
-    50
 }
 
 impl Config {
