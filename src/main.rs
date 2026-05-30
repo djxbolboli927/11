@@ -22,7 +22,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tracing::error;
 
 use alt_cache::AltCache;
@@ -185,12 +185,15 @@ async fn async_main(config: config::Config) -> Result<()> {
         sim_pool,
     });
 
-    // ── Create Jito dispatch channel + spawn persistent Stage-3 worker ────────
-    let (jito_tx, jito_rx) =
-        tokio::sync::mpsc::channel::<arbitrage::ReadyBundle>(64);
+    // ── Create LIFO queue + Notify + spawn persistent Stage-3 sender ─────────
+    let lifo: Arc<Mutex<Vec<arbitrage::ReadyInstruction>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let notify = Arc::new(Notify::new());
 
-    tokio::spawn(arbitrage::jito_dispatch_task(
-        jito_rx,
+    tokio::spawn(arbitrage::jito_send_task(
+        lifo.clone(),
+        notify.clone(),
+        calc_ctx.clone(),
         jito_client,
         jito_grpc_client,
         metrics.clone(),
@@ -215,7 +218,8 @@ async fn async_main(config: config::Config) -> Result<()> {
             &token_mints,
             &config,
             &calc_ctx,
-            &jito_tx,
+            &lifo,
+            &notify,
             &calc_sem,
             &metrics,
         )

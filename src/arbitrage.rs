@@ -1,11 +1,11 @@
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{signature::Keypair, transaction::VersionedTransaction};
+use solana_sdk::signature::Keypair;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::account_cache::AccountCache;
 use crate::alt_cache::AltCache;
@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::jito::JitoClient;
 use crate::jito_grpc::JitoGrpcClient;
 use crate::litesvm_sim::SimulatorPool;
-use crate::metis::{MetisClient, QuoteResponse};
+use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
 use crate::metrics::Metrics;
 use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS, PMM_PROGRAM_IDS};
 use crate::rate_limiter::RateLimiter;
@@ -24,8 +24,10 @@ use crate::transaction;
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 const JITO_TIP_LAMPORTS: u64 = 1_600;
 const NETWORK_FEE_LAMPORTS: u64 = 5_000;
-/// Bundles older than this are stale and dropped before sending to Jito.
-const BUNDLE_MAX_AGE_MS: u64 = 15;
+/// Total time budget from swap_instructions fire to Jito send (milliseconds).
+const CALC_MAX_AGE_MS: u64 = 30;
+/// Maximum time a ReadyInstruction may wait in the LIFO queue (milliseconds).
+const INSTRUCTION_QUEUE_MAX_AGE_MS: u64 = 15;
 /// Pause this many milliseconds after every N swap_instructions spawns to
 /// give Metis time to drain its queue between bursts.
 const SWAP_IX_BURST: usize = 6;
@@ -106,12 +108,17 @@ struct QuotePair {
     is_pmm: bool,
 }
 
-// ─── Stage 2 output ──────────────────────────────────────────────────────────
+// ─── Stage 2 output (LIFO queue element) ─────────────────────────────────────
 
-pub struct ReadyBundle {
-    pub tx: VersionedTransaction,
+pub struct ReadyInstruction {
+    pub swap_ixs: SwapInstructionsResponse,
+    pub amount: u64,
+    pub hop_count: usize,
     pub use_grpc: bool,
-    pub built_at: Instant,
+    /// When swap_instructions HTTP request was fired (30 ms total budget).
+    pub fired_at: Instant,
+    /// When the response arrived in the LIFO queue (15 ms pickup budget).
+    pub arrived_at: Instant,
 }
 
 // ─── Dependencies for Stage-2 calc workers ───────────────────────────────────
@@ -152,7 +159,7 @@ async fn quote_check(
 
     // Stage-1 pre-filter uses min_profit_lamports from config (gross profit check).
     // This controls which quotes are counted as "profitable" and proceed to
-    // swap_instructions. It is independent of the on-chain floor used in Stage 2.
+    // swap_instructions. It is independent of the on-chain floor used in Stage 3.
     let stage1_threshold = amount.saturating_add(min_profit_lamports);
     if output_wsol <= stage1_threshold {
         return None;
@@ -179,16 +186,17 @@ async fn quote_check(
     Some(QuotePair { token_mint: token_mint.to_string(), amount, output_wsol, net_profit, quote1, quote2, hop_count, is_pmm })
 }
 
-// ─── Stage 2: Calc + tx build ─────────────────────────────────────────────────
+// ─── Stage 2: Merge quotes + fire swap_instructions (fire-and-forget) ────────
 
 async fn calc_and_build(
     pair: QuotePair,
     ctx: Arc<CalcCtx>,
-    jito_tx: mpsc::Sender<ReadyBundle>,
+    lifo: Arc<Mutex<Vec<ReadyInstruction>>>,
+    notify: Arc<Notify>,
     metrics: Arc<Metrics>,
-    _permit: OwnedSemaphorePermit, // released on drop → frees calc slot
+    _permit: OwnedSemaphorePermit, // released on return → frees calc slot immediately
 ) {
-    // 1. Reserve a Jito rate-limit slot first (cheap; avoids building tx we can't send).
+    // 1. Reserve a Jito rate-limit slot first (cheap; avoids firing swap_ixs we can't send).
     let use_grpc = if ctx.jito_limiter.lock().unwrap().try_acquire() {
         false
     } else if let Some(gl) = &ctx.jito_grpc_limiter {
@@ -203,11 +211,7 @@ async fn calc_and_build(
         return;
     };
 
-    // 2. Merge quotes + get swap instructions.
-    // on_chain_floor is passed as out_amount to the merged quote — Metis copies
-    // it into the route_v2 instruction's quotedOutAmount field verbatim.
-    // With slippage_bps=0, quotedOutAmount IS the on-chain minimum, so the tx
-    // reverts only if actual output < input + tip + network_fee.
+    // 2. Merge quotes.
     let on_chain_floor = pair.amount + JITO_TIP_LAMPORTS + NETWORK_FEE_LAMPORTS;
     tracing::debug!(
         token = %pair.token_mint,
@@ -219,85 +223,152 @@ async fn calc_and_build(
     );
     let merged = match MetisClient::merge_quotes(&pair.quote1, &pair.quote2, on_chain_floor) {
         Ok(m) => m,
-        Err(_) => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
+        Err(_) => {
+            metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
     };
+
+    // 3. Spawn the swap_instructions HTTP call and return immediately.
+    //    The spawned task pushes the result into the LIFO queue; jito_send_task picks it up.
+    let fired_at = Instant::now();
+    let amount = pair.amount;
+    let hop_count = pair.hop_count;
+    let metis = ctx.metis.clone();
+    let user_pubkey = ctx.user_pubkey.clone();
+    let met_c = metrics.clone();
 
     metrics.metis_req_sent.fetch_add(1, Ordering::Relaxed); // swap_instructions HTTP call
-    let swap_ixs = match ctx.metis.get_swap_instructions(&ctx.user_pubkey, &merged).await {
-        Ok(s) => s,
-        Err(_) => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
-    };
 
-    // 3. Build versioned transaction (CPU-bound + possible ALT RPC → spawn_blocking).
-    let cu_limit = lookup_cu_limit(pair.hop_count, &ctx.cu_limits);
-    let recent_blockhash = ctx.blockhash_cache.get();
-    let keypair = ctx.trading_keypair.clone();
-    let alt = ctx.alt_cache.clone();
-    let rpc = ctx.rpc_client.clone();
+    tokio::spawn(async move {
+        let swap_ixs = match metis.get_swap_instructions(&user_pubkey, &merged).await {
+            Ok(s) => s,
+            Err(_) => {
+                met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
 
-    let tx = match tokio::task::spawn_blocking(move || {
-        transaction::build_arb_transaction(
-            &swap_ixs, &keypair, JITO_TIP_LAMPORTS, cu_limit, recent_blockhash, &alt, &rpc,
-        )
-    })
-    .await
-    {
-        Ok(Ok(tx)) => tx,
-        _ => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
-    };
+        // Drop response if total budget already exceeded.
+        if fired_at.elapsed().as_millis() as u64 > CALC_MAX_AGE_MS {
+            met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
-    // 4. Size guard (Solana hard limit: 1232 bytes).
-    match bincode::serialize(&tx) {
-        Ok(bytes) if bytes.len() > 1232 => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
-        Err(_) => { metrics.tx_dropped.fetch_add(1, Ordering::Relaxed); return; }
-        Ok(_) => {}
-    }
-
-    // 5. Send to Stage-3 Jito worker (non-blocking; drop if channel full).
-    let bundle = ReadyBundle { tx, use_grpc, built_at: Instant::now() };
-    if jito_tx.try_send(bundle).is_ok() {
-        metrics.calc_done.fetch_add(1, Ordering::Relaxed);
-    } else {
-        metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
-    }
+        let arrived_at = Instant::now();
+        lifo.lock().unwrap().push(ReadyInstruction {
+            swap_ixs,
+            amount,
+            hop_count,
+            use_grpc,
+            fired_at,
+            arrived_at,
+        });
+        notify.notify_one();
+    });
+    // _permit drops here: Stage-2 slot is freed while the HTTP call is still in flight.
 }
 
-// ─── Stage 3: Persistent Jito dispatcher ────────────────────────────────────
+// ─── Stage 3: Persistent Jito sender (LIFO, newest-first) ────────────────────
 
-/// Receives ready bundles from Stage 2 and dispatches them to Jito.
-/// Stale bundles (older than BUNDLE_MAX_AGE_MS) are dropped.
-/// Each Jito HTTP send is spawned independently to avoid blocking on network I/O.
-pub async fn jito_dispatch_task(
-    mut rx: mpsc::Receiver<ReadyBundle>,
+/// Waits for swap instruction results on the LIFO queue (newest first), builds
+/// versioned transactions, and dispatches them to Jito.
+/// Items older than INSTRUCTION_QUEUE_MAX_AGE_MS in queue, or CALC_MAX_AGE_MS
+/// from fire, are dropped without sending.
+/// Each Jito HTTP/gRPC send is spawned independently to avoid blocking.
+pub async fn jito_send_task(
+    lifo: Arc<Mutex<Vec<ReadyInstruction>>>,
+    notify: Arc<Notify>,
+    ctx: Arc<CalcCtx>,
     jito: Arc<JitoClient>,
     jito_grpc: Option<Arc<JitoGrpcClient>>,
     metrics: Arc<Metrics>,
 ) {
-    while let Some(bundle) = rx.recv().await {
-        if bundle.built_at.elapsed().as_millis() as u64 > BUNDLE_MAX_AGE_MS {
-            metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
+    loop {
+        notify.notified().await;
+        loop {
+            // Pop newest item (LIFO: push to end, pop from end).
+            let item = { lifo.lock().unwrap().pop() };
+            let item = match item {
+                None => break,
+                Some(i) => i,
+            };
 
-        let jito_c = jito.clone();
-        let grpc_c = jito_grpc.clone();
-        let met = metrics.clone();
+            // Drop stale items.
+            if item.arrived_at.elapsed().as_millis() as u64 > INSTRUCTION_QUEUE_MAX_AGE_MS
+                || item.fired_at.elapsed().as_millis() as u64 > CALC_MAX_AGE_MS
+            {
+                metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
 
-        tokio::spawn(async move {
-            if bundle.use_grpc {
-                if let Some(grpc) = grpc_c {
-                    match grpc.send_bundle(&bundle.tx).await {
-                        Ok(_) => { met.jito_sent.fetch_add(1, Ordering::Relaxed); }
-                        Err(_) => { met.tx_dropped.fetch_add(1, Ordering::Relaxed); }
+            // Build versioned transaction (CPU-bound + possible ALT RPC → spawn_blocking).
+            let cu_limit = lookup_cu_limit(item.hop_count, &ctx.cu_limits);
+            let recent_blockhash = ctx.blockhash_cache.get();
+            let keypair = ctx.trading_keypair.clone();
+            let alt = ctx.alt_cache.clone();
+            let rpc = ctx.rpc_client.clone();
+            let swap_ixs = item.swap_ixs;
+
+            let tx = match tokio::task::spawn_blocking(move || {
+                transaction::build_arb_transaction(
+                    &swap_ixs, &keypair, JITO_TIP_LAMPORTS, cu_limit, recent_blockhash, &alt, &rpc,
+                )
+            })
+            .await
+            {
+                Ok(Ok(tx)) => tx,
+                _ => {
+                    metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+
+            // Size guard (Solana hard limit: 1232 bytes).
+            match bincode::serialize(&tx) {
+                Ok(bytes) if bytes.len() > 1232 => {
+                    metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Err(_) => {
+                    metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Ok(_) => {}
+            }
+
+            // Fire Jito send independently (non-blocking).
+            let jito_c = jito.clone();
+            let grpc_c = jito_grpc.clone();
+            let met = metrics.clone();
+            let use_grpc = item.use_grpc;
+
+            tokio::spawn(async move {
+                if use_grpc {
+                    if let Some(grpc) = grpc_c {
+                        match grpc.send_bundle(&tx).await {
+                            Ok(_) => {
+                                met.jito_sent.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                met.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                } else {
+                    match jito_c.send_bundle(&tx).await {
+                        Ok(_) => {
+                            met.jito_sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            met.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
-            } else {
-                match jito_c.send_bundle(&bundle.tx).await {
-                    Ok(_) => { met.jito_sent.fetch_add(1, Ordering::Relaxed); }
-                    Err(_) => { met.tx_dropped.fetch_add(1, Ordering::Relaxed); }
-                }
-            }
-        });
+            });
+
+            metrics.calc_done.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -306,13 +377,14 @@ pub async fn jito_dispatch_task(
 /// One scan cycle over all (token × amount) pairs.
 ///
 /// Stage 1 (here): buffer_unordered quote scanner
-/// Stage 2 (spawned tasks, max CALC_WORKERS concurrent): swap_instructions + tx build
-/// Stage 3 (jito_dispatch_task, persistent): Jito send with age-check
+/// Stage 2 (spawned tasks, max calc_sem concurrent): merge quotes + fire swap_instructions
+/// Stage 3 (jito_send_task, persistent): LIFO drain → tx build → Jito send
 pub async fn scan_all_tokens(
     token_mints: &[String],
     config: &Config,
     ctx: &Arc<CalcCtx>,
-    jito_tx: &mpsc::Sender<ReadyBundle>,
+    lifo: &Arc<Mutex<Vec<ReadyInstruction>>>,
+    notify: &Arc<Notify>,
     calc_sem: &Arc<Semaphore>,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
@@ -368,11 +440,12 @@ pub async fn scan_all_tokens(
         }
 
         let ctx_c = ctx.clone();
-        let jito_tx_c = jito_tx.clone();
+        let lifo_c = lifo.clone();
+        let notify_c = notify.clone();
         let met_c = metrics.clone();
 
         tokio::spawn(async move {
-            calc_and_build(pair, ctx_c, jito_tx_c, met_c, permit).await;
+            calc_and_build(pair, ctx_c, lifo_c, notify_c, met_c, permit).await;
         });
     }
 
