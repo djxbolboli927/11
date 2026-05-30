@@ -90,7 +90,7 @@ struct QuotePair {
     token_mint: String,
     amount: u64,
     output_wsol: u64,
-    net_profit: i64, // output_wsol - (amount + on_chain_floor)
+    net_profit: i64,
     quote1: QuoteResponse,
     quote2: QuoteResponse,
     hop_count: usize,
@@ -115,6 +115,11 @@ pub struct CalcCtx {
     pub sim_cache: Option<Arc<AccountCache>>,
     pub sim_pool: Option<Arc<SimulatorPool>>,
 }
+
+// ─── Worker sender handle ─────────────────────────────────────────────────────
+
+/// Opaque handle to the pre-spawned worker pool. Pass to scan_all_tokens.
+pub struct WorkSender(tokio::sync::mpsc::Sender<QuotePair>);
 
 // ─── Stage 1: Quote scanner ───────────────────────────────────────────────────
 
@@ -170,16 +175,9 @@ async fn quote_check(
 }
 
 // ─── Per-opportunity pipeline ─────────────────────────────────────────────────
-//
-// Each profitable pair gets one dedicated task that owns the full pipeline:
-//   rate-limit check → merge quotes → swap_instructions → build tx → Jito send
-//
-// No intermediate queues or staging between stages. The Jito rate-limit slot
-// is claimed at the very start; if none is available the task returns
-// immediately without calling Metis swap_instructions (no wasted HTTP calls).
 
 async fn process_and_send(pair: QuotePair, ctx: Arc<CalcCtx>, metrics: Arc<Metrics>) {
-    // 1. Claim a Jito rate-limit slot (cheap; rejects ~90% of tasks instantly).
+    // 1. Claim a Jito rate-limit slot first.
     let use_grpc = if ctx.jito_limiter.lock().unwrap().try_acquire() {
         false
     } else if let Some(gl) = &ctx.jito_grpc_limiter {
@@ -194,7 +192,7 @@ async fn process_and_send(pair: QuotePair, ctx: Arc<CalcCtx>, metrics: Arc<Metri
         return;
     };
 
-    // 2. Merge quotes: embed on-chain minimum output into the combined route.
+    // 2. Merge quotes: embed on-chain minimum output.
     let on_chain_floor = pair.amount + JITO_TIP_LAMPORTS + NETWORK_FEE_LAMPORTS;
     tracing::debug!(
         token = %pair.token_mint,
@@ -222,7 +220,7 @@ async fn process_and_send(pair: QuotePair, ctx: Arc<CalcCtx>, metrics: Arc<Metri
         }
     };
 
-    // 4. Build versioned transaction (CPU-bound + possible ALT RPC → spawn_blocking).
+    // 4. Build versioned transaction.
     let cu_limit = lookup_cu_limit(pair.hop_count, &ctx.cu_limits);
     let recent_blockhash = ctx.blockhash_cache.get();
     let keypair = ctx.trading_keypair.clone();
@@ -264,7 +262,7 @@ async fn process_and_send(pair: QuotePair, ctx: Arc<CalcCtx>, metrics: Arc<Metri
 
     metrics.calc_done.fetch_add(1, Ordering::Relaxed);
 
-    // 6. Send bundle to Jito (REST or gRPC).
+    // 6. Send bundle to Jito.
     let result = if use_grpc {
         match &ctx.jito_grpc {
             Some(grpc) => grpc.send_bundle(&tx).await,
@@ -284,17 +282,64 @@ async fn process_and_send(pair: QuotePair, ctx: Arc<CalcCtx>, metrics: Arc<Metri
     }
 }
 
+// ─── Worker pool ──────────────────────────────────────────────────────────────
+
+/// Spawn `worker_count` persistent pipeline workers. Call once at startup.
+///
+/// Each worker runs a permanent loop: receive a profitable pair from the shared
+/// channel, execute the full pipeline (rate-limit → merge → swap_instructions →
+/// build tx → Jito send), then immediately wait for the next pair.
+///
+/// Because workers are already alive and blocked on `recv()`, there is zero
+/// spawn latency when a burst arrives. Items are delivered in FIFO order via
+/// the channel. If all workers are busy and the channel buffer is full,
+/// `scan_all_tokens` drops the item (counted as `dropped_busy`).
+pub fn spawn_workers(
+    ctx: Arc<CalcCtx>,
+    metrics: Arc<Metrics>,
+    worker_count: usize,
+) -> WorkSender {
+    let capacity = worker_count.max(1);
+    let (tx, rx) = tokio::sync::mpsc::channel::<QuotePair>(capacity);
+    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+
+    for _ in 0..worker_count {
+        let rx_c = rx.clone();
+        let ctx_c = ctx.clone();
+        let met_c = metrics.clone();
+        tokio::spawn(async move {
+            loop {
+                // Only one worker holds the receiver lock at a time; this
+                // ensures FIFO ordering and prevents multiple workers from
+                // racing to dequeue the same item.
+                let pair = {
+                    let mut locked = rx_c.lock().await;
+                    match locked.recv().await {
+                        Some(p) => p,
+                        None => return, // sender dropped = program exiting
+                    }
+                };
+                // Lock is released here; process_and_send runs without
+                // holding it, so the next idle worker can dequeue immediately.
+                process_and_send(pair, ctx_c.clone(), met_c.clone()).await;
+            }
+        });
+    }
+
+    WorkSender(tx)
+}
+
 // ─── Main scan entry ─────────────────────────────────────────────────────────
 
 /// One scan cycle over all (token × amount) pairs.
 ///
-/// Stage 1 (here): buffer_unordered quote scanner — token_count/2 concurrent pairs
-/// Stage 2 (spawned tasks, unlimited): each profitable pair runs the full pipeline
-///   to Jito submission with no intermediate queuing
+/// Stage 1: buffer_unordered quote scanner (token_count/2 concurrent)
+/// Stage 2: profitable pairs are dispatched to pre-spawned workers via channel
 pub async fn scan_all_tokens(
     token_mints: &[String],
     config: &Config,
     ctx: &Arc<CalcCtx>,
+    work_tx: &WorkSender,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     let min_lamports = (config.trading.min_amount_sol * LAMPORTS_PER_SOL) as u64;
@@ -302,12 +347,9 @@ pub async fn scan_all_tokens(
     let step_lamports = (config.trading.step_sol * LAMPORTS_PER_SOL) as u64;
     let min_profit_lamports = config.trading.min_profit_lamports;
 
-    // Send half the token catalog to Metis simultaneously.
-    // N/2 quote pairs are in flight at once — one full "half-wave" of tokens
-    // completes before the next starts, keeping Metis load predictable.
+    // Half the token catalog in flight at once.
     let max_concurrent = (token_mints.len() / 2).max(1);
 
-    // Pairs interleaved across tokens: (0.001,A),(0.001,B),...,(0.001,Z),(0.0012,A),...
     let all_pairs: Vec<(u64, String)> = {
         let mut pairs = Vec::new();
         let mut amount = min_lamports;
@@ -334,12 +376,10 @@ pub async fn scan_all_tokens(
             Some(p) => p,
             None => continue,
         };
-
-        let ctx_c = ctx.clone();
-        let met_c = metrics.clone();
-        tokio::spawn(async move {
-            process_and_send(pair, ctx_c, met_c).await;
-        });
+        // try_send: non-blocking. Drops if all workers busy + channel full.
+        if work_tx.0.try_send(pair).is_err() {
+            metrics.dropped_busy.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     Ok(())

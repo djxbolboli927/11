@@ -187,8 +187,17 @@ async fn async_main(config: config::Config) -> Result<()> {
         sim_pool,
     });
 
+    // ── Spawn persistent pipeline workers (one per Jito rate-limit slot) ─────
+    let worker_count = config.jito.max_bundles_per_second as usize
+        + if config.jito_grpc.enabled {
+            config.jito_grpc.max_bundles_per_second as usize
+        } else {
+            0
+        };
+    let work_sender = arbitrage::spawn_workers(calc_ctx.clone(), metrics.clone(), worker_count);
+
     eprintln!(
-        "scanner ready | tokens={} | pairs_per_scan={} | quote_concurrency={}",
+        "scanner ready | tokens={} | pairs_per_scan={} | workers={worker_count} | quote_concurrency={}",
         token_mints.len(),
         {
             let steps = ((config.trading.max_amount_sol - config.trading.min_amount_sol)
@@ -204,6 +213,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             &token_mints,
             &config,
             &calc_ctx,
+            &work_sender,
             &metrics,
         )
         .await
