@@ -190,6 +190,11 @@ pub struct PerformanceConfig {
     /// stage as a bottleneck. Default 6 (legacy value).
     #[serde(default = "default_calc_workers")]
     pub calc_workers: usize,
+    /// Max time (ms) a swap_instructions result may wait in the LIFO queue
+    /// before being dropped by a calc worker. Tune higher to tolerate slower
+    /// Metis responses; lower to discard stale opportunities faster.
+    #[serde(default = "default_queue_max_age_ms")]
+    pub queue_max_age_ms: u64,
     #[serde(default)]
     pub bot_cpu_cores: Vec<usize>,
 }
@@ -200,6 +205,10 @@ fn default_max_concurrent_quotes() -> usize {
 
 fn default_calc_workers() -> usize {
     6
+}
+
+fn default_queue_max_age_ms() -> u64 {
+    50
 }
 
 impl Config {

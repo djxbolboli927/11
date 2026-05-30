@@ -194,7 +194,12 @@ async fn async_main(config: config::Config) -> Result<()> {
         } else {
             0
         };
-    let work_sender = arbitrage::spawn_workers(calc_ctx.clone(), metrics.clone(), worker_count);
+    let pipeline = arbitrage::spawn_workers(
+        calc_ctx.clone(),
+        metrics.clone(),
+        worker_count,
+        config.performance.queue_max_age_ms,
+    );
 
     eprintln!(
         "scanner ready | tokens={} | pairs_per_scan={} | workers={worker_count} | quote_concurrency={}",
@@ -213,7 +218,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             &token_mints,
             &config,
             &calc_ctx,
-            &work_sender,
+            &pipeline,
             &metrics,
         )
         .await
