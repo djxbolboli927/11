@@ -202,7 +202,7 @@ async fn async_main(config: config::Config) -> Result<()> {
     );
 
     eprintln!(
-        "scanner ready | tokens={} | pairs_per_scan={} | workers={worker_count} | quote_concurrency={}",
+        "scanner ready | tokens={} | pairs_per_scan={} | workers={worker_count} | quote_concurrency={} | min_profit={}λ | queue_max_age={}ms",
         token_mints.len(),
         {
             let steps = ((config.trading.max_amount_sol - config.trading.min_amount_sol)
@@ -211,6 +211,8 @@ async fn async_main(config: config::Config) -> Result<()> {
             steps * token_mints.len()
         },
         token_mints.len() / 2,
+        config.trading.min_profit_lamports,
+        config.performance.queue_max_age_ms,
     );
 
     loop {

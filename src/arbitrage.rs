@@ -147,9 +147,11 @@ async fn quote_check(
     metrics.metis_req_sent.fetch_add(2, Ordering::Relaxed); // quote1 + quote2
 
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
+    metrics.metis_quote_ok.fetch_add(1, Ordering::Relaxed); // quote1 returned
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
 
     let quote2 = metis.get_quote(token_mint, WSOL_MINT, token_amount).await.ok()?;
+    metrics.metis_quote_ok.fetch_add(1, Ordering::Relaxed); // quote2 returned
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
     metrics.metis_resp_total.fetch_add(1, Ordering::Relaxed);
