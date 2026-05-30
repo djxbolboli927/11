@@ -199,11 +199,12 @@ async fn async_main(config: config::Config) -> Result<()> {
         metrics.clone(),
     ));
 
-    // ── Calc semaphore: at most 6 concurrent Stage-2 workers per scan cycle ───
-    let calc_sem = Arc::new(Semaphore::new(6));
+    // ── Calc semaphore: max concurrent Stage-2 workers per scan cycle ─────────
+    let calc_workers = config.performance.calc_workers.max(1);
+    let calc_sem = Arc::new(Semaphore::new(calc_workers));
 
     eprintln!(
-        "scanner ready | tokens={} | pairs_per_scan={} | calc_workers=6",
+        "scanner ready | tokens={} | pairs_per_scan={} | calc_workers={calc_workers}",
         token_mints.len(),
         {
             let steps = ((config.trading.max_amount_sol - config.trading.min_amount_sol)

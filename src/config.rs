@@ -184,12 +184,22 @@ pub struct PerformanceConfig {
     /// Keeps the HTTP connection pool from being overwhelmed.
     #[serde(default = "default_max_concurrent_quotes")]
     pub max_concurrent_quotes: usize,
+    /// Maximum concurrent Stage-2 calc workers (merge quotes + fire
+    /// swap_instructions). With fire-and-forget each worker holds its slot
+    /// only for microseconds, so this can be set high to rule out the calc
+    /// stage as a bottleneck. Default 6 (legacy value).
+    #[serde(default = "default_calc_workers")]
+    pub calc_workers: usize,
     #[serde(default)]
     pub bot_cpu_cores: Vec<usize>,
 }
 
 fn default_max_concurrent_quotes() -> usize {
     512
+}
+
+fn default_calc_workers() -> usize {
+    6
 }
 
 impl Config {
