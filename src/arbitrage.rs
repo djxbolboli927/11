@@ -136,6 +136,7 @@ async fn quote_check(
     metis: &MetisClient,
     token_mint: &str,
     amount: u64,
+    min_profit_lamports: u64,
     metrics: &Metrics,
 ) -> Option<QuotePair> {
     metrics.metis_req_sent.fetch_add(2, Ordering::Relaxed); // quote1 + quote2
@@ -149,13 +150,11 @@ async fn quote_check(
     // Both quotes returned — count Metis throughput regardless of profitability.
     metrics.metis_resp_total.fetch_add(1, Ordering::Relaxed);
 
-    // Pre-filter: match Stage-2 on-chain floor exactly.
-    // Only proceed if the quote covers jito tip + network fee; anything less
-    // will revert on-chain so there is no point requesting swap_instructions.
-    let on_chain_floor = amount
-        .saturating_add(JITO_TIP_LAMPORTS)
-        .saturating_add(NETWORK_FEE_LAMPORTS);
-    if output_wsol <= on_chain_floor {
+    // Stage-1 pre-filter uses min_profit_lamports from config (gross profit check).
+    // This controls which quotes are counted as "profitable" and proceed to
+    // swap_instructions. It is independent of the on-chain floor used in Stage 2.
+    let stage1_threshold = amount.saturating_add(min_profit_lamports);
+    if output_wsol <= stage1_threshold {
         return None;
     }
 
@@ -172,6 +171,10 @@ async fn quote_check(
 
     metrics.metis_resp_ok.fetch_add(1, Ordering::Relaxed);
 
+    // net_profit relative to the on-chain floor (tip + network fee), not the config threshold.
+    let on_chain_floor = amount
+        .saturating_add(JITO_TIP_LAMPORTS)
+        .saturating_add(NETWORK_FEE_LAMPORTS);
     let net_profit = output_wsol as i64 - on_chain_floor as i64;
     Some(QuotePair { token_mint: token_mint.to_string(), amount, output_wsol, net_profit, quote1, quote2, hop_count, is_pmm })
 }
@@ -317,6 +320,7 @@ pub async fn scan_all_tokens(
     let max_lamports = (config.trading.max_amount_sol * LAMPORTS_PER_SOL) as u64;
     let step_lamports = (config.trading.step_sol * LAMPORTS_PER_SOL) as u64;
     let max_concurrent = config.performance.max_concurrent_quotes;
+    let min_profit_lamports = config.trading.min_profit_lamports;
 
     // Pairs interleaved across tokens: (0.001,A),(0.001,B),...,(0.001,Q),(0.0011,A),...
     // This ensures all tokens get equal opportunity regardless of which complete first.
@@ -338,7 +342,7 @@ pub async fn scan_all_tokens(
     // Stage 1: stream quotes with bounded concurrency.
     let mut opps = stream::iter(all_pairs)
         .map(move |(amt, tok)| async move {
-            quote_check(metis_ref, &tok, amt, met_ref).await
+            quote_check(metis_ref, &tok, amt, min_profit_lamports, met_ref).await
         })
         .buffer_unordered(max_concurrent);
 
