@@ -22,7 +22,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use tokio::sync::{Notify, Semaphore};
+
 use tracing::error;
 
 use alt_cache::AltCache;
@@ -170,13 +170,15 @@ async fn async_main(config: config::Config) -> Result<()> {
         (None, None)
     };
 
-    // ── Build shared CalcCtx (used by Stage-2 workers every scan cycle) ──────
+    // ── Build shared CalcCtx ─────────────────────────────────────────────────
     let calc_ctx = Arc::new(arbitrage::CalcCtx {
         metis: metis.clone(),
         blockhash_cache: blockhash_cache.clone(),
         trading_keypair: trading_keypair.clone(),
         rpc_client: rpc_client.clone(),
         alt_cache: alt_cache.clone(),
+        jito: jito_client,
+        jito_grpc: jito_grpc_client,
         jito_limiter: jito_limiter.clone(),
         jito_grpc_limiter: jito_grpc_limiter.clone(),
         cu_limits: config.performance.cu_limits.clone(),
@@ -185,33 +187,16 @@ async fn async_main(config: config::Config) -> Result<()> {
         sim_pool,
     });
 
-    // ── Create LIFO queue + Notify + spawn persistent Stage-3 sender ─────────
-    let lifo: Arc<Mutex<Vec<arbitrage::ReadyInstruction>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let notify = Arc::new(Notify::new());
-
-    tokio::spawn(arbitrage::jito_send_task(
-        lifo.clone(),
-        notify.clone(),
-        calc_ctx.clone(),
-        jito_client,
-        jito_grpc_client,
-        metrics.clone(),
-    ));
-
-    // ── Calc semaphore: max concurrent Stage-2 workers per scan cycle ─────────
-    let calc_workers = config.performance.calc_workers.max(1);
-    let calc_sem = Arc::new(Semaphore::new(calc_workers));
-
     eprintln!(
-        "scanner ready | tokens={} | pairs_per_scan={} | calc_workers={calc_workers}",
+        "scanner ready | tokens={} | pairs_per_scan={} | quote_concurrency={}",
         token_mints.len(),
         {
             let steps = ((config.trading.max_amount_sol - config.trading.min_amount_sol)
                 / config.trading.step_sol) as usize
                 + 1;
             steps * token_mints.len()
-        }
+        },
+        token_mints.len() / 2,
     );
 
     loop {
@@ -219,9 +204,6 @@ async fn async_main(config: config::Config) -> Result<()> {
             &token_mints,
             &config,
             &calc_ctx,
-            &lifo,
-            &notify,
-            &calc_sem,
             &metrics,
         )
         .await
