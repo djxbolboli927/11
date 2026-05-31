@@ -25,6 +25,12 @@ const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 const JITO_TIP_LAMPORTS: u64 = 1_600;
 const NETWORK_FEE_LAMPORTS: u64 = 5_000;
 
+/// How long a worker sleeps before retrying when both Jito limiters are full.
+/// The sliding-window limiter frees a slot within ≤1s of a prior send, so a
+/// short poll keeps latency low while the item waits (it is never dropped for
+/// rate-limit reasons — only when it ages past queue_max_age_ms).
+const RATE_RETRY_BACKOFF_MS: u64 = 20;
+
 // ─── Route helpers ───────────────────────────────────────────────────────────
 
 fn route_uses_forbidden_dex(quote: &QuoteResponse) -> bool {
@@ -279,14 +285,44 @@ pub fn spawn_workers(
                     None => continue,
                 };
 
-                // Drop stale items immediately.
+                // Drop only when the item has waited longer than queue_max_age_ms.
+                // This is the ONLY reason an item leaves the queue without being
+                // sent — rate limiting never drops it (see the requeue below).
                 if item.arrived_at.elapsed().as_millis() as u64 > queue_max_age_ms {
                     met_c.dropped_stale.fetch_add(1, Ordering::Relaxed);
                     met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
-                // Build versioned transaction.
+                // Claim a Jito send slot BEFORE building. The send rate stays at
+                // 10/sec (REST + gRPC limiters). If both are full we must NOT
+                // drop: put the item back on the queue (newest-first preserved,
+                // arrived_at unchanged) and retry after a short backoff. Claiming
+                // before the build means a rate-limited retry costs no build work,
+                // and the item keeps waiting until either a slot frees or it ages
+                // past the 2s TTL.
+                let use_grpc = if ctx_c.jito_limiter.lock().unwrap().try_acquire() {
+                    false
+                } else if ctx_c
+                    .jito_grpc_limiter
+                    .as_ref()
+                    .map(|gl| gl.lock().unwrap().try_acquire())
+                    .unwrap_or(false)
+                {
+                    true
+                } else {
+                    met_c.rate_requeued.fetch_add(1, Ordering::Relaxed);
+                    lifo_c.lock().unwrap().push(item);
+                    met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
+                    sem_c.add_permits(1);
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        RATE_RETRY_BACKOFF_MS,
+                    ))
+                    .await;
+                    continue;
+                };
+
+                // Slot held — build the versioned transaction.
                 let cu_limit = lookup_cu_limit(item.hop_count, &ctx_c.cu_limits);
                 let recent_blockhash = ctx_c.blockhash_cache.get();
                 let keypair = ctx_c.trading_keypair.clone();
@@ -331,21 +367,6 @@ pub fn spawn_workers(
                 }
 
                 met_c.calc_done.fetch_add(1, Ordering::Relaxed);
-
-                // Claim a Jito slot only after the tx is fully built and sized.
-                let use_grpc = if ctx_c.jito_limiter.lock().unwrap().try_acquire() {
-                    false
-                } else if let Some(gl) = &ctx_c.jito_grpc_limiter {
-                    if gl.lock().unwrap().try_acquire() {
-                        true
-                    } else {
-                        met_c.dropped_rate_limit.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                } else {
-                    met_c.dropped_rate_limit.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                };
 
                 // Send bundle to Jito via the slot we just claimed.
                 let result = if use_grpc {

@@ -32,8 +32,10 @@ pub struct Metrics {
     pub calc_done: AtomicU64,
 
     // ── Stage 3: Jito send ────────────────────────────────────────────────────
-    /// Both REST and gRPC Jito limiters were full — tx discarded after build
-    pub dropped_rate_limit: AtomicU64,
+    /// Both REST and gRPC Jito limiters were full — item put BACK on the queue
+    /// (NOT dropped). Counts requeue events; one item may be requeued many times
+    /// while it waits for a 10/sec slot, until it sends or ages past the TTL.
+    pub rate_requeued: AtomicU64,
     /// Claimed a slot but Jito API returned an error
     pub jito_send_failed: AtomicU64,
     /// Bundle successfully accepted by Jito
@@ -57,7 +59,7 @@ impl Metrics {
             tx_build_failed: AtomicU64::new(0),
             tx_too_large: AtomicU64::new(0),
             calc_done: AtomicU64::new(0),
-            dropped_rate_limit: AtomicU64::new(0),
+            rate_requeued: AtomicU64::new(0),
             jito_send_failed: AtomicU64::new(0),
             jito_sent: AtomicU64::new(0),
             dropped_busy: AtomicU64::new(0),
@@ -88,7 +90,7 @@ impl Metrics {
                 let build     = m.tx_build_failed.swap(0, Ordering::Relaxed);
                 let too_big   = m.tx_too_large.swap(0, Ordering::Relaxed);
                 let calc      = m.calc_done.swap(0, Ordering::Relaxed);
-                let rate_lim  = m.dropped_rate_limit.swap(0, Ordering::Relaxed);
+                let requeued  = m.rate_requeued.swap(0, Ordering::Relaxed);
                 let jfail     = m.jito_send_failed.swap(0, Ordering::Relaxed);
                 let jito      = m.jito_sent.swap(0, Ordering::Relaxed);
 
@@ -103,9 +105,9 @@ impl Metrics {
                     "[{WINDOW_SECS}s] \
 metis_sent={sent} routes={routes} profitable={profit}\n  \
 PRE-QUEUE : swap_ix_fail={swap_fail} -> queue_in={q_in}  (depth_now={depth})\n  \
-IN-QUEUE  : stale={stale} (expired in queue before worker picked up)\n  \
+IN-QUEUE  : stale={stale} (ONLY drop reason: waited >2s for a send slot)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
-JITO      : rate_lim={rate_lim}  send_fail={jfail}  sent={jito}"
+JITO      : rate_requeued={requeued} (waiting in queue, NOT dropped)  send_fail={jfail}  sent={jito}"
                 );
             }
         });
