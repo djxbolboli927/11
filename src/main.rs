@@ -187,13 +187,14 @@ async fn async_main(config: config::Config) -> Result<()> {
         sim_pool,
     });
 
-    // ── Spawn persistent pipeline workers (one per Jito rate-limit slot) ─────
-    let worker_count = config.jito.max_bundles_per_second as usize
-        + if config.jito_grpc.enabled {
-            config.jito_grpc.max_bundles_per_second as usize
-        } else {
-            0
-        };
+    // ── Spawn persistent calc workers. Jito throughput is enforced later, right
+    // before send_bundle, so calc concurrency can be higher than Jito capacity.
+    let worker_count = config.performance.calc_workers.max(1);
+    let jito_capacity = config.jito.max_bundles_per_second as usize
+        + jito_grpc_limiter
+            .as_ref()
+            .map(|_| config.jito_grpc.max_bundles_per_second as usize)
+            .unwrap_or(0);
     let pipeline = arbitrage::spawn_workers(
         calc_ctx.clone(),
         metrics.clone(),
@@ -202,7 +203,7 @@ async fn async_main(config: config::Config) -> Result<()> {
     );
 
     eprintln!(
-        "scanner ready | tokens={} | pairs_per_scan={} | workers={worker_count} | quote_concurrency={} | min_profit={}λ | queue_max_age={}ms",
+        "scanner ready | tokens={} | pairs_per_scan={} | calc_workers={worker_count} | jito_capacity_per_sec={jito_capacity} | quote_concurrency={}",
         token_mints.len(),
         {
             let steps = ((config.trading.max_amount_sol - config.trading.min_amount_sol)
@@ -210,9 +211,7 @@ async fn async_main(config: config::Config) -> Result<()> {
                 + 1;
             steps * token_mints.len()
         },
-        token_mints.len() / 2,
-        config.trading.min_profit_lamports,
-        config.performance.queue_max_age_ms,
+        config.performance.max_concurrent_quotes.max(1),
     );
 
     loop {
