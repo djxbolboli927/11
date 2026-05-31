@@ -23,7 +23,7 @@
 //! (REST first, gRPC fallback when REST limiter is empty).
 
 use anyhow::{anyhow, Context, Result};
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
@@ -144,6 +144,7 @@ impl JitoGrpcClient {
             .with_context(|| format!("invalid Jito gRPC endpoint {endpoint}"))?
             .tls_config(tls)
             .context("failed to configure TLS for Jito gRPC")?
+            .timeout(Duration::from_secs(1))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Duration::from_secs(20))
             .keep_alive_while_idle(true)
@@ -206,20 +207,15 @@ impl JitoGrpcClient {
     pub async fn send_bundle(&self, tx: &VersionedTransaction) -> Result<String> {
         let tx_bytes = bincode::serialize(tx).context("failed to serialize transaction")?;
 
-        let futures: Vec<_> = self
-            .regions
-            .iter()
-            .map(|r| {
-                let region = r.clone();
-                let tx_bytes = tx_bytes.clone();
-                async move { send_to_region(&region, tx_bytes).await }
-            })
-            .collect();
-
-        let results = join_all(futures).await;
+        let mut futures = FuturesUnordered::new();
+        for region in &self.regions {
+            let region = region.clone();
+            let tx_bytes = tx_bytes.clone();
+            futures.push(async move { send_to_region(&region, tx_bytes).await });
+        }
 
         let mut last_err = None;
-        for result in results {
+        while let Some(result) = futures.next().await {
             match result {
                 Ok(uuid) => return Ok(uuid),
                 Err(e) => last_err = Some(e),
@@ -251,9 +247,9 @@ async fn send_to_region(region: &Region, tx_bytes: Vec<u8>) -> Result<String> {
         req.metadata_mut().insert("authorization", auth_value);
     }
 
-    let resp = client
-        .send_bundle(req)
+    let resp = tokio::time::timeout(Duration::from_secs(1), client.send_bundle(req))
         .await
+        .with_context(|| format!("Jito gRPC SendBundle timed out at {}", region.endpoint))?
         .with_context(|| format!("Jito gRPC SendBundle failed at {}", region.endpoint))?;
     let uuid = resp.into_inner().uuid;
     debug!(endpoint = %region.endpoint, uuid = %uuid, "gRPC bundle accepted");
