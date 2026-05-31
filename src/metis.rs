@@ -78,6 +78,22 @@ pub struct AccountMeta {
     pub is_writable: bool,
 }
 
+/// Why a /swap-instructions call failed. Lets the caller break down the
+/// (often large) swap_ix_fail count by root cause instead of one opaque total.
+#[derive(Debug, Clone, Copy)]
+pub enum SwapIxError {
+    /// Request exceeded the client timeout (quote_timeout_ms). Most common when
+    /// Metis is overwhelmed and can't build the circular instruction in time.
+    Timeout,
+    /// Metis returned a non-2xx status — it could not route/build this quote
+    /// (e.g. 400 "no route", 422, 500). A genuine rejection, not a stall.
+    Http(u16),
+    /// Connection-level failure (TCP/TLS reset, pool exhausted, etc.).
+    Network,
+    /// 2xx received but the body could not be parsed as SwapInstructionsResponse.
+    Parse,
+}
+
 impl MetisClient {
     pub fn new(base_url: &str, timeout_ms: u64) -> Self {
         let http = Client::builder()
@@ -213,8 +229,11 @@ impl MetisClient {
         &self,
         user_pubkey: &str,
         quote_response: &QuoteResponse,
-    ) -> Result<SwapInstructionsResponse> {
-        let quote_value = serde_json::to_value(quote_response)?;
+    ) -> std::result::Result<SwapInstructionsResponse, SwapIxError> {
+        let quote_value = match serde_json::to_value(quote_response) {
+            Ok(v) => v,
+            Err(_) => return Err(SwapIxError::Parse),
+        };
 
         let body = SwapInstructionsRequest {
             user_public_key: user_pubkey.to_string(),
@@ -227,24 +246,26 @@ impl MetisClient {
         };
 
         let url = format!("{}/swap-instructions", self.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .context("swap-instructions request failed")?;
+        let resp = match self.http.post(&url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // Distinguish a client-timeout (Metis too slow) from a
+                // connection-level failure so the funnel can show which one.
+                return Err(if e.is_timeout() {
+                    SwapIxError::Timeout
+                } else {
+                    SwapIxError::Network
+                });
+            }
+        };
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("swap-instructions failed: {} -- {}", status, body);
+            return Err(SwapIxError::Http(resp.status().as_u16()));
         }
 
-        let swap_ixs: SwapInstructionsResponse = resp
-            .json()
-            .await
-            .context("failed to parse swap-instructions response")?;
-        Ok(swap_ixs)
+        match resp.json::<SwapInstructionsResponse>().await {
+            Ok(swap_ixs) => Ok(swap_ixs),
+            Err(_) => Err(SwapIxError::Parse),
+        }
     }
 }

@@ -14,8 +14,17 @@ pub struct Metrics {
     pub metis_resp_ok: AtomicU64,
 
     // ── Stage 1.5: swap_instructions + queue entry ────────────────────────────
-    /// /swap-instructions returned an error (pre-queue drop — never enters LIFO)
+    /// /swap-instructions returned an error (pre-queue drop — never enters LIFO).
+    /// Equals the sum of the four breakdown counters below.
     pub swap_ix_failed: AtomicU64,
+    /// swap_ix_fail breakdown: request exceeded quote_timeout_ms (Metis too slow).
+    pub swap_ix_timeout: AtomicU64,
+    /// swap_ix_fail breakdown: Metis returned non-2xx (no route / rejected quote).
+    pub swap_ix_http: AtomicU64,
+    /// swap_ix_fail breakdown: connection-level failure (reset, pool exhausted).
+    pub swap_ix_network: AtomicU64,
+    /// swap_ix_fail breakdown: 2xx body could not be parsed.
+    pub swap_ix_parse: AtomicU64,
     /// Items successfully pushed into the LIFO queue (= profitable - swap_ix_fail)
     pub queue_in: AtomicU64,
     /// Current LIFO queue depth (gauge: +1 on push, -1 on pop; read with load)
@@ -69,6 +78,10 @@ impl Metrics {
             metis_resp_total: AtomicU64::new(0),
             metis_resp_ok: AtomicU64::new(0),
             swap_ix_failed: AtomicU64::new(0),
+            swap_ix_timeout: AtomicU64::new(0),
+            swap_ix_http: AtomicU64::new(0),
+            swap_ix_network: AtomicU64::new(0),
+            swap_ix_parse: AtomicU64::new(0),
             queue_in: AtomicU64::new(0),
             queue_depth: AtomicI64::new(0),
             dropped_stale: AtomicU64::new(0),
@@ -94,8 +107,9 @@ impl Metrics {
     ///
     /// Pipeline:
     ///   profitable → [swap_ix_fail?] → QUEUE → [stale?] → TX build → [rate_lim?] → Jito
-    pub fn spawn_reporter(self: &Arc<Self>) {
+    pub fn spawn_reporter(self: &Arc<Self>, queue_max_age_ms: u64) {
         let m = self.clone();
+        let ttl_secs = queue_max_age_ms as f64 / 1000.0;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(WINDOW_SECS));
             interval.tick().await; // discard the immediate first tick
@@ -108,6 +122,10 @@ impl Metrics {
                 let routes    = m.metis_resp_total.swap(0, Ordering::Relaxed);
                 let profit    = m.metis_resp_ok.swap(0, Ordering::Relaxed);
                 let swap_fail = m.swap_ix_failed.swap(0, Ordering::Relaxed);
+                let sf_to     = m.swap_ix_timeout.swap(0, Ordering::Relaxed);
+                let sf_http   = m.swap_ix_http.swap(0, Ordering::Relaxed);
+                let sf_net    = m.swap_ix_network.swap(0, Ordering::Relaxed);
+                let sf_parse  = m.swap_ix_parse.swap(0, Ordering::Relaxed);
                 let q_in      = m.queue_in.swap(0, Ordering::Relaxed);
                 let stale     = m.dropped_stale.swap(0, Ordering::Relaxed);
                 let build     = m.tx_build_failed.swap(0, Ordering::Relaxed);
@@ -136,10 +154,10 @@ impl Metrics {
                 eprintln!(
                     "[{WINDOW_SECS}s] \
 metis_sent={sent} routes={routes} profitable={profit}\n  \
-PRE-QUEUE : swap_ix_fail={swap_fail} -> queue_in={q_in}  (depth_now={depth})\n  \
-IN-QUEUE  : stale={stale} (ONLY drop reason: waited >2s for a send slot)\n  \
+PRE-QUEUE : swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
+IN-QUEUE  : stale={stale} (ONLY drop reason: waited >{ttl_secs}s for a send slot)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
-JITO      : rate_requeued={requeued} (waiting in queue, NOT dropped)  send_fail={jfail}  sent={jito}\n  \
+JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued} (distinct tx that queued for a slot, NOT dropped)\n  \
 CACHE     : routes_total={c_total}  new={c_new}  hit={c_hit}  miss={c_miss}  composer_built={c_built}  match={c_match}  mismatch={c_mismat}"
                 );
             }

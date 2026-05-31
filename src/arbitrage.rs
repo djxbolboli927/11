@@ -113,6 +113,11 @@ struct ReadyInstruction {
     swap_ixs: SwapInstructionsResponse,
     hop_count: usize,
     arrived_at: Instant,
+    /// True once this item has been requeued at least once for a Jito slot.
+    /// Used so the rate_requeued metric counts DISTINCT waiting transactions
+    /// rather than every 20ms poll (which inflated the number into the tens of
+    /// thousands). Bounded by queue_in.
+    waited_for_slot: bool,
 }
 
 // ─── Shared context ───────────────────────────────────────────────────────────
@@ -279,7 +284,7 @@ pub fn spawn_workers(
                 sem_c.acquire().await.unwrap().forget();
 
                 let item = lifo_c.lock().unwrap().pop();
-                let item = match item {
+                let mut item = match item {
                     Some(i) => {
                         met_c.queue_depth.fetch_sub(1, Ordering::Relaxed);
                         i
@@ -313,7 +318,14 @@ pub fn spawn_workers(
                 {
                     true
                 } else {
-                    met_c.rate_requeued.fetch_add(1, Ordering::Relaxed);
+                    // Both limiters full — keep the item in the queue. Count the
+                    // metric only the FIRST time an item waits, so rate_requeued
+                    // reflects distinct transactions that queued for a slot (not
+                    // every poll). It can never exceed queue_in.
+                    if !item.waited_for_slot {
+                        item.waited_for_slot = true;
+                        met_c.rate_requeued.fetch_add(1, Ordering::Relaxed);
+                    }
                     lifo_c.lock().unwrap().push(item);
                     met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
                     sem_c.add_permits(1);
@@ -492,9 +504,24 @@ pub async fn scan_all_tokens(
             let swap_ixs =
                 match ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged).await {
                     Ok(s) => s,
-                    Err(_) => {
+                    Err(e) => {
                         met_c.swap_ix_failed.fetch_add(1, Ordering::Relaxed);
                         met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                        // Break the failure down by root cause.
+                        match e {
+                            crate::metis::SwapIxError::Timeout => {
+                                met_c.swap_ix_timeout.fetch_add(1, Ordering::Relaxed);
+                            }
+                            crate::metis::SwapIxError::Http(_) => {
+                                met_c.swap_ix_http.fetch_add(1, Ordering::Relaxed);
+                            }
+                            crate::metis::SwapIxError::Network => {
+                                met_c.swap_ix_network.fetch_add(1, Ordering::Relaxed);
+                            }
+                            crate::metis::SwapIxError::Parse => {
+                                met_c.swap_ix_parse.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         return;
                     }
                 };
@@ -525,6 +552,7 @@ pub async fn scan_all_tokens(
                 swap_ixs,
                 hop_count,
                 arrived_at: Instant::now(),
+                waited_for_slot: false,
             };
             lifo_c.lock().unwrap().push(item);
             met_c.queue_in.fetch_add(1, Ordering::Relaxed);

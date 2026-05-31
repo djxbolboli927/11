@@ -139,6 +139,7 @@ impl InstructionCache {
 
         let cache_dir = std::path::Path::new("/root/c/cache");
         std::fs::create_dir_all(cache_dir.join("routes"))?;
+        std::fs::create_dir_all(cache_dir.join("hops"))?;
         std::fs::create_dir_all(cache_dir.join("index"))?;
 
         // routes/hot_routes.json — full response keyed by hex signature.
@@ -148,6 +149,30 @@ impl InstructionCache {
             cache_dir.join("routes/hot_routes.json"),
             serde_json::to_string_pretty(&route_map)?,
         )?;
+
+        // hops/<dex>.json — one file per DEX, listing every route that touches
+        // that DEX (full instructions included so each DEX can be inspected in
+        // isolation). A route appears in every DEX file it uses.
+        let mut by_dex: HashMap<String, Vec<&CachedRoute>> = HashMap::new();
+        for r in &snapshot {
+            let mut seen: Vec<&str> = Vec::new();
+            for dex in &r.dex_path {
+                if seen.contains(&dex.as_str()) {
+                    continue; // don't list the same route twice in one DEX file
+                }
+                seen.push(dex.as_str());
+                by_dex.entry(dex.clone()).or_default().push(r);
+            }
+        }
+        for (dex, routes) in &by_dex {
+            let map: HashMap<&str, &CachedRoute> =
+                routes.iter().map(|r| (r.sig.as_str(), *r)).collect();
+            let fname = format!("{}.json", sanitize_filename(dex));
+            std::fs::write(
+                cache_dir.join("hops").join(fname),
+                serde_json::to_string_pretty(&map)?,
+            )?;
+        }
 
         // index/template_index.json — lightweight summary (no instruction bytes).
         let index: HashMap<&str, serde_json::Value> = snapshot
@@ -169,6 +194,27 @@ impl InstructionCache {
         )?;
 
         Ok(())
+    }
+
+    /// Load a previously-flushed hot_routes.json back into RAM at startup so the
+    /// cache survives restarts. Returns the number of routes loaded (0 if the
+    /// file is missing — a fresh start). Best-effort: a corrupt file is ignored.
+    pub fn load_from_disk(&self) -> usize {
+        let path = std::path::Path::new("/root/c/cache/routes/hot_routes.json");
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let parsed: HashMap<String, CachedRoute> = match serde_json::from_str(&content) {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+        let mut inner = self.inner.write().unwrap();
+        for route in parsed.into_values() {
+            let sig = u64::from_str_radix(&route.sig, 16).unwrap_or(0);
+            inner.routes.insert(sig, route);
+        }
+        inner.routes.len()
     }
 }
 
@@ -234,6 +280,14 @@ fn fnv1a(s: &str) -> u64 {
         h = h.wrapping_mul(PRIME);
     }
     h
+}
+
+/// Make a DEX label safe to use as a filename (DEX labels may contain spaces,
+/// slashes, etc.). Replaces anything that isn't alphanumeric/-/_ with '_'.
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
 }
 
 fn unix_now() -> u64 {
