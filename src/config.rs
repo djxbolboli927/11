@@ -208,7 +208,7 @@ fn default_calc_workers() -> usize {
 }
 
 fn default_queue_max_age_ms() -> u64 {
-    2000
+    5000
 }
 
 impl Config {
