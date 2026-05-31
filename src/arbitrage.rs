@@ -17,6 +17,7 @@ use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
 use crate::metrics::Metrics;
 use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS, PMM_PROGRAM_IDS};
 use crate::rate_limiter::RateLimiter;
+use crate::token_metrics::TokenMetrics;
 use crate::tokens::WSOL_MINT;
 use crate::transaction;
 
@@ -141,24 +142,71 @@ async fn quote_check(
     amount: u64,
     min_profit_lamports: u64,
     metrics: &Metrics,
+    token_metrics: &TokenMetrics,
 ) -> Option<QuotePair> {
-    metrics.metis_req_sent.fetch_add(2, Ordering::Relaxed); // quote1 + quote2
+    // 2 HTTP requests per scan (quote1 + quote2).
+    metrics.metis_req_sent.fetch_add(2, Ordering::Relaxed);
+    let ts = token_metrics.get(token_mint);
+    if let Some(ts) = ts {
+        ts.q_sent.fetch_add(2, Ordering::Relaxed);
+    }
 
-    let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
-    let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
+    // quote1: WSOL → token
+    let quote1 = match metis.get_quote(WSOL_MINT, token_mint, amount).await {
+        Ok(q) => q,
+        Err(_) => {
+            if let Some(ts) = ts {
+                ts.route_fail.fetch_add(1, Ordering::Relaxed);
+            }
+            return None;
+        }
+    };
 
-    let quote2 = metis.get_quote(token_mint, WSOL_MINT, token_amount).await.ok()?;
+    let token_amount: u64 = match quote1.out_amount.parse::<u64>().ok().filter(|&v| v > 0) {
+        Some(v) => v,
+        None => {
+            if let Some(ts) = ts {
+                ts.route_fail.fetch_add(1, Ordering::Relaxed);
+            }
+            return None;
+        }
+    };
+
+    // quote2: token → WSOL
+    let quote2 = match metis.get_quote(token_mint, WSOL_MINT, token_amount).await {
+        Ok(q) => q,
+        Err(_) => {
+            if let Some(ts) = ts {
+                ts.route_fail.fetch_add(1, Ordering::Relaxed);
+            }
+            return None;
+        }
+    };
+
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
-
     metrics.metis_resp_total.fetch_add(1, Ordering::Relaxed);
+    if let Some(ts) = ts {
+        ts.route_ok.fetch_add(1, Ordering::Relaxed);
+    }
 
     let stage1_threshold = amount.saturating_add(min_profit_lamports);
     if output_wsol <= stage1_threshold {
+        if let Some(ts) = ts {
+            ts.not_profitable.fetch_add(1, Ordering::Relaxed);
+        }
         return None;
     }
 
     if route_uses_forbidden_dex(&quote1) || route_uses_forbidden_dex(&quote2) {
+        if let Some(ts) = ts {
+            ts.not_profitable.fetch_add(1, Ordering::Relaxed);
+        }
         return None;
+    }
+
+    // Profitable.
+    if let Some(ts) = ts {
+        ts.profitable.fetch_add(1, Ordering::Relaxed);
     }
 
     let is_pmm = route_uses_pmm(&quote1) || route_uses_pmm(&quote2);
@@ -333,6 +381,7 @@ pub async fn scan_all_tokens(
     ctx: &Arc<CalcCtx>,
     pipeline: &Pipeline,
     metrics: &Arc<Metrics>,
+    token_metrics: &Arc<TokenMetrics>,
 ) -> Result<()> {
     let min_lamports = (config.trading.min_amount_sol * LAMPORTS_PER_SOL) as u64;
     let max_lamports = (config.trading.max_amount_sol * LAMPORTS_PER_SOL) as u64;
@@ -358,10 +407,11 @@ pub async fn scan_all_tokens(
 
     let metis_ref: &MetisClient = &ctx.metis;
     let met_ref: &Metrics = metrics;
+    let tok_met_ref: &TokenMetrics = token_metrics;
 
     let mut opps = stream::iter(all_pairs)
         .map(move |(amt, tok)| async move {
-            quote_check(metis_ref, &tok, amt, min_profit_lamports, met_ref).await
+            quote_check(metis_ref, &tok, amt, min_profit_lamports, met_ref, tok_met_ref).await
         })
         .buffer_unordered(max_concurrent);
 

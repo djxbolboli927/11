@@ -11,6 +11,7 @@ mod metis;
 mod metrics;
 mod program_registry;
 mod rate_limiter;
+mod token_metrics;
 mod tokens;
 mod transaction;
 mod wallet;
@@ -82,6 +83,9 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let metrics = metrics::Metrics::new();
     metrics.spawn_reporter();
+
+    let token_metrics = token_metrics::TokenMetrics::new(&token_mints);
+    token_metrics.spawn_reporter();
 
     let blockhash_cache = Arc::new(BlockhashCache::new(rpc_client.clone()));
 
@@ -221,6 +225,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             &calc_ctx,
             &pipeline,
             &metrics,
+            &token_metrics,
         )
         .await
         {
