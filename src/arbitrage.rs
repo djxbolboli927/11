@@ -494,20 +494,108 @@ pub async fn scan_all_tokens(
         let sem_c = pipeline.lifo_sem.clone();
         let hop_count = pair.hop_count;
 
-        metrics.metis_req_sent.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            // Compute route signature before the Metis call so we can lookup and
-            // record in O(1) on the hot path — the actual hash is cheap (FNV-1a).
+            // Extract route signature and exact amount before any IO.
             let route_sig = InstructionCache::compute_signature(&merged.route_plan);
-            let prior = ctx_c.instruction_cache.lookup(route_sig);
+            let request_amount = merged.in_amount.parse::<u64>().unwrap_or(0);
+            let dex_path = instruction_cache::extract_dex_labels(&merged.route_plan);
+            let sig_hex = format!("{route_sig:016x}");
 
-            let swap_ixs =
-                match ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged).await {
+            // ── Cache hit: serve from RAM, compare in background ────────────
+            let t_lookup = std::time::Instant::now();
+            let cached = ctx_c.instruction_cache.lookup(route_sig, request_amount);
+            let lookup_us = t_lookup.elapsed().as_micros() as u64;
+
+            if let Some(cached_entry) = cached {
+                // Exact (route, amount) match found — push to queue immediately.
+                met_c.cache_served.fetch_add(1, Ordering::Relaxed);
+                met_c.cache_build_us_total.fetch_add(lookup_us, Ordering::Relaxed);
+                met_c.cache_build_samples.fetch_add(1, Ordering::Relaxed);
+
+                let swap_ixs_for_queue = cached_entry.swap_ixs.clone();
+                let item = ReadyInstruction {
+                    swap_ixs: swap_ixs_for_queue,
+                    hop_count,
+                    arrived_at: std::time::Instant::now(),
+                    waited_for_slot: false,
+                };
+                lifo_c.lock().unwrap().push(item);
+                met_c.queue_in.fetch_add(1, Ordering::Relaxed);
+                met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
+                sem_c.add_permits(1);
+
+                // Background: fetch from Metis for byte comparison + cache refresh.
+                // Do NOT push the Metis result to the queue — we already sent cached.
+                let ctx_bg = ctx_c.clone();
+                let met_bg = met_c.clone();
+                let cache_bg = ctx_c.instruction_cache.clone();
+                let dex_path_bg = dex_path;
+                let sig_hex_bg = sig_hex;
+                let cached_ixs = cached_entry.swap_ixs;
+
+                tokio::spawn(async move {
+                    met_bg.metis_req_sent.fetch_add(1, Ordering::Relaxed);
+                    let t_metis = std::time::Instant::now();
+                    let fresh = match ctx_bg
+                        .metis
+                        .get_swap_instructions(&ctx_bg.user_pubkey, &merged)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            met_bg.swap_ix_failed.fetch_add(1, Ordering::Relaxed);
+                            match e {
+                                crate::metis::SwapIxError::Timeout => {
+                                    met_bg.swap_ix_timeout.fetch_add(1, Ordering::Relaxed);
+                                }
+                                crate::metis::SwapIxError::Http(_) => {
+                                    met_bg.swap_ix_http.fetch_add(1, Ordering::Relaxed);
+                                }
+                                crate::metis::SwapIxError::Network => {
+                                    met_bg.swap_ix_network.fetch_add(1, Ordering::Relaxed);
+                                }
+                                crate::metis::SwapIxError::Parse => {
+                                    met_bg.swap_ix_parse.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            return;
+                        }
+                    };
+                    let fetch_ms = t_metis.elapsed().as_millis() as u64;
+                    met_bg.metis_fetch_ms_total.fetch_add(fetch_ms, Ordering::Relaxed);
+                    met_bg.metis_fetch_samples.fetch_add(1, Ordering::Relaxed);
+
+                    // Byte-level comparison.
+                    if instruction_cache::instructions_match_bytewise(&cached_ixs, &fresh) {
+                        met_bg.byte_exact.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        met_bg.byte_diff.fetch_add(1, Ordering::Relaxed);
+                        let diff =
+                            instruction_cache::diff_description(&cached_ixs, &fresh);
+                        instruction_cache::append_mismatch_log(
+                            &sig_hex_bg,
+                            request_amount,
+                            &dex_path_bg,
+                            &diff,
+                        );
+                    }
+
+                    // Refresh cache with the latest Metis response.
+                    cache_bg.record(route_sig, request_amount, dex_path_bg, fresh);
+                });
+            } else {
+                // ── Cache miss: call Metis, store result, push to queue ──────
+                met_c.metis_req_sent.fetch_add(1, Ordering::Relaxed);
+                let t_metis = std::time::Instant::now();
+                let swap_ixs = match ctx_c
+                    .metis
+                    .get_swap_instructions(&ctx_c.user_pubkey, &merged)
+                    .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         met_c.swap_ix_failed.fetch_add(1, Ordering::Relaxed);
                         met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
-                        // Break the failure down by root cause.
                         match e {
                             crate::metis::SwapIxError::Timeout => {
                                 met_c.swap_ix_timeout.fetch_add(1, Ordering::Relaxed);
@@ -525,39 +613,29 @@ pub async fn scan_all_tokens(
                         return;
                     }
                 };
+                let fetch_ms = t_metis.elapsed().as_millis() as u64;
+                met_c.metis_fetch_ms_total.fetch_add(fetch_ms, Ordering::Relaxed);
+                met_c.metis_fetch_samples.fetch_add(1, Ordering::Relaxed);
 
-            // Update instruction cache and run shadow comparison.
-            let dex_path = instruction_cache::extract_dex_labels(&merged.route_plan);
-            let is_new = ctx_c.instruction_cache.record(route_sig, dex_path, swap_ixs.clone());
-            if is_new {
-                met_c.cache_saved_new.fetch_add(1, Ordering::Relaxed);
-                met_c.cache_miss.fetch_add(1, Ordering::Relaxed);
-                met_c.cache_routes_stored.fetch_add(1, Ordering::Relaxed);
-            } else {
-                met_c.cache_hit.fetch_add(1, Ordering::Relaxed);
-                if let Some(cached) = prior {
-                    met_c.composer_built.fetch_add(1, Ordering::Relaxed);
-                    if instruction_cache::instructions_match_structurally(
-                        &cached.swap_ixs,
-                        &swap_ixs,
-                    ) {
-                        met_c.composer_match.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        met_c.composer_mismatch.fetch_add(1, Ordering::Relaxed);
-                    }
+                let is_new = ctx_c
+                    .instruction_cache
+                    .record(route_sig, request_amount, dex_path, swap_ixs.clone());
+                if is_new {
+                    met_c.cache_saved_new.fetch_add(1, Ordering::Relaxed);
                 }
-            }
+                met_c.metis_served.fetch_add(1, Ordering::Relaxed);
 
-            let item = ReadyInstruction {
-                swap_ixs,
-                hop_count,
-                arrived_at: Instant::now(),
-                waited_for_slot: false,
-            };
-            lifo_c.lock().unwrap().push(item);
-            met_c.queue_in.fetch_add(1, Ordering::Relaxed);
-            met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
-            sem_c.add_permits(1);
+                let item = ReadyInstruction {
+                    swap_ixs,
+                    hop_count,
+                    arrived_at: std::time::Instant::now(),
+                    waited_for_slot: false,
+                };
+                lifo_c.lock().unwrap().push(item);
+                met_c.queue_in.fetch_add(1, Ordering::Relaxed);
+                met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
+                sem_c.add_permits(1);
+            }
         });
     }
 

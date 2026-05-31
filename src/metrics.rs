@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use crate::instruction_cache::InstructionCache;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,61 +15,68 @@ pub struct Metrics {
     pub metis_resp_ok: AtomicU64,
 
     // ── Stage 1.5: swap_instructions + queue entry ────────────────────────────
-    /// /swap-instructions returned an error (pre-queue drop — never enters LIFO).
-    /// Equals the sum of the four breakdown counters below.
+    /// /swap-instructions returned an error (pre-queue drop). Sum of four below.
     pub swap_ix_failed: AtomicU64,
-    /// swap_ix_fail breakdown: request exceeded quote_timeout_ms (Metis too slow).
+    /// Breakdown: request exceeded quote_timeout_ms (Metis too slow).
     pub swap_ix_timeout: AtomicU64,
-    /// swap_ix_fail breakdown: Metis returned non-2xx (no route / rejected quote).
+    /// Breakdown: Metis returned non-2xx (no route / rejected merged quote).
     pub swap_ix_http: AtomicU64,
-    /// swap_ix_fail breakdown: connection-level failure (reset, pool exhausted).
+    /// Breakdown: connection-level failure (TCP reset, pool exhausted, etc.).
     pub swap_ix_network: AtomicU64,
-    /// swap_ix_fail breakdown: 2xx body could not be parsed.
+    /// Breakdown: 2xx body could not be parsed as SwapInstructionsResponse.
     pub swap_ix_parse: AtomicU64,
-    /// Items successfully pushed into the LIFO queue (= profitable - swap_ix_fail)
+    /// Items pushed into the LIFO queue (profitable minus swap_ix_fail).
     pub queue_in: AtomicU64,
-    /// Current LIFO queue depth (gauge: +1 on push, -1 on pop; read with load)
+    /// Current LIFO queue depth (gauge: +1 push / -1 pop — use load, not swap).
     pub queue_depth: AtomicI64,
 
     // ── Stage 2: worker processing ────────────────────────────────────────────
-    /// Popped from queue but waited longer than queue_max_age_ms (in-queue drop)
+    /// Popped from queue but aged past queue_max_age_ms — dropped (only drop reason).
     pub dropped_stale: AtomicU64,
-    /// Transaction serialization / signing failed
+    /// Transaction serialization / signing failed.
     pub tx_build_failed: AtomicU64,
-    /// Built tx exceeds Solana's 1232-byte limit
+    /// Built tx exceeds Solana's 1232-byte limit.
     pub tx_too_large: AtomicU64,
-    /// Tx fully built and sized; attempted to claim a Jito rate-limit slot
+    /// Tx fully built and sized; proceeded to claim a Jito slot.
     pub calc_done: AtomicU64,
 
     // ── Stage 3: Jito send ────────────────────────────────────────────────────
-    /// Both REST and gRPC Jito limiters were full — item put BACK on the queue
-    /// (NOT dropped). Counts requeue events; one item may be requeued many times
-    /// while it waits for a 10/sec slot, until it sends or ages past the TTL.
+    /// Distinct txs that waited at least once for a Jito rate-limit slot
+    /// (bounded by queue_in — one count per tx, not per 20ms poll).
     pub rate_requeued: AtomicU64,
-    /// Claimed a slot but Jito API returned an error
+    /// Jito API returned an error after a slot was claimed.
     pub jito_send_failed: AtomicU64,
-    /// Bundle successfully accepted by Jito
+    /// Bundle successfully accepted by Jito.
     pub jito_sent: AtomicU64,
 
-    // ── Legacy aggregates (kept for compatibility) ────────────────────────────
+    // ── Legacy ────────────────────────────────────────────────────────────────
     pub dropped_busy: AtomicU64,
     pub tx_dropped: AtomicU64,
 
-    // ── Instruction cache / shadow composer ───────────────────────────────────
-    /// New routes added to the cache for the first time.
+    // ── Instruction cache ─────────────────────────────────────────────────────
+    /// New (route, amount) entries added to the cache for the first time.
     pub cache_saved_new: AtomicU64,
-    /// Route found in cache (seen before).
-    pub cache_hit: AtomicU64,
-    /// Route not in cache (first occurrence).
-    pub cache_miss: AtomicU64,
-    /// Shadow comparisons performed (cached entry existed).
-    pub composer_built: AtomicU64,
-    /// Shadow: cached and fresh instructions are structurally identical.
-    pub composer_match: AtomicU64,
-    /// Shadow: structural difference detected (program/accounts/data-length changed).
-    pub composer_mismatch: AtomicU64,
-    /// Running total of unique routes ever stored (gauge — never reset).
-    pub cache_routes_stored: AtomicUsize,
+
+    // ── Instruction serving: from RAM vs from Metis ───────────────────────────
+    /// Instructions served directly from RAM cache (bypassed Metis entirely).
+    pub cache_served: AtomicU64,
+    /// Microseconds spent on all cache-served instructions (for avg latency).
+    pub cache_build_us_total: AtomicU64,
+    /// Sample count for cache_build_us_total.
+    pub cache_build_samples: AtomicU64,
+
+    /// Instructions received from Metis and sent to the queue (cache miss path).
+    pub metis_served: AtomicU64,
+    /// Milliseconds spent waiting for all Metis responses (for avg latency).
+    pub metis_fetch_ms_total: AtomicU64,
+    /// Sample count for metis_fetch_ms_total.
+    pub metis_fetch_samples: AtomicU64,
+
+    // ── Shadow / byte comparison ──────────────────────────────────────────────
+    /// Cache hit + Metis background fetch + byte-for-byte identical result.
+    pub byte_exact: AtomicU64,
+    /// Cache hit + Metis background fetch + byte difference found (logged to file).
+    pub byte_diff: AtomicU64,
 }
 
 impl Metrics {
@@ -94,39 +102,46 @@ impl Metrics {
             dropped_busy: AtomicU64::new(0),
             tx_dropped: AtomicU64::new(0),
             cache_saved_new: AtomicU64::new(0),
-            cache_hit: AtomicU64::new(0),
-            cache_miss: AtomicU64::new(0),
-            composer_built: AtomicU64::new(0),
-            composer_match: AtomicU64::new(0),
-            composer_mismatch: AtomicU64::new(0),
-            cache_routes_stored: AtomicUsize::new(0),
+            cache_served: AtomicU64::new(0),
+            cache_build_us_total: AtomicU64::new(0),
+            cache_build_samples: AtomicU64::new(0),
+            metis_served: AtomicU64::new(0),
+            metis_fetch_ms_total: AtomicU64::new(0),
+            metis_fetch_samples: AtomicU64::new(0),
+            byte_exact: AtomicU64::new(0),
+            byte_diff: AtomicU64::new(0),
         })
     }
 
     /// Prints a funnel-style report every 30 s so every drop reason is visible.
-    ///
-    /// Pipeline:
-    ///   profitable → [swap_ix_fail?] → QUEUE → [stale?] → TX build → [rate_lim?] → Jito
-    pub fn spawn_reporter(self: &Arc<Self>, queue_max_age_ms: u64) {
+    pub fn spawn_reporter(
+        self: &Arc<Self>,
+        queue_max_age_ms: u64,
+        cache: Arc<InstructionCache>,
+    ) {
         let m = self.clone();
         let ttl_secs = queue_max_age_ms as f64 / 1000.0;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(WINDOW_SECS));
-            interval.tick().await; // discard the immediate first tick
+            interval.tick().await;
 
             loop {
                 interval.tick().await;
 
-                // Counters: swap and reset.
+                // ── Quoting ───────────────────────────────────────────────────
                 let sent      = m.metis_req_sent.swap(0, Ordering::Relaxed);
                 let routes    = m.metis_resp_total.swap(0, Ordering::Relaxed);
                 let profit    = m.metis_resp_ok.swap(0, Ordering::Relaxed);
+
+                // ── swap_instructions ────────────────────────────────────────
                 let swap_fail = m.swap_ix_failed.swap(0, Ordering::Relaxed);
                 let sf_to     = m.swap_ix_timeout.swap(0, Ordering::Relaxed);
                 let sf_http   = m.swap_ix_http.swap(0, Ordering::Relaxed);
                 let sf_net    = m.swap_ix_network.swap(0, Ordering::Relaxed);
                 let sf_parse  = m.swap_ix_parse.swap(0, Ordering::Relaxed);
                 let q_in      = m.queue_in.swap(0, Ordering::Relaxed);
+
+                // ── Worker / Jito ────────────────────────────────────────────
                 let stale     = m.dropped_stale.swap(0, Ordering::Relaxed);
                 let build     = m.tx_build_failed.swap(0, Ordering::Relaxed);
                 let too_big   = m.tx_too_large.swap(0, Ordering::Relaxed);
@@ -135,21 +150,32 @@ impl Metrics {
                 let jfail     = m.jito_send_failed.swap(0, Ordering::Relaxed);
                 let jito      = m.jito_sent.swap(0, Ordering::Relaxed);
 
-                // Cache / composer counters.
-                let c_new     = m.cache_saved_new.swap(0, Ordering::Relaxed);
-                let c_hit     = m.cache_hit.swap(0, Ordering::Relaxed);
-                let c_miss    = m.cache_miss.swap(0, Ordering::Relaxed);
-                let c_built   = m.composer_built.swap(0, Ordering::Relaxed);
-                let c_match   = m.composer_match.swap(0, Ordering::Relaxed);
-                let c_mismat  = m.composer_mismatch.swap(0, Ordering::Relaxed);
+                // ── Cache serving ────────────────────────────────────────────
+                let new_saved = m.cache_saved_new.swap(0, Ordering::Relaxed);
 
-                // Gauges: read without reset.
-                let depth     = m.queue_depth.load(Ordering::Relaxed);
-                let c_total   = m.cache_routes_stored.load(Ordering::Relaxed);
+                let cs        = m.cache_served.swap(0, Ordering::Relaxed);
+                let cs_us     = m.cache_build_us_total.swap(0, Ordering::Relaxed);
+                let cs_n      = m.cache_build_samples.swap(0, Ordering::Relaxed);
 
-                // Also drain legacy aggregates so they don't overflow.
+                let ms_srv    = m.metis_served.swap(0, Ordering::Relaxed);
+                let ms_ms     = m.metis_fetch_ms_total.swap(0, Ordering::Relaxed);
+                let ms_n      = m.metis_fetch_samples.swap(0, Ordering::Relaxed);
+
+                // ── Shadow comparison ────────────────────────────────────────
+                let b_exact   = m.byte_exact.swap(0, Ordering::Relaxed);
+                let b_diff    = m.byte_diff.swap(0, Ordering::Relaxed);
+
+                // ── Gauges (read without reset) ───────────────────────────────
+                let depth      = m.queue_depth.load(Ordering::Relaxed);
+                let c_routes   = cache.route_count();
+                let c_entries  = cache.entry_count();
+
+                // ── Drain legacy aggregates ───────────────────────────────────
                 let _ = m.tx_dropped.swap(0, Ordering::Relaxed);
                 let _ = m.dropped_busy.swap(0, Ordering::Relaxed);
+
+                let avg_cache_us = if cs_n > 0 { cs_us / cs_n } else { 0 };
+                let avg_metis_ms = if ms_n > 0 { ms_ms / ms_n } else { 0 };
 
                 eprintln!(
                     "[{WINDOW_SECS}s] \
@@ -157,8 +183,10 @@ metis_sent={sent} routes={routes} profitable={profit}\n  \
 PRE-QUEUE : swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
 IN-QUEUE  : stale={stale} (ONLY drop reason: waited >{ttl_secs}s for a send slot)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
-JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued} (distinct tx that queued for a slot, NOT dropped)\n  \
-CACHE     : routes_total={c_total}  new={c_new}  hit={c_hit}  miss={c_miss}  composer_built={c_built}  match={c_match}  mismatch={c_mismat}"
+JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \
+CACHE     : routes={c_routes} entries={c_entries} new_saved={new_saved}\n  \
+SERVING   : from_cache={cs} (avg={avg_cache_us}µs)  from_metis={ms_srv} (avg={avg_metis_ms}ms)\n  \
+SHADOW    : byte_exact={b_exact}  byte_diff={b_diff}  (diffs logged to /root/c/cache/mismatch_log.jsonl)"
                 );
             }
         });
