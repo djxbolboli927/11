@@ -108,13 +108,13 @@ impl MetisClient {
     ///   `bps: 10000` (instead of legacy `percent: 100`). When this QuoteResponse
     ///   is later sent to /swap-instructions, Metis builds a `route_v2` instruction
     ///   which costs fewer compute units and is what competing arb bots use.
-    /// NOTE: onlyDirectRoutes intentionally omitted. Add &onlyDirectRoutes=true
-    ///   to test if single-hop restriction improves swap_ix latency vs fewer profitable hits.
+    /// `only_direct`: when true, adds `&onlyDirectRoutes=true` (single-hop only).
     pub async fn get_quote(
         &self,
         input_mint: &str,
         output_mint: &str,
         amount_lamports: u64,
+        only_direct: bool,
     ) -> Result<QuoteResponse> {
         let url = format!(
             "{}/quote?inputMint={}&outputMint={}&amount={}\
@@ -123,8 +123,9 @@ impl MetisClient {
              &swapMode=ExactIn\
              &forJitoBundle=true\
              &restrictIntermediateTokens=false\
-             &instructionVersion=V2",
-            self.base_url, input_mint, output_mint, amount_lamports
+             &instructionVersion=V2{}",
+            self.base_url, input_mint, output_mint, amount_lamports,
+            if only_direct { "&onlyDirectRoutes=true" } else { "" }
         );
 
         let resp = self

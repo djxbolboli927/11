@@ -100,6 +100,15 @@ struct QuotePair {
     is_pmm: bool,
 }
 
+// Raw result of one complete (q1 + q2) route attempt.
+struct RawPair {
+    quote1: QuoteResponse,
+    quote2: QuoteResponse,
+    output_wsol: u64,
+    hop_count: usize,
+    is_pmm: bool,
+}
+
 // ─── LIFO queue item ──────────────────────────────────────────────────────────
 
 struct ReadyInstruction {
@@ -136,6 +145,37 @@ pub struct Pipeline {
 
 // ─── Stage 1: Quote scanner ───────────────────────────────────────────────────
 
+/// Run one complete (q1 → q2) round-trip for the given route mode.
+/// Returns None on any failure (network error, zero amount, etc.).
+async fn run_quote_pair(
+    metis: &MetisClient,
+    token_mint: &str,
+    amount: u64,
+    only_direct: bool,
+) -> Option<RawPair> {
+    let quote1 = metis
+        .get_quote(WSOL_MINT, token_mint, amount, only_direct)
+        .await
+        .ok()?;
+    let token_amount: u64 = quote1.out_amount.parse::<u64>().ok().filter(|&v| v > 0)?;
+    let quote2 = metis
+        .get_quote(token_mint, WSOL_MINT, token_amount, only_direct)
+        .await
+        .ok()?;
+    let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
+    let n1 = quote1.route_plan.as_array().map(|a| a.len()).unwrap_or(1);
+    let n2 = quote2.route_plan.as_array().map(|a| a.len()).unwrap_or(1);
+    Some(RawPair {
+        is_pmm: route_uses_pmm(&quote1) || route_uses_pmm(&quote2),
+        quote1,
+        quote2,
+        output_wsol,
+        hop_count: n1 + n2,
+    })
+}
+
+/// Run free-route and direct-route pairs simultaneously; return the most
+/// profitable result, or None if neither mode beats `min_profit_lamports`.
 async fn quote_check(
     metis: &MetisClient,
     token_mint: &str,
@@ -144,94 +184,76 @@ async fn quote_check(
     metrics: &Metrics,
     token_metrics: &TokenMetrics,
 ) -> Option<QuotePair> {
-    // 2 HTTP requests per scan (quote1 + quote2).
-    metrics.metis_req_sent.fetch_add(2, Ordering::Relaxed);
+    // 4 HTTP requests planned: (q1 + q2) × (free + direct).
+    metrics.metis_req_sent.fetch_add(4, Ordering::Relaxed);
     let ts = token_metrics.get(token_mint);
     if let Some(ts) = ts {
-        ts.q_sent.fetch_add(2, Ordering::Relaxed);
+        ts.q_sent.fetch_add(4, Ordering::Relaxed);
     }
 
-    // quote1: WSOL → token
-    let quote1 = match metis.get_quote(WSOL_MINT, token_mint, amount).await {
-        Ok(q) => q,
-        Err(_) => {
-            if let Some(ts) = ts {
-                ts.route_fail.fetch_add(1, Ordering::Relaxed);
-            }
-            return None;
-        }
-    };
+    // Fire both route modes simultaneously.
+    let (free, direct) = tokio::join!(
+        run_quote_pair(metis, token_mint, amount, false),
+        run_quote_pair(metis, token_mint, amount, true),
+    );
 
-    let token_amount: u64 = match quote1.out_amount.parse::<u64>().ok().filter(|&v| v > 0) {
-        Some(v) => v,
-        None => {
-            if let Some(ts) = ts {
-                ts.route_fail.fetch_add(1, Ordering::Relaxed);
-            }
-            return None;
-        }
-    };
-
-    // quote2: token → WSOL
-    let quote2 = match metis.get_quote(token_mint, WSOL_MINT, token_amount).await {
-        Ok(q) => q,
-        Err(_) => {
-            if let Some(ts) = ts {
-                ts.route_fail.fetch_add(1, Ordering::Relaxed);
-            }
-            return None;
-        }
-    };
-
-    let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
-    metrics.metis_resp_total.fetch_add(1, Ordering::Relaxed);
+    // Track per-token route_ok / route_fail.
+    let ok = free.is_some() as u64 + direct.is_some() as u64;
+    let fail = 2u64 - ok;
     if let Some(ts) = ts {
-        ts.route_ok.fetch_add(1, Ordering::Relaxed);
+        if ok > 0 {
+            ts.route_ok.fetch_add(ok, Ordering::Relaxed);
+        }
+        if fail > 0 {
+            ts.route_fail.fetch_add(fail, Ordering::Relaxed);
+        }
     }
+    metrics.metis_resp_total.fetch_add(ok, Ordering::Relaxed);
 
     let stage1_threshold = amount.saturating_add(min_profit_lamports);
-    if output_wsol <= stage1_threshold {
-        if let Some(ts) = ts {
-            ts.not_profitable.fetch_add(1, Ordering::Relaxed);
-        }
-        return None;
-    }
-
-    if route_uses_forbidden_dex(&quote1) || route_uses_forbidden_dex(&quote2) {
-        if let Some(ts) = ts {
-            ts.not_profitable.fetch_add(1, Ordering::Relaxed);
-        }
-        return None;
-    }
-
-    // Profitable.
-    if let Some(ts) = ts {
-        ts.profitable.fetch_add(1, Ordering::Relaxed);
-    }
-
-    let is_pmm = route_uses_pmm(&quote1) || route_uses_pmm(&quote2);
-    let hop_count = {
-        let n1 = quote1.route_plan.as_array().map(|a| a.len()).unwrap_or(1);
-        let n2 = quote2.route_plan.as_array().map(|a| a.len()).unwrap_or(1);
-        n1 + n2
-    };
-
-    metrics.metis_resp_ok.fetch_add(1, Ordering::Relaxed);
-
     let on_chain_floor = amount
         .saturating_add(JITO_TIP_LAMPORTS)
         .saturating_add(NETWORK_FEE_LAMPORTS);
-    let net_profit = output_wsol as i64 - on_chain_floor as i64;
-    Some(QuotePair {
-        token_mint: token_mint.to_string(),
-        amount,
-        output_wsol,
-        net_profit,
-        quote1,
-        quote2,
-        hop_count,
-        is_pmm,
-    })
+
+    // Evaluate both modes; keep the most profitable one.
+    let mut best: Option<QuotePair> = None;
+    for raw in [free, direct].into_iter().flatten() {
+        if raw.output_wsol <= stage1_threshold
+            || route_uses_forbidden_dex(&raw.quote1)
+            || route_uses_forbidden_dex(&raw.quote2)
+        {
+            continue;
+        }
+        let net_profit = raw.output_wsol as i64 - on_chain_floor as i64;
+        let candidate = QuotePair {
+            token_mint: token_mint.to_string(),
+            amount,
+            output_wsol: raw.output_wsol,
+            net_profit,
+            quote1: raw.quote1,
+            quote2: raw.quote2,
+            hop_count: raw.hop_count,
+            is_pmm: raw.is_pmm,
+        };
+        best = Some(match best.take() {
+            None => candidate,
+            Some(prev) if candidate.net_profit > prev.net_profit => candidate,
+            Some(prev) => prev,
+        });
+    }
+
+    if best.is_some() {
+        if let Some(ts) = ts {
+            ts.profitable.fetch_add(1, Ordering::Relaxed);
+        }
+        metrics.metis_resp_ok.fetch_add(1, Ordering::Relaxed);
+    } else if let Some(ts) = ts {
+        if ok > 0 {
+            ts.not_profitable.fetch_add(ok, Ordering::Relaxed);
+        }
+    }
+
+    best
 }
 
 // ─── Worker pool ──────────────────────────────────────────────────────────────

@@ -63,7 +63,7 @@ max_concurrent_quotes = 256
 calc_workers = 64
 # حداکثر سن (ms) یک نتیجه swap_instructions در صف LIFO قبل از حذف.
 # کم‌تر = فرصت‌های بیات سریع‌تر حذف می‌شوند؛ بیشتر = تلاش بیشتر برای ارسال.
-queue_max_age_ms = 50
+queue_max_age_ms = 2000
 # اگر سرور 16 هسته دارد: متیس روی 0-11، ربات روی 12-15
 bot_cpu_cores = [12,13,14,15,28,29,30,31]
 
