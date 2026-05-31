@@ -213,7 +213,7 @@ async fn async_main(config: config::Config) -> Result<()> {
             let steps = ((config.trading.max_amount_sol - config.trading.min_amount_sol)
                 / config.trading.step_sol) as usize
                 + 1;
-            steps * token_mints.len()
+            steps * token_mints.len() * 2 // ×2: free + direct route per pair
         },
         config.performance.max_concurrent_quotes.max(1),
     );

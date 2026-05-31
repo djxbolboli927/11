@@ -52,8 +52,8 @@ impl TokenMetrics {
         self.index.get(mint).and_then(|&i| self.stats.get(i))
     }
 
-    /// Every 5 min: snapshot + reset counters → overwrite gozaresh5.json.
-    /// Every 30 min (6 windows): accumulate → overwrite gozaresh30.json.
+    /// Every 5 min: snapshot + reset counters → overwrite /root/c/gozaresh5.json.
+    /// Every 30 min (6 windows): accumulate → overwrite /root/c/gozaresh30.json.
     /// Nothing is printed to the terminal.
     pub fn spawn_reporter(self: &Arc<Self>) {
         let m = self.clone();
@@ -107,11 +107,11 @@ impl TokenMetrics {
                 }
 
                 // Overwrite the 5-min file with this window's data.
-                write_json("gozaresh5.json", &snap, &ts, 5);
+                write_json("/root/c/gozaresh5.json", &snap, &ts, 5);
 
                 // Every 30 min (6 × 5-min windows): flush the summary file.
                 if windows >= 6 {
-                    write_json("gozaresh30.json", &acc, &ts, 30);
+                    write_json("/root/c/gozaresh30.json", &acc, &ts, 30);
                     for a in acc.iter_mut() {
                         a.q_sent = 0;
                         a.route_ok = 0;
