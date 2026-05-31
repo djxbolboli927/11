@@ -272,7 +272,10 @@ pub fn spawn_workers(
 
                 let item = lifo_c.lock().unwrap().pop();
                 let item = match item {
-                    Some(i) => i,
+                    Some(i) => {
+                        met_c.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                        i
+                    }
                     None => continue,
                 };
 
@@ -474,6 +477,8 @@ pub async fn scan_all_tokens(
                 arrived_at: Instant::now(),
             };
             lifo_c.lock().unwrap().push(item);
+            met_c.queue_in.fetch_add(1, Ordering::Relaxed);
+            met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
             sem_c.add_permits(1);
         });
     }
