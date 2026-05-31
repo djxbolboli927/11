@@ -103,9 +103,7 @@ struct QuotePair {
 
 struct ReadyInstruction {
     swap_ixs: SwapInstructionsResponse,
-    amount: u64,
     hop_count: usize,
-    use_grpc: bool,
     arrived_at: Instant,
 }
 
@@ -147,11 +145,9 @@ async fn quote_check(
     metrics.metis_req_sent.fetch_add(2, Ordering::Relaxed); // quote1 + quote2
 
     let quote1 = metis.get_quote(WSOL_MINT, token_mint, amount).await.ok()?;
-    metrics.metis_quote_ok.fetch_add(1, Ordering::Relaxed); // quote1 returned
     let token_amount: u64 = quote1.out_amount.parse().ok().filter(|&v: &u64| v > 0)?;
 
     let quote2 = metis.get_quote(token_mint, WSOL_MINT, token_amount).await.ok()?;
-    metrics.metis_quote_ok.fetch_add(1, Ordering::Relaxed); // quote2 returned
     let output_wsol: u64 = quote2.out_amount.parse().unwrap_or(0);
 
     metrics.metis_resp_total.fetch_add(1, Ordering::Relaxed);
@@ -199,9 +195,9 @@ async fn quote_check(
 /// if older than `queue_max_age_ms`, then build a versioned transaction and
 /// submit it to Jito.
 ///
-/// The rate-limit slot is claimed in scan_all_tokens *before* the
-/// swap_instructions call, so each ReadyInstruction already has `use_grpc` set
-/// to the correct Jito path. Workers never touch the rate limiters.
+/// Workers build the transaction first, then claim a Jito rate-limit slot right
+/// before `send_bundle`. This keeps slow/failed swap-instructions or tx builds
+/// from burning one of the 10 per-second Jito slots.
 pub fn spawn_workers(
     ctx: Arc<CalcCtx>,
     metrics: Arc<Metrics>,
@@ -229,6 +225,7 @@ pub fn spawn_workers(
 
                 // Drop stale items immediately.
                 if item.arrived_at.elapsed().as_millis() as u64 > queue_max_age_ms {
+                    met_c.dropped_stale.fetch_add(1, Ordering::Relaxed);
                     met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -256,6 +253,7 @@ pub fn spawn_workers(
                 {
                     Ok(Ok(tx)) => tx,
                     _ => {
+                        met_c.tx_build_failed.fetch_add(1, Ordering::Relaxed);
                         met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -264,10 +262,12 @@ pub fn spawn_workers(
                 // Size guard (Solana hard limit: 1232 bytes).
                 match bincode::serialize(&tx) {
                     Ok(bytes) if bytes.len() > 1232 => {
+                        met_c.tx_too_large.fetch_add(1, Ordering::Relaxed);
                         met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     Err(_) => {
+                        met_c.tx_build_failed.fetch_add(1, Ordering::Relaxed);
                         met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -276,8 +276,23 @@ pub fn spawn_workers(
 
                 met_c.calc_done.fetch_add(1, Ordering::Relaxed);
 
-                // Send bundle to Jito via the pre-claimed path.
-                let result = if item.use_grpc {
+                // Claim a Jito slot only after the tx is fully built and sized.
+                let use_grpc = if ctx_c.jito_limiter.lock().unwrap().try_acquire() {
+                    false
+                } else if let Some(gl) = &ctx_c.jito_grpc_limiter {
+                    if gl.lock().unwrap().try_acquire() {
+                        true
+                    } else {
+                        met_c.dropped_rate_limit.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                } else {
+                    met_c.dropped_rate_limit.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+
+                // Send bundle to Jito via the slot we just claimed.
+                let result = if use_grpc {
                     match &ctx_c.jito_grpc {
                         Some(grpc) => grpc.send_bundle(&tx).await,
                         None => ctx_c.jito.send_bundle(&tx).await,
@@ -291,6 +306,7 @@ pub fn spawn_workers(
                         met_c.jito_sent.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => {
+                        met_c.jito_send_failed.fetch_add(1, Ordering::Relaxed);
                         met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -305,12 +321,12 @@ pub fn spawn_workers(
 
 /// One scan cycle over all (token × amount) pairs.
 ///
-/// Stage 1: buffer_unordered quote scanner (token_count/2 concurrent).
+/// Stage 1: buffer_unordered quote scanner (`performance.max_concurrent_quotes`).
 /// For each profitable pair:
-///   - Claim a Jito rate-limit slot (REST first, then gRPC fallback).
 ///   - Merge quotes and fire a detached tokio task for swap_instructions.
 ///   - The task pushes a ReadyInstruction into the Pipeline's LIFO queue.
-/// Stage 2: pre-spawned workers (spawn_workers) drain the LIFO queue newest-first.
+/// Stage 2: pre-spawned workers drain the LIFO queue newest-first, build the tx,
+/// then claim a Jito rate-limit slot only immediately before send_bundle.
 pub async fn scan_all_tokens(
     token_mints: &[String],
     config: &Config,
@@ -323,9 +339,6 @@ pub async fn scan_all_tokens(
     let step_lamports = (config.trading.step_sol * LAMPORTS_PER_SOL) as u64;
     let min_profit_lamports = config.trading.min_profit_lamports;
 
-    // Half the token catalog in flight at once.
-    let max_concurrent = (token_mints.len() / 2).max(1);
-
     let all_pairs: Vec<(u64, String)> = {
         let mut pairs = Vec::new();
         let mut amount = min_lamports;
@@ -337,6 +350,11 @@ pub async fn scan_all_tokens(
         }
         pairs
     };
+    let max_concurrent = config
+        .performance
+        .max_concurrent_quotes
+        .max(1)
+        .min(all_pairs.len().max(1));
 
     let metis_ref: &MetisClient = &ctx.metis;
     let met_ref: &Metrics = metrics;
@@ -351,21 +369,6 @@ pub async fn scan_all_tokens(
         let pair = match result {
             Some(p) => p,
             None => continue,
-        };
-
-        // Claim a Jito rate-limit slot before firing swap_instructions.
-        let use_grpc = if ctx.jito_limiter.lock().unwrap().try_acquire() {
-            false
-        } else if let Some(gl) = &ctx.jito_grpc_limiter {
-            if gl.lock().unwrap().try_acquire() {
-                true
-            } else {
-                metrics.dropped_rate_limit.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        } else {
-            metrics.dropped_rate_limit.fetch_add(1, Ordering::Relaxed);
-            continue;
         };
 
         let on_chain_floor = pair.amount + JITO_TIP_LAMPORTS + NETWORK_FEE_LAMPORTS;
@@ -391,7 +394,6 @@ pub async fn scan_all_tokens(
         let met_c = metrics.clone();
         let lifo_c = pipeline.lifo.clone();
         let sem_c = pipeline.lifo_sem.clone();
-        let amount = pair.amount;
         let hop_count = pair.hop_count;
 
         metrics.metis_req_sent.fetch_add(1, Ordering::Relaxed);
@@ -400,6 +402,7 @@ pub async fn scan_all_tokens(
                 match ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged).await {
                     Ok(s) => s,
                     Err(_) => {
+                        met_c.swap_ix_failed.fetch_add(1, Ordering::Relaxed);
                         met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -407,9 +410,7 @@ pub async fn scan_all_tokens(
 
             let item = ReadyInstruction {
                 swap_ixs,
-                amount,
                 hop_count,
-                use_grpc,
                 arrived_at: Instant::now(),
             };
             lifo_c.lock().unwrap().push(item);
