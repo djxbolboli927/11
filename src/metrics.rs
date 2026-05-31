@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +44,22 @@ pub struct Metrics {
     // ── Legacy aggregates (kept for compatibility) ────────────────────────────
     pub dropped_busy: AtomicU64,
     pub tx_dropped: AtomicU64,
+
+    // ── Instruction cache / shadow composer ───────────────────────────────────
+    /// New routes added to the cache for the first time.
+    pub cache_saved_new: AtomicU64,
+    /// Route found in cache (seen before).
+    pub cache_hit: AtomicU64,
+    /// Route not in cache (first occurrence).
+    pub cache_miss: AtomicU64,
+    /// Shadow comparisons performed (cached entry existed).
+    pub composer_built: AtomicU64,
+    /// Shadow: cached and fresh instructions are structurally identical.
+    pub composer_match: AtomicU64,
+    /// Shadow: structural difference detected (program/accounts/data-length changed).
+    pub composer_mismatch: AtomicU64,
+    /// Running total of unique routes ever stored (gauge — never reset).
+    pub cache_routes_stored: AtomicUsize,
 }
 
 impl Metrics {
@@ -64,6 +80,13 @@ impl Metrics {
             jito_sent: AtomicU64::new(0),
             dropped_busy: AtomicU64::new(0),
             tx_dropped: AtomicU64::new(0),
+            cache_saved_new: AtomicU64::new(0),
+            cache_hit: AtomicU64::new(0),
+            cache_miss: AtomicU64::new(0),
+            composer_built: AtomicU64::new(0),
+            composer_match: AtomicU64::new(0),
+            composer_mismatch: AtomicU64::new(0),
+            cache_routes_stored: AtomicUsize::new(0),
         })
     }
 
@@ -94,8 +117,17 @@ impl Metrics {
                 let jfail     = m.jito_send_failed.swap(0, Ordering::Relaxed);
                 let jito      = m.jito_sent.swap(0, Ordering::Relaxed);
 
-                // Gauge: read without reset.
+                // Cache / composer counters.
+                let c_new     = m.cache_saved_new.swap(0, Ordering::Relaxed);
+                let c_hit     = m.cache_hit.swap(0, Ordering::Relaxed);
+                let c_miss    = m.cache_miss.swap(0, Ordering::Relaxed);
+                let c_built   = m.composer_built.swap(0, Ordering::Relaxed);
+                let c_match   = m.composer_match.swap(0, Ordering::Relaxed);
+                let c_mismat  = m.composer_mismatch.swap(0, Ordering::Relaxed);
+
+                // Gauges: read without reset.
                 let depth     = m.queue_depth.load(Ordering::Relaxed);
+                let c_total   = m.cache_routes_stored.load(Ordering::Relaxed);
 
                 // Also drain legacy aggregates so they don't overflow.
                 let _ = m.tx_dropped.swap(0, Ordering::Relaxed);
@@ -107,7 +139,8 @@ metis_sent={sent} routes={routes} profitable={profit}\n  \
 PRE-QUEUE : swap_ix_fail={swap_fail} -> queue_in={q_in}  (depth_now={depth})\n  \
 IN-QUEUE  : stale={stale} (ONLY drop reason: waited >2s for a send slot)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
-JITO      : rate_requeued={requeued} (waiting in queue, NOT dropped)  send_fail={jfail}  sent={jito}"
+JITO      : rate_requeued={requeued} (waiting in queue, NOT dropped)  send_fail={jfail}  sent={jito}\n  \
+CACHE     : routes_total={c_total}  new={c_new}  hit={c_hit}  miss={c_miss}  composer_built={c_built}  match={c_match}  mismatch={c_mismat}"
                 );
             }
         });

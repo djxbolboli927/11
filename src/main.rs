@@ -4,6 +4,7 @@ mod arbitrage;
 mod blockhash_cache;
 mod config;
 mod dex_accounts;
+mod instruction_cache;
 mod jito;
 mod jito_grpc;
 mod litesvm_sim;
@@ -83,6 +84,9 @@ async fn async_main(config: config::Config) -> Result<()> {
 
     let metrics = metrics::Metrics::new();
     metrics.spawn_reporter();
+
+    let instruction_cache = instruction_cache::InstructionCache::new();
+    instruction_cache.spawn_flush_task(60); // flush to /root/c/cache/ every 60 seconds
 
     let token_metrics = token_metrics::TokenMetrics::new(&token_mints);
     token_metrics.spawn_reporter();
@@ -189,6 +193,7 @@ async fn async_main(config: config::Config) -> Result<()> {
         user_pubkey: trading_keypair.pubkey().to_string(),
         sim_cache,
         sim_pool,
+        instruction_cache,
     });
 
     // ── Spawn persistent calc workers. Jito throughput is enforced later, right

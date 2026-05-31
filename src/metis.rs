@@ -48,7 +48,7 @@ pub struct SwapInstructionsRequest {
     pub as_legacy_transaction: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SwapInstructionsResponse {
     #[serde(default)]
@@ -62,7 +62,7 @@ pub struct SwapInstructionsResponse {
     pub address_lookup_table_addresses: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct InstructionData {
     pub program_id: String,
@@ -70,7 +70,7 @@ pub struct InstructionData {
     pub data: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountMeta {
     pub pubkey: String,

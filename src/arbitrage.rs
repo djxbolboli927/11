@@ -10,6 +10,7 @@ use crate::account_cache::AccountCache;
 use crate::alt_cache::AltCache;
 use crate::blockhash_cache::BlockhashCache;
 use crate::config::Config;
+use crate::instruction_cache::{self, InstructionCache};
 use crate::jito::JitoClient;
 use crate::jito_grpc::JitoGrpcClient;
 use crate::litesvm_sim::SimulatorPool;
@@ -130,6 +131,7 @@ pub struct CalcCtx {
     pub user_pubkey: String,
     pub sim_cache: Option<Arc<AccountCache>>,
     pub sim_pool: Option<Arc<SimulatorPool>>,
+    pub instruction_cache: Arc<InstructionCache>,
 }
 
 // ─── Pipeline handle ──────────────────────────────────────────────────────────
@@ -482,6 +484,11 @@ pub async fn scan_all_tokens(
 
         metrics.metis_req_sent.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
+            // Compute route signature before the Metis call so we can lookup and
+            // record in O(1) on the hot path — the actual hash is cheap (FNV-1a).
+            let route_sig = InstructionCache::compute_signature(&merged.route_plan);
+            let prior = ctx_c.instruction_cache.lookup(route_sig);
+
             let swap_ixs =
                 match ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged).await {
                     Ok(s) => s,
@@ -491,6 +498,28 @@ pub async fn scan_all_tokens(
                         return;
                     }
                 };
+
+            // Update instruction cache and run shadow comparison.
+            let dex_path = instruction_cache::extract_dex_labels(&merged.route_plan);
+            let is_new = ctx_c.instruction_cache.record(route_sig, dex_path, swap_ixs.clone());
+            if is_new {
+                met_c.cache_saved_new.fetch_add(1, Ordering::Relaxed);
+                met_c.cache_miss.fetch_add(1, Ordering::Relaxed);
+                met_c.cache_routes_stored.fetch_add(1, Ordering::Relaxed);
+            } else {
+                met_c.cache_hit.fetch_add(1, Ordering::Relaxed);
+                if let Some(cached) = prior {
+                    met_c.composer_built.fetch_add(1, Ordering::Relaxed);
+                    if instruction_cache::instructions_match_structurally(
+                        &cached.swap_ixs,
+                        &swap_ixs,
+                    ) {
+                        met_c.composer_match.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        met_c.composer_mismatch.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
 
             let item = ReadyInstruction {
                 swap_ixs,
