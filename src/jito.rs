@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use futures::future::join_all;
+use base64::Engine;
+use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_sdk::transaction::VersionedTransaction;
@@ -17,7 +18,12 @@ struct SendBundleRpcRequest {
     jsonrpc: &'static str,
     id: u64,
     method: &'static str,
-    params: (Vec<String>,),
+    params: (Vec<String>, SendBundleConfig),
+}
+
+#[derive(Serialize)]
+struct SendBundleConfig {
+    encoding: &'static str,
 }
 
 #[derive(Deserialize, Debug)]
@@ -47,7 +53,7 @@ impl JitoClient {
             .collect();
 
         let http = Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(1))
             // 8 regional endpoints × concurrent bundle sends — keep 16
             // idle connections per region so consecutive sends reuse the
             // warm TLS session instead of paying ~30ms handshake cost.
@@ -68,20 +74,18 @@ impl JitoClient {
     /// Returns the first successful bundle ID.
     pub async fn send_bundle(&self, tx: &VersionedTransaction) -> Result<String> {
         let tx_bytes = bincode::serialize(tx).context("failed to serialize transaction")?;
-        let tx_base58 = bs58::encode(&tx_bytes).into_string();
+        let tx_base64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
 
-        // Send to ALL endpoints concurrently
-        let futures: Vec<_> = self
+        // Send to all endpoints concurrently, but release the worker as soon as
+        // any region accepts. Dropping the remaining futures cancels slow tails.
+        let mut futures = self
             .bundle_urls
             .iter()
-            .map(|url| self.send_to_endpoint(url, &tx_base58))
-            .collect();
-
-        let results = join_all(futures).await;
-
-        // Return first success, or the last error
+            .map(|url| self.send_to_endpoint(url, &tx_base64))
+            .collect::<FuturesUnordered<_>>();
         let mut last_err = None;
-        for result in results {
+
+        while let Some(result) = futures.next().await {
             match result {
                 Ok(bundle_id) => return Ok(bundle_id),
                 Err(e) => {
@@ -94,12 +98,15 @@ impl JitoClient {
     }
 
     /// Send bundle to a single endpoint.
-    async fn send_to_endpoint(&self, url: &str, tx_base58: &str) -> Result<String> {
+    async fn send_to_endpoint(&self, url: &str, tx_base64: &str) -> Result<String> {
         let request = SendBundleRpcRequest {
             jsonrpc: "2.0",
             id: 1,
             method: "sendBundle",
-            params: (vec![tx_base58.to_string()],),
+            params: (
+                vec![tx_base64.to_string()],
+                SendBundleConfig { encoding: "base64" },
+            ),
         };
 
         let resp = self
