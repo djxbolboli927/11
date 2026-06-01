@@ -105,7 +105,11 @@ impl Metrics {
     }
 
     /// Prints a funnel-style report every 30 s so every drop reason is visible.
-    pub fn spawn_reporter(self: &Arc<Self>, queue_max_age_ms: u64) {
+    pub fn spawn_reporter(
+        self: &Arc<Self>,
+        queue_max_age_ms: u64,
+        cache: Arc<crate::instruction_cache::InstructionCache>,
+    ) {
         let m = self.clone();
         let ttl_secs = queue_max_age_ms as f64 / 1000.0;
         tokio::spawn(async move {
@@ -156,6 +160,7 @@ impl Metrics {
                 let _ = m.dropped_busy.swap(0, Ordering::Relaxed);
 
                 let avg_metis_ms = if ms_n > 0 { ms_ms / ms_n } else { 0 };
+                let cache_entries = cache.len();
 
                 eprintln!(
                     "[{WINDOW_SECS}s] \
@@ -164,7 +169,8 @@ PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={
 IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
 JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \
-SWAP-IX   : avg_metis={avg_metis_ms}ms  from_ram={cache_hit}  compare=[match={cmp_match} differ={cmp_differ} fail={cmp_fail}]"
+SWAP-IX   : avg_metis={avg_metis_ms}ms  from_ram={cache_hit}  compare=[match={cmp_match} differ={cmp_differ} fail={cmp_fail}]\n  \
+CACHE     : entries={cache_entries}"
                 );
             }
         });

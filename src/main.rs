@@ -82,8 +82,16 @@ async fn async_main(config: config::Config) -> Result<()> {
         &wsol_mint,
     );
 
+    // ── Instruction cache: load persisted entries and start periodic flush ───
+    let instruction_cache = instruction_cache::InstructionCache::new();
+    if config.instruction_cache.save_new || config.instruction_cache.serve_from_ram {
+        let loaded = instruction_cache.load_from_disk();
+        eprintln!("[cache] loaded {loaded} entries from /root/c/cache/routes/hot_routes.json");
+        instruction_cache.spawn_flush_task(60); // flush to disk every 60s
+    }
+
     let metrics = metrics::Metrics::new();
-    metrics.spawn_reporter(config.performance.queue_max_age_ms);
+    metrics.spawn_reporter(config.performance.queue_max_age_ms, instruction_cache.clone());
 
     let token_metrics = token_metrics::TokenMetrics::new(&token_mints);
     token_metrics.spawn_reporter();
@@ -190,7 +198,7 @@ async fn async_main(config: config::Config) -> Result<()> {
         user_pubkey: trading_keypair.pubkey().to_string(),
         sim_cache,
         sim_pool,
-        instruction_cache: instruction_cache::InstructionCache::new(),
+        instruction_cache,
     });
 
     // ── Spawn persistent calc workers. Jito throughput is enforced later, right
