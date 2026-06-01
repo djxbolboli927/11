@@ -12,6 +12,12 @@ pub type RouteSignature = u64;
 /// to pick up any pool-state changes. Set to 0 to always re-fetch.
 const INTRA_RUN_TTL_SECS: u64 = 60;
 
+/// Hard limit on in-RAM entries. When the cache is full the oldest entry
+/// (by last_seen_ts) is evicted on every new insert. This bounds steady-state
+/// RAM to roughly MAX_CACHE_ENTRIES × ~3 KB ≈ 60 MB at the default.
+/// It also caps how much JSON we write/read at each flush cycle.
+const MAX_CACHE_ENTRIES: usize = 20_000;
+
 /// Cache key: route structure + exact input amount.
 ///
 /// Including the amount means a cache hit guarantees the same instruction bytes
@@ -136,6 +142,20 @@ impl InstructionCache {
             entry.confirmed_at = Some(std::time::Instant::now());
         }
         inner.dirty = true;
+
+        // Evict the least-recently-seen entry when the cache is at capacity.
+        // Only runs on inserts (is_new), not on updates.
+        if is_new && inner.entries.len() > MAX_CACHE_ENTRIES {
+            if let Some(oldest) = inner
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.last_seen_ts)
+                .map(|(k, _)| *k)
+            {
+                inner.entries.remove(&oldest);
+            }
+        }
+
         is_new
     }
 
@@ -202,7 +222,7 @@ impl InstructionCache {
             .collect();
         std::fs::write(
             cache_dir.join("routes/hot_routes.json"),
-            serde_json::to_string_pretty(&route_map)?,
+            serde_json::to_string(&route_map)?,
         )?;
 
         // hops/<dex>.json — per-DEX view (all routes touching that DEX).
@@ -224,7 +244,7 @@ impl InstructionCache {
             let fname = format!("{}.json", sanitize_filename(dex));
             std::fs::write(
                 cache_dir.join("hops").join(fname),
-                serde_json::to_string_pretty(&map)?,
+                serde_json::to_string(&map)?,
             )?;
         }
 
@@ -258,7 +278,7 @@ impl InstructionCache {
         }
         std::fs::write(
             cache_dir.join("index/template_index.json"),
-            serde_json::to_string_pretty(&by_sig)?,
+            serde_json::to_string(&by_sig)?,
         )?;
 
         Ok(())
@@ -276,8 +296,15 @@ impl InstructionCache {
             Ok(p) => p,
             Err(_) => return 0,
         };
+        // Sort by last_seen_ts descending and keep only the freshest
+        // MAX_CACHE_ENTRIES entries so startup RAM usage is bounded even
+        // when the on-disk file has grown very large.
+        let mut all: Vec<CachedRoute> = raw.into_values().collect();
+        all.sort_unstable_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts));
+        all.truncate(MAX_CACHE_ENTRIES);
+
         let mut inner = self.inner.write().unwrap();
-        for route in raw.into_values() {
+        for route in all {
             let sig = u64::from_str_radix(&route.sig, 16).unwrap_or(0);
             inner.entries.insert((sig, route.amount), route);
         }
