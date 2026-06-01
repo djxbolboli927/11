@@ -206,9 +206,6 @@ async fn async_main(config: config::Config) -> Result<()> {
         sim_cache,
         sim_pool,
         instruction_cache,
-        swap_ix_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            config.performance.max_concurrent_swap_ix.max(1),
-        )),
     });
 
     // ── Spawn persistent calc workers. Jito throughput is enforced later, right

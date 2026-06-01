@@ -137,10 +137,6 @@ pub struct CalcCtx {
     pub sim_cache: Option<Arc<AccountCache>>,
     pub sim_pool: Option<Arc<SimulatorPool>>,
     pub instruction_cache: Arc<InstructionCache>,
-    /// Hard cap on concurrent /swap-instructions calls to Metis.
-    /// Prevents saturating Metis with thousands of simultaneous HTTP connections
-    /// when there are many profitable quotes in flight.
-    pub swap_ix_sem: Arc<tokio::sync::Semaphore>,
 }
 
 // ─── Pipeline handle ──────────────────────────────────────────────────────────
@@ -523,17 +519,10 @@ pub async fn scan_all_tokens(
             continue;
         }
 
-        // Cache miss: try to claim a semaphore permit without blocking.
-        // If all slots are busy, skip this opportunity rather than spawning a
-        // task that would queue behind thousands of others and inflate timing.
-        let permit = match ctx.swap_ix_sem.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        // Got a permit — spawn exactly one task that will hold the permit until
-        // the Metis HTTP response arrives. Timer starts here so it measures only
-        // actual network latency, not semaphore wait time.
+        // Cache miss: spawn a fire-and-forget task to call Metis.
+        // No semaphore needed — each task completes within quote_timeout_ms
+        // (≤200 ms), so tasks never accumulate. This restores the pre-cache
+        // behaviour where Metis's own internal queue paces the work naturally.
         let ctx_c = ctx.clone();
         let met_c = metrics.clone();
         let lifo_c = pipeline.lifo.clone();
@@ -548,8 +537,6 @@ pub async fn scan_all_tokens(
                 .metis
                 .get_swap_instructions(&ctx_c.user_pubkey, &merged)
                 .await;
-            drop(permit); // release slot immediately after HTTP response
-
             let fetch_ms = t_metis.elapsed().as_millis() as u64;
 
             let swap_ixs = match swap_ix_result {
