@@ -7,6 +7,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub type RouteSignature = u64;
 
+/// How long a confirmed cache entry is considered valid within a single run.
+/// After this interval the entry is treated as a miss and Metis is called again
+/// to pick up any pool-state changes. Set to 0 to always re-fetch.
+const INTRA_RUN_TTL_SECS: u64 = 60;
+
 /// Cache key: route structure + exact input amount.
 ///
 /// Including the amount means a cache hit guarantees the same instruction bytes
@@ -29,12 +34,14 @@ pub struct CachedRoute {
     pub hit_count: u64,
     /// Unix timestamp (seconds) of the most-recent update.
     pub last_seen_ts: u64,
-    /// True only when this entry was written (or refreshed) in the current
-    /// process run. Entries loaded from disk start as `false` and are not
-    /// served until Metis confirms them fresh for the first time.
-    /// Never persisted to disk (always resets to false on load).
+    /// Monotonic timestamp of the last Metis confirmation in this process run.
+    /// `None` means the entry was loaded from disk and has not been re-confirmed
+    /// yet; those entries are NOT served until Metis validates them.
+    /// Entries older than `INTRA_RUN_TTL_SECS` are also treated as misses,
+    /// forcing a re-fetch so pool-state changes are picked up.
+    /// Never persisted to disk — always `None` on load.
     #[serde(skip, default)]
-    pub fresh: bool,
+    pub confirmed_at: Option<std::time::Instant>,
 }
 
 struct CacheInner {
@@ -78,19 +85,22 @@ impl InstructionCache {
     }
 
     /// Exact lookup: returns `Some` only when route + amount match AND the entry
-    /// has been confirmed fresh in the current process run (`fresh = true`).
+    /// was confirmed by Metis in the current process run within `INTRA_RUN_TTL_SECS`.
     ///
-    /// Entries loaded from disk at startup have `fresh = false` until Metis
-    /// returns a successful response for them and `record()` is called.
-    /// This prevents serving stale instructions whose pool-state data is hours
-    /// old and would cause on-chain reverts.
+    /// Disk-loaded entries have `confirmed_at = None` → treated as miss until
+    /// Metis confirms them. Entries older than the TTL are also treated as miss
+    /// so pool-state changes are picked up (re-fetch is demand-driven).
     pub fn lookup(&self, sig: RouteSignature, amount: u64) -> Option<CachedRoute> {
         self.inner
             .read()
             .ok()?
             .entries
             .get(&(sig, amount))
-            .filter(|r| r.fresh)
+            .filter(|r| {
+                r.confirmed_at
+                    .map(|t| t.elapsed().as_secs() < INTRA_RUN_TTL_SECS)
+                    .unwrap_or(false)
+            })
             .cloned()
     }
 
@@ -116,14 +126,14 @@ impl InstructionCache {
                     swap_ixs,
                     hit_count: 1,
                     last_seen_ts: unix_now(),
-                    fresh: true, // confirmed by Metis in this process run
+                    confirmed_at: Some(std::time::Instant::now()),
                 },
             );
         } else if let Some(entry) = inner.entries.get_mut(&key) {
             entry.swap_ixs = swap_ixs;
             entry.hit_count += 1;
             entry.last_seen_ts = unix_now();
-            entry.fresh = true; // re-confirmed fresh
+            entry.confirmed_at = Some(std::time::Instant::now());
         }
         inner.dirty = true;
         is_new
@@ -157,8 +167,13 @@ impl InstructionCache {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if let Err(e) = cache.flush_to_disk() {
-                    eprintln!("[cache] flush error: {e}");
+                // JSON serialisation + fs::write are blocking; run off the
+                // async executor so tokio threads stay free for quote/swap tasks.
+                let c = cache.clone();
+                match tokio::task::spawn_blocking(move || c.flush_to_disk()).await {
+                    Ok(Err(e)) => eprintln!("[cache] flush error: {e}"),
+                    Err(e) => eprintln!("[cache] flush panic: {e}"),
+                    Ok(Ok(())) => {}
                 }
             }
         });
@@ -267,123 +282,6 @@ impl InstructionCache {
             inner.entries.insert((sig, route.amount), route);
         }
         inner.entries.len()
-    }
-}
-
-// ── Comparison helpers ────────────────────────────────────────────────────────
-
-/// Full byte comparison: every account pubkey, every data byte, every setup instruction.
-/// Returns `true` only when the cached and fresh instructions are completely identical.
-pub fn instructions_match_bytewise(
-    cached: &SwapInstructionsResponse,
-    fresh: &SwapInstructionsResponse,
-) -> bool {
-    let ci = &cached.swap_instruction;
-    let fi = &fresh.swap_instruction;
-
-    if ci.program_id != fi.program_id {
-        return false;
-    }
-    if ci.accounts.len() != fi.accounts.len() {
-        return false;
-    }
-    for (ca, fa) in ci.accounts.iter().zip(fi.accounts.iter()) {
-        if ca.pubkey != fa.pubkey
-            || ca.is_signer != fa.is_signer
-            || ca.is_writable != fa.is_writable
-        {
-            return false;
-        }
-    }
-    // base64 strings: equal strings ↔ equal decoded bytes.
-    if ci.data != fi.data {
-        return false;
-    }
-    if cached.setup_instructions.len() != fresh.setup_instructions.len() {
-        return false;
-    }
-    for (cs, fs) in cached
-        .setup_instructions
-        .iter()
-        .zip(fresh.setup_instructions.iter())
-    {
-        if cs.program_id != fs.program_id || cs.data != fs.data {
-            return false;
-        }
-    }
-    true
-}
-
-/// Human-readable description of what differs between cached and fresh instructions.
-/// Used in the mismatch log so the cause is immediately visible.
-pub fn diff_description(
-    cached: &SwapInstructionsResponse,
-    fresh: &SwapInstructionsResponse,
-) -> String {
-    let mut diffs = Vec::new();
-    let ci = &cached.swap_instruction;
-    let fi = &fresh.swap_instruction;
-
-    if ci.program_id != fi.program_id {
-        diffs.push(format!("program_id({} vs {})", ci.program_id, fi.program_id));
-    }
-    if ci.accounts.len() != fi.accounts.len() {
-        diffs.push(format!(
-            "account_count({} vs {})",
-            ci.accounts.len(),
-            fi.accounts.len()
-        ));
-    } else {
-        let mismatched: Vec<usize> = ci
-            .accounts
-            .iter()
-            .zip(fi.accounts.iter())
-            .enumerate()
-            .filter(|(_, (ca, fa))| ca.pubkey != fa.pubkey)
-            .map(|(i, _)| i)
-            .collect();
-        if !mismatched.is_empty() {
-            diffs.push(format!("account_pubkeys_at({mismatched:?})"));
-        }
-    }
-    if ci.data != fi.data {
-        diffs.push(format!(
-            "swap_data_bytes(cached_len={} fresh_len={})",
-            ci.data.len(),
-            fi.data.len()
-        ));
-    }
-    if cached.setup_instructions.len() != fresh.setup_instructions.len() {
-        diffs.push(format!(
-            "setup_count({} vs {})",
-            cached.setup_instructions.len(),
-            fresh.setup_instructions.len()
-        ));
-    }
-    if diffs.is_empty() {
-        "none_detected".to_string()
-    } else {
-        diffs.join("; ")
-    }
-}
-
-/// Append one mismatch event to `/root/c/cache/mismatch_log.jsonl` (JSON Lines).
-/// Best-effort: if the file can't be opened, the error is silently dropped.
-pub fn append_mismatch_log(sig_hex: &str, amount: u64, dex_path: &[String], diff: &str) {
-    let path = "/root/c/cache/mismatch_log.jsonl";
-    let entry = serde_json::json!({
-        "ts":       unix_now(),
-        "sig":      sig_hex,
-        "amount":   amount,
-        "dex_path": dex_path,
-        "diff":     diff,
-    });
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "{entry}");
     }
 }
 

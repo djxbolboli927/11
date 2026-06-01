@@ -137,6 +137,10 @@ pub struct CalcCtx {
     pub sim_cache: Option<Arc<AccountCache>>,
     pub sim_pool: Option<Arc<SimulatorPool>>,
     pub instruction_cache: Arc<InstructionCache>,
+    /// Hard cap on concurrent /swap-instructions calls to Metis.
+    /// Prevents saturating Metis with thousands of simultaneous HTTP connections
+    /// when there are many profitable quotes in flight.
+    pub swap_ix_sem: Arc<tokio::sync::Semaphore>,
 }
 
 // ─── Pipeline handle ──────────────────────────────────────────────────────────
@@ -499,23 +503,24 @@ pub async fn scan_all_tokens(
             let route_sig = InstructionCache::compute_signature(&merged.route_plan);
             let request_amount = merged.in_amount.parse::<u64>().unwrap_or(0);
             let dex_path = instruction_cache::extract_dex_labels(&merged.route_plan);
-            let sig_hex = format!("{route_sig:016x}");
 
-            // ── Cache hit: serve from RAM, compare in background ────────────
+            // ── Cache hit: serve from RAM, no Metis call ─────────────────────
             let t_lookup = std::time::Instant::now();
             let cached = ctx_c.instruction_cache.lookup(route_sig, request_amount);
             let lookup_us = t_lookup.elapsed().as_micros() as u64;
 
             if let Some(cached_entry) = cached {
-                // Exact (route, amount) match found — push to queue immediately.
+                // Exact (route, amount) match found and fresh — push to queue.
+                // No Metis call: cache entries auto-expire after INTRA_RUN_TTL_SECS
+                // and are re-fetched on the next miss, so pool state stays current
+                // without flooding Metis with a background call per hit.
                 met_c.cache_served.fetch_add(1, Ordering::Relaxed);
                 met_c.cache_build_us_total.fetch_add(lookup_us, Ordering::Relaxed);
                 met_c.cache_build_samples.fetch_add(1, Ordering::Relaxed);
                 met_c.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
 
-                let swap_ixs_for_queue = cached_entry.swap_ixs.clone();
                 let item = ReadyInstruction {
-                    swap_ixs: swap_ixs_for_queue,
+                    swap_ixs: cached_entry.swap_ixs,
                     hop_count,
                     arrived_at: std::time::Instant::now(),
                     waited_for_slot: false,
@@ -524,75 +529,25 @@ pub async fn scan_all_tokens(
                 met_c.queue_in.fetch_add(1, Ordering::Relaxed);
                 met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
                 sem_c.add_permits(1);
-
-                // Background: fetch from Metis for byte comparison + cache refresh.
-                // Do NOT push the Metis result to the queue — we already sent cached.
-                let ctx_bg = ctx_c.clone();
-                let met_bg = met_c.clone();
-                let cache_bg = ctx_c.instruction_cache.clone();
-                let dex_path_bg = dex_path;
-                let sig_hex_bg = sig_hex;
-                let cached_ixs = cached_entry.swap_ixs;
-
-                tokio::spawn(async move {
-                    met_bg.metis_req_sent.fetch_add(1, Ordering::Relaxed);
-                    let t_metis = std::time::Instant::now();
-                    let fresh = match ctx_bg
-                        .metis
-                        .get_swap_instructions(&ctx_bg.user_pubkey, &merged)
-                        .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            met_bg.swap_ix_failed.fetch_add(1, Ordering::Relaxed);
-                            match e {
-                                crate::metis::SwapIxError::Timeout => {
-                                    met_bg.swap_ix_timeout.fetch_add(1, Ordering::Relaxed);
-                                }
-                                crate::metis::SwapIxError::Http(_) => {
-                                    met_bg.swap_ix_http.fetch_add(1, Ordering::Relaxed);
-                                }
-                                crate::metis::SwapIxError::Network => {
-                                    met_bg.swap_ix_network.fetch_add(1, Ordering::Relaxed);
-                                }
-                                crate::metis::SwapIxError::Parse => {
-                                    met_bg.swap_ix_parse.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            return;
-                        }
-                    };
-                    let fetch_ms = t_metis.elapsed().as_millis() as u64;
-                    met_bg.metis_fetch_ms_total.fetch_add(fetch_ms, Ordering::Relaxed);
-                    met_bg.metis_fetch_samples.fetch_add(1, Ordering::Relaxed);
-
-                    // Byte-level comparison.
-                    if instruction_cache::instructions_match_bytewise(&cached_ixs, &fresh) {
-                        met_bg.byte_exact.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        met_bg.byte_diff.fetch_add(1, Ordering::Relaxed);
-                        let diff =
-                            instruction_cache::diff_description(&cached_ixs, &fresh);
-                        instruction_cache::append_mismatch_log(
-                            &sig_hex_bg,
-                            request_amount,
-                            &dex_path_bg,
-                            &diff,
-                        );
-                    }
-
-                    // Refresh cache with the latest Metis response.
-                    cache_bg.record(route_sig, request_amount, dex_path_bg, fresh);
-                });
             } else {
-                // ── Cache miss: call Metis, store result, push to queue ──────
+                // ── Cache miss: rate-limited Metis call ──────────────────────
+                // Acquire a slot from the shared semaphore BEFORE calling Metis.
+                // This caps concurrent swap_instructions connections to
+                // max_concurrent_swap_ix so a burst of profitable quotes cannot
+                // flood Metis with thousands of simultaneous HTTP requests.
                 met_c.metis_req_sent.fetch_add(1, Ordering::Relaxed);
                 let t_metis = std::time::Instant::now();
-                let swap_ixs = match ctx_c
+
+                let permit = ctx_c.swap_ix_sem.clone().acquire_owned().await.unwrap();
+                let swap_ix_result = ctx_c
                     .metis
                     .get_swap_instructions(&ctx_c.user_pubkey, &merged)
-                    .await
-                {
+                    .await;
+                drop(permit); // release slot as soon as HTTP response arrives
+
+                let fetch_ms = t_metis.elapsed().as_millis() as u64;
+
+                let swap_ixs = match swap_ix_result {
                     Ok(s) => s,
                     Err(e) => {
                         met_c.swap_ix_failed.fetch_add(1, Ordering::Relaxed);
@@ -603,8 +558,6 @@ pub async fn scan_all_tokens(
                             }
                             crate::metis::SwapIxError::Http(status) => {
                                 met_c.swap_ix_http.fetch_add(1, Ordering::Relaxed);
-                                // Log the DEX path so we can identify which routes
-                                // Metis consistently refuses at swap_ix level.
                                 instruction_cache::append_swap_ix_failure(&dex_path, status);
                             }
                             crate::metis::SwapIxError::Network => {
@@ -617,7 +570,7 @@ pub async fn scan_all_tokens(
                         return;
                     }
                 };
-                let fetch_ms = t_metis.elapsed().as_millis() as u64;
+
                 met_c.metis_fetch_ms_total.fetch_add(fetch_ms, Ordering::Relaxed);
                 met_c.metis_fetch_samples.fetch_add(1, Ordering::Relaxed);
 

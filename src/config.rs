@@ -195,6 +195,12 @@ pub struct PerformanceConfig {
     /// Metis responses; lower to discard stale opportunities faster.
     #[serde(default = "default_queue_max_age_ms")]
     pub queue_max_age_ms: u64,
+    /// Maximum concurrent /swap-instructions calls to Metis. Hard cap on the
+    /// number of in-flight HTTP connections so a burst of profitable quotes
+    /// doesn't flood Metis and trigger 500 errors. Default 32 — enough for
+    /// ~26 successful swap_ix/s (at ~1.2 s avg) with headroom for failures.
+    #[serde(default = "default_max_concurrent_swap_ix")]
+    pub max_concurrent_swap_ix: usize,
     #[serde(default)]
     pub bot_cpu_cores: Vec<usize>,
 }
@@ -209,6 +215,10 @@ fn default_calc_workers() -> usize {
 
 fn default_queue_max_age_ms() -> u64 {
     5000
+}
+
+fn default_max_concurrent_swap_ix() -> usize {
+    32
 }
 
 impl Config {

@@ -76,12 +76,6 @@ pub struct Metrics {
     pub metis_fetch_ms_total: AtomicU64,
     /// Sample count for metis_fetch_ms_total.
     pub metis_fetch_samples: AtomicU64,
-
-    // ── Shadow / byte comparison ──────────────────────────────────────────────
-    /// Cache hit + Metis background fetch + byte-for-byte identical result.
-    pub byte_exact: AtomicU64,
-    /// Cache hit + Metis background fetch + byte difference found (logged to file).
-    pub byte_diff: AtomicU64,
 }
 
 impl Metrics {
@@ -114,8 +108,6 @@ impl Metrics {
             metis_served: AtomicU64::new(0),
             metis_fetch_ms_total: AtomicU64::new(0),
             metis_fetch_samples: AtomicU64::new(0),
-            byte_exact: AtomicU64::new(0),
-            byte_diff: AtomicU64::new(0),
         })
     }
 
@@ -168,10 +160,6 @@ impl Metrics {
                 let ms_ms     = m.metis_fetch_ms_total.swap(0, Ordering::Relaxed);
                 let ms_n      = m.metis_fetch_samples.swap(0, Ordering::Relaxed);
 
-                // ── Shadow comparison ────────────────────────────────────────
-                let b_exact   = m.byte_exact.swap(0, Ordering::Relaxed);
-                let b_diff    = m.byte_diff.swap(0, Ordering::Relaxed);
-
                 // ── Gauges (read without reset) ───────────────────────────────
                 let depth      = m.queue_depth.load(Ordering::Relaxed);
                 let c_routes   = cache.route_count();
@@ -192,8 +180,7 @@ IN-QUEUE  : stale={stale} (ONLY drop reason: waited >{ttl_secs}s for a send slot
 TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
 JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \
 CACHE     : routes={c_routes} entries={c_entries} new_saved={new_saved}\n  \
-SERVING   : from_cache={cs} (avg={avg_cache_us}µs)  from_metis={ms_srv} (avg={avg_metis_ms}ms)\n  \
-SHADOW    : byte_exact={b_exact}  byte_diff={b_diff}  (diffs logged to /root/c/cache/mismatch_log.jsonl)"
+SERVING   : from_cache={cs} (avg={avg_cache_us}µs)  from_metis={ms_srv} (avg={avg_metis_ms}ms)"
                 );
             }
         });
