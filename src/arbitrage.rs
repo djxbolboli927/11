@@ -479,6 +479,13 @@ pub async fn scan_all_tokens(
             "send_candidate"
         );
 
+        // Only 2-hop routes (1 hop each side) are safe to send to swap_instructions.
+        // Multi-hop merged routes (from only_direct=false) cause Metis 500 errors.
+        if pair.hop_count != 2 {
+            metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
         let merged = match MetisClient::merge_quotes(&pair.quote1, &pair.quote2, on_chain_floor) {
             Ok(m) => m,
             Err(_) => {

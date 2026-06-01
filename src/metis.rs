@@ -207,7 +207,7 @@ impl MetisClient {
             input_mint: quote1.input_mint.clone(),
             in_amount: quote1.in_amount.clone(),
             output_mint: quote2.output_mint.clone(),
-            out_amount: min_acceptable_out.to_string(),
+            out_amount: quote2.out_amount.clone(),
             other_amount_threshold: min_acceptable_out.to_string(),
             swap_mode: quote1.swap_mode.clone(),
             price_impact_pct: "0".to_string(),
