@@ -285,8 +285,35 @@ impl InstructionCache {
     }
 
     /// Reload hot_routes.json into RAM on startup. Returns entries loaded.
+    ///
+    /// Skips loading if the file exceeds MAX_LOAD_MB to avoid a large RAM spike
+    /// on a machine that shares memory with Metis. The old pretty-printed format
+    /// could be 300-400 MB; the current compact format caps at ~60 MB.
+    /// If skipped, the user sees a one-time warning and the cache rebuilds in the
+    /// first scan cycle. After the next flush the file will be in the new format.
     pub fn load_from_disk(&self) -> usize {
+        const MAX_LOAD_BYTES: u64 = 150 * 1024 * 1024; // 150 MB
+
         let path = std::path::Path::new("/root/c/cache/routes/hot_routes.json");
+
+        // Guard: refuse to load files that would cause a large startup RAM spike.
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.len() > MAX_LOAD_BYTES => {
+                eprintln!(
+                    "[cache] hot_routes.json is {} MB — too large to load safely (limit 150 MB). \
+                     Cache will rebuild from Metis this run. \
+                     Delete the file or wait for the next flush to get the compact format.",
+                    meta.len() / 1_048_576
+                );
+                return 0;
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                // Can't stat the file for some other reason; skip gracefully.
+                return 0;
+            }
+            _ => {}
+        }
+
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return 0,
