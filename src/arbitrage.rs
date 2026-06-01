@@ -495,8 +495,14 @@ pub async fn scan_all_tokens(
         let request_amount = merged.in_amount.parse::<u64>().unwrap_or(0);
         let dex_path = instruction_cache::extract_dex_labels(&merged.route_plan);
 
+        let cache_enabled = config.performance.cache_enabled;
+
         let t_lookup = std::time::Instant::now();
-        let cached = ctx.instruction_cache.lookup(route_sig, request_amount);
+        let cached = if cache_enabled {
+            ctx.instruction_cache.lookup(route_sig, request_amount)
+        } else {
+            None
+        };
         let lookup_us = t_lookup.elapsed().as_micros() as u64;
 
         if let Some(cached_entry) = cached {
@@ -566,11 +572,13 @@ pub async fn scan_all_tokens(
             met_c.metis_fetch_ms_total.fetch_add(fetch_ms, Ordering::Relaxed);
             met_c.metis_fetch_samples.fetch_add(1, Ordering::Relaxed);
 
-            let is_new = ctx_c
-                .instruction_cache
-                .record(route_sig, request_amount, dex_path, swap_ixs.clone());
-            if is_new {
-                met_c.cache_saved_new.fetch_add(1, Ordering::Relaxed);
+            if cache_enabled {
+                let is_new = ctx_c
+                    .instruction_cache
+                    .record(route_sig, request_amount, dex_path, swap_ixs.clone());
+                if is_new {
+                    met_c.cache_saved_new.fetch_add(1, Ordering::Relaxed);
+                }
             }
             met_c.metis_served.fetch_add(1, Ordering::Relaxed);
             met_c.swap_ix_ok.fetch_add(1, Ordering::Relaxed);

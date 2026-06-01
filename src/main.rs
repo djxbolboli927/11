@@ -83,16 +83,22 @@ async fn async_main(config: config::Config) -> Result<()> {
     );
 
     let instruction_cache = instruction_cache::InstructionCache::new();
-    // Restore any previously-collected (route, amount) entries so the cache
-    // survives restarts and can serve from RAM on the very first scan.
-    let loaded = instruction_cache.load_from_disk();
-    if loaded > 0 {
+    if config.performance.cache_enabled {
+        // Restore any previously-collected (route, amount) entries so the cache
+        // survives restarts and can serve from RAM on the very first scan.
+        let loaded = instruction_cache.load_from_disk();
+        if loaded > 0 {
+            eprintln!(
+                "[cache] loaded {loaded} entries ({} routes) from /root/c/cache/routes/hot_routes.json",
+                instruction_cache.route_count()
+            );
+        }
+        instruction_cache.spawn_flush_task(60); // flush to /root/c/cache/ every 60 seconds
+    } else {
         eprintln!(
-            "[cache] loaded {loaded} entries ({} routes) from /root/c/cache/routes/hot_routes.json",
-            instruction_cache.route_count()
+            "[cache] disabled via config (performance.cache_enabled=false) — running in pre-cache mode"
         );
     }
-    instruction_cache.spawn_flush_task(60); // flush to /root/c/cache/ every 60 seconds
 
     let metrics = metrics::Metrics::new();
     metrics.spawn_reporter(
