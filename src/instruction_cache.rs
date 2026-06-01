@@ -14,9 +14,12 @@ const INTRA_RUN_TTL_SECS: u64 = 60;
 
 /// Hard limit on in-RAM entries. When the cache is full the oldest entry
 /// (by last_seen_ts) is evicted on every new insert. This bounds steady-state
-/// RAM to roughly MAX_CACHE_ENTRIES × ~3 KB ≈ 60 MB at the default.
+/// RAM to roughly MAX_CACHE_ENTRIES × ~3 KB ≈ 6 MB at the default.
 /// It also caps how much JSON we write/read at each flush cycle.
-const MAX_CACHE_ENTRIES: usize = 20_000;
+/// Keep this small: Metis runs on the same machine and shares physical RAM.
+/// With 17 tokens × 246 amounts × 2 modes = ~8k pairs, a few hundred are
+/// profitable at any one time — 2000 slots is 5–10× headroom.
+const MAX_CACHE_ENTRIES: usize = 2_000;
 
 /// Cache key: route structure + exact input amount.
 ///
@@ -286,13 +289,13 @@ impl InstructionCache {
 
     /// Reload hot_routes.json into RAM on startup. Returns entries loaded.
     ///
-    /// Skips loading if the file exceeds MAX_LOAD_MB to avoid a large RAM spike
-    /// on a machine that shares memory with Metis. The old pretty-printed format
-    /// could be 300-400 MB; the current compact format caps at ~60 MB.
-    /// If skipped, the user sees a one-time warning and the cache rebuilds in the
-    /// first scan cycle. After the next flush the file will be in the new format.
+    /// Entries whose last_seen_ts is within INTRA_RUN_TTL_SECS of now are
+    /// marked confirmed immediately so they can be served from cache on the
+    /// very first scan (avoiding a startup flood of swap_instructions calls).
+    /// Stale entries are loaded cold and require a Metis round-trip before
+    /// they become hot.
     pub fn load_from_disk(&self) -> usize {
-        const MAX_LOAD_BYTES: u64 = 150 * 1024 * 1024; // 150 MB
+        const MAX_LOAD_BYTES: u64 = 20 * 1024 * 1024; // 20 MB — matches new MAX_CACHE_ENTRIES
 
         let path = std::path::Path::new("/root/c/cache/routes/hot_routes.json");
 
@@ -330,9 +333,20 @@ impl InstructionCache {
         all.sort_unstable_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts));
         all.truncate(MAX_CACHE_ENTRIES);
 
+        let now_ts = unix_now();
         let mut inner = self.inner.write().unwrap();
-        for route in all {
+        for mut route in all {
             let sig = u64::from_str_radix(&route.sig, 16).unwrap_or(0);
+            // Entries last seen within TTL are immediately usable so the first
+            // scan can hit the cache rather than flooding Metis with
+            // swap_instructions calls for every profitable quote.
+            // The route_v2 instruction bytes are safe to reuse: on-chain
+            // other_amount_threshold is embedded in the instruction and reverts
+            // the tx if profitability is gone.
+            let age_secs = now_ts.saturating_sub(route.last_seen_ts);
+            if age_secs < INTRA_RUN_TTL_SECS {
+                route.confirmed_at = Some(std::time::Instant::now());
+            }
             inner.entries.insert((sig, route.amount), route);
         }
         inner.entries.len()
