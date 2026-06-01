@@ -11,8 +11,13 @@ pub struct Metrics {
     pub metis_req_sent: AtomicU64,
     /// Round-trips where both quote1+quote2 returned successfully
     pub metis_resp_total: AtomicU64,
-    /// Quote pairs that passed the profitability check
+    /// Quote pairs that passed the profitability check at quote time.
+    /// Fires synchronously inside quote_check — may lead queue_in by one window
+    /// because the swap_instructions call runs asynchronously afterwards.
     pub metis_resp_ok: AtomicU64,
+    /// Items that successfully entered the LIFO queue (cache hit OR swap_ix success).
+    /// This is the definitive "made it to Jito" counter and is always sync with queue_in.
+    pub swap_ix_ok: AtomicU64,
 
     // ── Stage 1.5: swap_instructions + queue entry ────────────────────────────
     /// /swap-instructions returned an error (pre-queue drop). Sum of four below.
@@ -85,6 +90,7 @@ impl Metrics {
             metis_req_sent: AtomicU64::new(0),
             metis_resp_total: AtomicU64::new(0),
             metis_resp_ok: AtomicU64::new(0),
+            swap_ix_ok: AtomicU64::new(0),
             swap_ix_failed: AtomicU64::new(0),
             swap_ix_timeout: AtomicU64::new(0),
             swap_ix_http: AtomicU64::new(0),
@@ -132,6 +138,7 @@ impl Metrics {
                 let sent      = m.metis_req_sent.swap(0, Ordering::Relaxed);
                 let routes    = m.metis_resp_total.swap(0, Ordering::Relaxed);
                 let profit    = m.metis_resp_ok.swap(0, Ordering::Relaxed);
+                let sw_ok     = m.swap_ix_ok.swap(0, Ordering::Relaxed);
 
                 // ── swap_instructions ────────────────────────────────────────
                 let swap_fail = m.swap_ix_failed.swap(0, Ordering::Relaxed);
@@ -179,8 +186,8 @@ impl Metrics {
 
                 eprintln!(
                     "[{WINDOW_SECS}s] \
-metis_sent={sent} routes={routes} profitable={profit}\n  \
-PRE-QUEUE : swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
+metis_sent={sent} routes={routes} quoted_profitable={profit} (async lag: swap results may appear in next window)\n  \
+PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
 IN-QUEUE  : stale={stale} (ONLY drop reason: waited >{ttl_secs}s for a send slot)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
 JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \

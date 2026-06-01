@@ -511,6 +511,7 @@ pub async fn scan_all_tokens(
                 met_c.cache_served.fetch_add(1, Ordering::Relaxed);
                 met_c.cache_build_us_total.fetch_add(lookup_us, Ordering::Relaxed);
                 met_c.cache_build_samples.fetch_add(1, Ordering::Relaxed);
+                met_c.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
 
                 let swap_ixs_for_queue = cached_entry.swap_ixs.clone();
                 let item = ReadyInstruction {
@@ -600,8 +601,11 @@ pub async fn scan_all_tokens(
                             crate::metis::SwapIxError::Timeout => {
                                 met_c.swap_ix_timeout.fetch_add(1, Ordering::Relaxed);
                             }
-                            crate::metis::SwapIxError::Http(_) => {
+                            crate::metis::SwapIxError::Http(status) => {
                                 met_c.swap_ix_http.fetch_add(1, Ordering::Relaxed);
+                                // Log the DEX path so we can identify which routes
+                                // Metis consistently refuses at swap_ix level.
+                                instruction_cache::append_swap_ix_failure(&dex_path, status);
                             }
                             crate::metis::SwapIxError::Network => {
                                 met_c.swap_ix_network.fetch_add(1, Ordering::Relaxed);
@@ -624,6 +628,7 @@ pub async fn scan_all_tokens(
                     met_c.cache_saved_new.fetch_add(1, Ordering::Relaxed);
                 }
                 met_c.metis_served.fetch_add(1, Ordering::Relaxed);
+                met_c.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
 
                 let item = ReadyInstruction {
                     swap_ixs,

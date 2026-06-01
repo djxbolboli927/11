@@ -29,6 +29,12 @@ pub struct CachedRoute {
     pub hit_count: u64,
     /// Unix timestamp (seconds) of the most-recent update.
     pub last_seen_ts: u64,
+    /// True only when this entry was written (or refreshed) in the current
+    /// process run. Entries loaded from disk start as `false` and are not
+    /// served until Metis confirms them fresh for the first time.
+    /// Never persisted to disk (always resets to false on load).
+    #[serde(skip, default)]
+    pub fresh: bool,
 }
 
 struct CacheInner {
@@ -71,10 +77,21 @@ impl InstructionCache {
         fnv1a(&key)
     }
 
-    /// Exact lookup: returns `Some` only when both route structure AND amount match.
-    /// O(1) HashMap read under a shared read lock — no write contention on hot path.
+    /// Exact lookup: returns `Some` only when route + amount match AND the entry
+    /// has been confirmed fresh in the current process run (`fresh = true`).
+    ///
+    /// Entries loaded from disk at startup have `fresh = false` until Metis
+    /// returns a successful response for them and `record()` is called.
+    /// This prevents serving stale instructions whose pool-state data is hours
+    /// old and would cause on-chain reverts.
     pub fn lookup(&self, sig: RouteSignature, amount: u64) -> Option<CachedRoute> {
-        self.inner.read().ok()?.entries.get(&(sig, amount)).cloned()
+        self.inner
+            .read()
+            .ok()?
+            .entries
+            .get(&(sig, amount))
+            .filter(|r| r.fresh)
+            .cloned()
     }
 
     /// Store (or refresh) a Metis response for this exact (route, amount) pair.
@@ -99,12 +116,14 @@ impl InstructionCache {
                     swap_ixs,
                     hit_count: 1,
                     last_seen_ts: unix_now(),
+                    fresh: true, // confirmed by Metis in this process run
                 },
             );
         } else if let Some(entry) = inner.entries.get_mut(&key) {
             entry.swap_ixs = swap_ixs;
             entry.hit_count += 1;
             entry.last_seen_ts = unix_now();
+            entry.fresh = true; // re-confirmed fresh
         }
         inner.dirty = true;
         is_new
@@ -358,6 +377,29 @@ pub fn append_mismatch_log(sig_hex: &str, amount: u64, dex_path: &[String], diff
         "amount":   amount,
         "dex_path": dex_path,
         "diff":     diff,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{entry}");
+    }
+}
+
+/// Record a swap_ix HTTP failure with its DEX path to
+/// `/root/c/cache/swap_ix_failures.jsonl`.
+///
+/// Over time this file reveals which DEX paths Metis consistently refuses to
+/// build circular instructions for. Routes that appear here frequently can be
+/// added to `FORBIDDEN_DEX_LABELS` so the bot stops wasting Metis requests
+/// on them.
+pub fn append_swap_ix_failure(dex_path: &[String], http_status: u16) {
+    let path = "/root/c/cache/swap_ix_failures.jsonl";
+    let entry = serde_json::json!({
+        "ts":         unix_now(),
+        "dex_path":   dex_path,
+        "http_status": http_status,
     });
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
