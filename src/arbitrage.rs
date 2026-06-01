@@ -10,6 +10,7 @@ use crate::account_cache::AccountCache;
 use crate::alt_cache::AltCache;
 use crate::blockhash_cache::BlockhashCache;
 use crate::config::Config;
+use crate::instruction_cache::InstructionCache;
 use crate::jito::JitoClient;
 use crate::jito_grpc::JitoGrpcClient;
 use crate::litesvm_sim::SimulatorPool;
@@ -135,6 +136,7 @@ pub struct CalcCtx {
     pub user_pubkey: String,
     pub sim_cache: Option<Arc<AccountCache>>,
     pub sim_pool: Option<Arc<SimulatorPool>>,
+    pub instruction_cache: Arc<InstructionCache>,
 }
 
 // ─── Pipeline handle ──────────────────────────────────────────────────────────
@@ -492,46 +494,93 @@ pub async fn scan_all_tokens(
             }
         };
 
-        // Fire a detached task to fetch swap_instructions from Metis and push
-        // the result into the LIFO queue. Each task completes within
-        // quote_timeout_ms (≤200 ms), so tasks never accumulate and Metis's own
-        // internal queue paces the work naturally.
         let hop_count = pair.hop_count;
+        let amount = pair.amount;
+        let sig = crate::instruction_cache::route_sig(&merged.route_plan);
+        let ic = &config.instruction_cache;
+
+        // ── RAM path ──────────────────────────────────────────────────────────
+        // Only entered when serve_from_ram=true and we have a cache hit.
+        if ic.serve_from_ram {
+            if let Some(cached) = ctx.instruction_cache.get(sig, amount) {
+                metrics.cache_hit.fetch_add(1, Ordering::Relaxed);
+                metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
+
+                // If compare=true, fire a background task to call Metis and
+                // compare swap_instruction.data. The result served to the queue
+                // is always the RAM copy — the compare task is diagnostic only.
+                if ic.compare {
+                    let merged_cmp = merged.clone();
+                    let ctx_c = ctx.clone();
+                    let met_c = metrics.clone();
+                    let cached_data = cached.swap_instruction.data.clone();
+                    tokio::spawn(async move {
+                        match ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged_cmp).await {
+                            Ok(fresh) => {
+                                if fresh.swap_instruction.data == cached_data {
+                                    met_c.cache_compare_match.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    met_c.cache_compare_differ.fetch_add(1, Ordering::Relaxed);
+                                    tracing::warn!(sig, amount, "cache compare: swap_instruction differs");
+                                }
+                            }
+                            Err(_) => {
+                                met_c.cache_compare_fail.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
+
+                let item = ReadyInstruction {
+                    swap_ixs: cached,
+                    hop_count,
+                    arrived_at: std::time::Instant::now(),
+                    waited_for_slot: false,
+                };
+                pipeline.lifo.lock().unwrap().push(item);
+                metrics.queue_in.fetch_add(1, Ordering::Relaxed);
+                metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+                pipeline.lifo_sem.add_permits(1);
+                continue;
+            }
+            // cache miss: fall through to Metis path if serve_from_metis=true
+        }
+
+        // ── Metis path ────────────────────────────────────────────────────────
+        // Skipped when serve_from_metis=false (e.g. RAM-only mode).
+        if !ic.serve_from_metis {
+            metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
         let ctx_c = ctx.clone();
         let met_c = metrics.clone();
         let lifo_c = pipeline.lifo.clone();
         let sem_c = pipeline.lifo_sem.clone();
+        let save_new = ic.save_new;
 
         metrics.metis_req_sent.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
-            let t_metis = std::time::Instant::now();
+            let t = std::time::Instant::now();
+            let result = ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged).await;
+            let fetch_ms = t.elapsed().as_millis() as u64;
 
-            let swap_ix_result = ctx_c
-                .metis
-                .get_swap_instructions(&ctx_c.user_pubkey, &merged)
-                .await;
-            let fetch_ms = t_metis.elapsed().as_millis() as u64;
-
-            let swap_ixs = match swap_ix_result {
+            let swap_ixs = match result {
                 Ok(s) => s,
                 Err(e) => {
                     met_c.swap_ix_failed.fetch_add(1, Ordering::Relaxed);
                     met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                     match e {
-                        crate::metis::SwapIxError::Timeout => {
-                            met_c.swap_ix_timeout.fetch_add(1, Ordering::Relaxed);
-                        }
-                        crate::metis::SwapIxError::Http(_) => {
-                            met_c.swap_ix_http.fetch_add(1, Ordering::Relaxed);
-                        }
-                        crate::metis::SwapIxError::Network => {
-                            met_c.swap_ix_network.fetch_add(1, Ordering::Relaxed);
-                        }
-                        crate::metis::SwapIxError::Parse => {
-                            met_c.swap_ix_parse.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                        crate::metis::SwapIxError::Timeout =>
+                            met_c.swap_ix_timeout.fetch_add(1, Ordering::Relaxed),
+                        crate::metis::SwapIxError::Http(_) =>
+                            met_c.swap_ix_http.fetch_add(1, Ordering::Relaxed),
+                        crate::metis::SwapIxError::Network =>
+                            met_c.swap_ix_network.fetch_add(1, Ordering::Relaxed),
+                        crate::metis::SwapIxError::Parse =>
+                            met_c.swap_ix_parse.fetch_add(1, Ordering::Relaxed),
+                    };
                     return;
                 }
             };
@@ -539,6 +588,10 @@ pub async fn scan_all_tokens(
             met_c.metis_fetch_ms_total.fetch_add(fetch_ms, Ordering::Relaxed);
             met_c.metis_fetch_samples.fetch_add(1, Ordering::Relaxed);
             met_c.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
+
+            if save_new {
+                ctx_c.instruction_cache.set(sig, amount, swap_ixs.clone());
+            }
 
             let item = ReadyInstruction {
                 swap_ixs,

@@ -4,6 +4,7 @@ mod arbitrage;
 mod blockhash_cache;
 mod config;
 mod dex_accounts;
+mod instruction_cache;
 mod jito;
 mod jito_grpc;
 mod litesvm_sim;
@@ -189,6 +190,7 @@ async fn async_main(config: config::Config) -> Result<()> {
         user_pubkey: trading_keypair.pubkey().to_string(),
         sim_cache,
         sim_pool,
+        instruction_cache: instruction_cache::InstructionCache::new(),
     });
 
     // ── Spawn persistent calc workers. Jito throughput is enforced later, right

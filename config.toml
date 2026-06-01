@@ -111,3 +111,13 @@ endpoints = [
 # تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
 auth_keypair = "/root/c/wallet/grpc.json"
 max_bundles_per_second = 5
+
+[instruction_cache]
+# مرحله ۱: فقط save_new را روشن کنید تا کش پر شود (رفتار بدون تغییر)
+# مرحله ۲: compare=true برای تست صحت (هر RAM hit یک درخواست پس‌زمینه به متیس میفرستد)
+# مرحله ۳: compare=false, serve_from_ram=true برای استفاده از رم
+# مرحله ۴: serve_from_metis=false فقط وقتی کش کاملاً پر است (skip روی miss)
+save_new = false
+compare = false
+serve_from_ram = false
+serve_from_metis = true

@@ -58,10 +58,18 @@ pub struct Metrics {
     pub tx_dropped: AtomicU64,
 
     // ── swap_instructions latency ─────────────────────────────────────────────
-    /// Milliseconds spent waiting for all Metis swap_instructions responses.
     pub metis_fetch_ms_total: AtomicU64,
-    /// Sample count for metis_fetch_ms_total.
     pub metis_fetch_samples: AtomicU64,
+
+    // ── Instruction cache ─────────────────────────────────────────────────────
+    /// Opportunities served from RAM (Metis call skipped).
+    pub cache_hit: AtomicU64,
+    /// compare=true: fresh Metis instruction matched the cached one.
+    pub cache_compare_match: AtomicU64,
+    /// compare=true: fresh Metis instruction differed from cached.
+    pub cache_compare_differ: AtomicU64,
+    /// compare=true: background Metis call for comparison failed.
+    pub cache_compare_fail: AtomicU64,
 }
 
 impl Metrics {
@@ -89,6 +97,10 @@ impl Metrics {
             tx_dropped: AtomicU64::new(0),
             metis_fetch_ms_total: AtomicU64::new(0),
             metis_fetch_samples: AtomicU64::new(0),
+            cache_hit: AtomicU64::new(0),
+            cache_compare_match: AtomicU64::new(0),
+            cache_compare_differ: AtomicU64::new(0),
+            cache_compare_fail: AtomicU64::new(0),
         })
     }
 
@@ -130,6 +142,12 @@ impl Metrics {
                 let ms_ms     = m.metis_fetch_ms_total.swap(0, Ordering::Relaxed);
                 let ms_n      = m.metis_fetch_samples.swap(0, Ordering::Relaxed);
 
+                // ── Instruction cache ─────────────────────────────────────────
+                let cache_hit  = m.cache_hit.swap(0, Ordering::Relaxed);
+                let cmp_match  = m.cache_compare_match.swap(0, Ordering::Relaxed);
+                let cmp_differ = m.cache_compare_differ.swap(0, Ordering::Relaxed);
+                let cmp_fail   = m.cache_compare_fail.swap(0, Ordering::Relaxed);
+
                 // ── Gauges (read without reset) ───────────────────────────────
                 let depth      = m.queue_depth.load(Ordering::Relaxed);
 
@@ -141,12 +159,12 @@ impl Metrics {
 
                 eprintln!(
                     "[{WINDOW_SECS}s] \
-metis_sent={sent} routes={routes} quoted_profitable={profit} (async lag: swap results may appear in next window)\n  \
+metis_sent={sent} routes={routes} quoted_profitable={profit}\n  \
 PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
-IN-QUEUE  : stale={stale} (ONLY drop reason: waited >{ttl_secs}s for a send slot)\n  \
+IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
 JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \
-SWAP-IX   : avg_metis={avg_metis_ms}ms"
+SWAP-IX   : avg_metis={avg_metis_ms}ms  from_ram={cache_hit}  compare=[match={cmp_match} differ={cmp_differ} fail={cmp_fail}]"
                 );
             }
         });
