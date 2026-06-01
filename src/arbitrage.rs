@@ -491,109 +491,113 @@ pub async fn scan_all_tokens(
             }
         };
 
-        // Fire swap_instructions asynchronously; push result into the LIFO queue.
+        // ── Compute route signature and check cache synchronously ────────────
+        // Both operations are pure RAM (no IO), so running them here avoids
+        // spawning tasks that would block on the semaphore and accumulate.
+        let hop_count = pair.hop_count;
+        let route_sig = InstructionCache::compute_signature(&merged.route_plan);
+        let request_amount = merged.in_amount.parse::<u64>().unwrap_or(0);
+        let dex_path = instruction_cache::extract_dex_labels(&merged.route_plan);
+
+        let t_lookup = std::time::Instant::now();
+        let cached = ctx.instruction_cache.lookup(route_sig, request_amount);
+        let lookup_us = t_lookup.elapsed().as_micros() as u64;
+
+        if let Some(cached_entry) = cached {
+            // Cache hit: serve from RAM and push to queue without spawning a task.
+            metrics.cache_served.fetch_add(1, Ordering::Relaxed);
+            metrics.cache_build_us_total.fetch_add(lookup_us, Ordering::Relaxed);
+            metrics.cache_build_samples.fetch_add(1, Ordering::Relaxed);
+            metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
+
+            let item = ReadyInstruction {
+                swap_ixs: cached_entry.swap_ixs,
+                hop_count,
+                arrived_at: std::time::Instant::now(),
+                waited_for_slot: false,
+            };
+            pipeline.lifo.lock().unwrap().push(item);
+            metrics.queue_in.fetch_add(1, Ordering::Relaxed);
+            metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+            pipeline.lifo_sem.add_permits(1);
+            continue;
+        }
+
+        // Cache miss: try to claim a semaphore permit without blocking.
+        // If all slots are busy, skip this opportunity rather than spawning a
+        // task that would queue behind thousands of others and inflate timing.
+        let permit = match ctx.swap_ix_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Got a permit — spawn exactly one task that will hold the permit until
+        // the Metis HTTP response arrives. Timer starts here so it measures only
+        // actual network latency, not semaphore wait time.
         let ctx_c = ctx.clone();
         let met_c = metrics.clone();
         let lifo_c = pipeline.lifo.clone();
         let sem_c = pipeline.lifo_sem.clone();
-        let hop_count = pair.hop_count;
+
+        metrics.metis_req_sent.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
-            // Extract route signature and exact amount before any IO.
-            let route_sig = InstructionCache::compute_signature(&merged.route_plan);
-            let request_amount = merged.in_amount.parse::<u64>().unwrap_or(0);
-            let dex_path = instruction_cache::extract_dex_labels(&merged.route_plan);
+            let t_metis = std::time::Instant::now();
 
-            // ── Cache hit: serve from RAM, no Metis call ─────────────────────
-            let t_lookup = std::time::Instant::now();
-            let cached = ctx_c.instruction_cache.lookup(route_sig, request_amount);
-            let lookup_us = t_lookup.elapsed().as_micros() as u64;
+            let swap_ix_result = ctx_c
+                .metis
+                .get_swap_instructions(&ctx_c.user_pubkey, &merged)
+                .await;
+            drop(permit); // release slot immediately after HTTP response
 
-            if let Some(cached_entry) = cached {
-                // Exact (route, amount) match found and fresh — push to queue.
-                // No Metis call: cache entries auto-expire after INTRA_RUN_TTL_SECS
-                // and are re-fetched on the next miss, so pool state stays current
-                // without flooding Metis with a background call per hit.
-                met_c.cache_served.fetch_add(1, Ordering::Relaxed);
-                met_c.cache_build_us_total.fetch_add(lookup_us, Ordering::Relaxed);
-                met_c.cache_build_samples.fetch_add(1, Ordering::Relaxed);
-                met_c.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
+            let fetch_ms = t_metis.elapsed().as_millis() as u64;
 
-                let item = ReadyInstruction {
-                    swap_ixs: cached_entry.swap_ixs,
-                    hop_count,
-                    arrived_at: std::time::Instant::now(),
-                    waited_for_slot: false,
-                };
-                lifo_c.lock().unwrap().push(item);
-                met_c.queue_in.fetch_add(1, Ordering::Relaxed);
-                met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
-                sem_c.add_permits(1);
-            } else {
-                // ── Cache miss: rate-limited Metis call ──────────────────────
-                // Acquire a slot from the shared semaphore BEFORE calling Metis.
-                // This caps concurrent swap_instructions connections to
-                // max_concurrent_swap_ix so a burst of profitable quotes cannot
-                // flood Metis with thousands of simultaneous HTTP requests.
-                met_c.metis_req_sent.fetch_add(1, Ordering::Relaxed);
-                let t_metis = std::time::Instant::now();
-
-                let permit = ctx_c.swap_ix_sem.clone().acquire_owned().await.unwrap();
-                let swap_ix_result = ctx_c
-                    .metis
-                    .get_swap_instructions(&ctx_c.user_pubkey, &merged)
-                    .await;
-                drop(permit); // release slot as soon as HTTP response arrives
-
-                let fetch_ms = t_metis.elapsed().as_millis() as u64;
-
-                let swap_ixs = match swap_ix_result {
-                    Ok(s) => s,
-                    Err(e) => {
-                        met_c.swap_ix_failed.fetch_add(1, Ordering::Relaxed);
-                        met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
-                        match e {
-                            crate::metis::SwapIxError::Timeout => {
-                                met_c.swap_ix_timeout.fetch_add(1, Ordering::Relaxed);
-                            }
-                            crate::metis::SwapIxError::Http(status) => {
-                                met_c.swap_ix_http.fetch_add(1, Ordering::Relaxed);
-                                instruction_cache::append_swap_ix_failure(&dex_path, status);
-                            }
-                            crate::metis::SwapIxError::Network => {
-                                met_c.swap_ix_network.fetch_add(1, Ordering::Relaxed);
-                            }
-                            crate::metis::SwapIxError::Parse => {
-                                met_c.swap_ix_parse.fetch_add(1, Ordering::Relaxed);
-                            }
+            let swap_ixs = match swap_ix_result {
+                Ok(s) => s,
+                Err(e) => {
+                    met_c.swap_ix_failed.fetch_add(1, Ordering::Relaxed);
+                    met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                    match e {
+                        crate::metis::SwapIxError::Timeout => {
+                            met_c.swap_ix_timeout.fetch_add(1, Ordering::Relaxed);
                         }
-                        return;
+                        crate::metis::SwapIxError::Http(status) => {
+                            met_c.swap_ix_http.fetch_add(1, Ordering::Relaxed);
+                            instruction_cache::append_swap_ix_failure(&dex_path, status);
+                        }
+                        crate::metis::SwapIxError::Network => {
+                            met_c.swap_ix_network.fetch_add(1, Ordering::Relaxed);
+                        }
+                        crate::metis::SwapIxError::Parse => {
+                            met_c.swap_ix_parse.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                };
-
-                met_c.metis_fetch_ms_total.fetch_add(fetch_ms, Ordering::Relaxed);
-                met_c.metis_fetch_samples.fetch_add(1, Ordering::Relaxed);
-
-                let is_new = ctx_c
-                    .instruction_cache
-                    .record(route_sig, request_amount, dex_path, swap_ixs.clone());
-                if is_new {
-                    met_c.cache_saved_new.fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
-                met_c.metis_served.fetch_add(1, Ordering::Relaxed);
-                met_c.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
+            };
 
-                let item = ReadyInstruction {
-                    swap_ixs,
-                    hop_count,
-                    arrived_at: std::time::Instant::now(),
-                    waited_for_slot: false,
-                };
-                lifo_c.lock().unwrap().push(item);
-                met_c.queue_in.fetch_add(1, Ordering::Relaxed);
-                met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
-                sem_c.add_permits(1);
+            met_c.metis_fetch_ms_total.fetch_add(fetch_ms, Ordering::Relaxed);
+            met_c.metis_fetch_samples.fetch_add(1, Ordering::Relaxed);
+
+            let is_new = ctx_c
+                .instruction_cache
+                .record(route_sig, request_amount, dex_path, swap_ixs.clone());
+            if is_new {
+                met_c.cache_saved_new.fetch_add(1, Ordering::Relaxed);
             }
+            met_c.metis_served.fetch_add(1, Ordering::Relaxed);
+            met_c.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
+
+            let item = ReadyInstruction {
+                swap_ixs,
+                hop_count,
+                arrived_at: std::time::Instant::now(),
+                waited_for_slot: false,
+            };
+            lifo_c.lock().unwrap().push(item);
+            met_c.queue_in.fetch_add(1, Ordering::Relaxed);
+            met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
+            sem_c.add_permits(1);
         });
     }
 
