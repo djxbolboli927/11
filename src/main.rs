@@ -4,7 +4,6 @@ mod arbitrage;
 mod blockhash_cache;
 mod config;
 mod dex_accounts;
-mod instruction_cache;
 mod jito;
 mod jito_grpc;
 mod litesvm_sim;
@@ -82,29 +81,8 @@ async fn async_main(config: config::Config) -> Result<()> {
         &wsol_mint,
     );
 
-    let instruction_cache = instruction_cache::InstructionCache::new();
-    if config.performance.cache_enabled {
-        // Restore any previously-collected (route, amount) entries so the cache
-        // survives restarts and can serve from RAM on the very first scan.
-        let loaded = instruction_cache.load_from_disk();
-        if loaded > 0 {
-            eprintln!(
-                "[cache] loaded {loaded} entries ({} routes) from /root/c/cache/routes/hot_routes.json",
-                instruction_cache.route_count()
-            );
-        }
-        instruction_cache.spawn_flush_task(60); // flush to /root/c/cache/ every 60 seconds
-    } else {
-        eprintln!(
-            "[cache] disabled via config (performance.cache_enabled=false) — running in pre-cache mode"
-        );
-    }
-
     let metrics = metrics::Metrics::new();
-    metrics.spawn_reporter(
-        config.performance.queue_max_age_ms,
-        instruction_cache.clone(),
-    );
+    metrics.spawn_reporter(config.performance.queue_max_age_ms);
 
     let token_metrics = token_metrics::TokenMetrics::new(&token_mints);
     token_metrics.spawn_reporter();
@@ -211,7 +189,6 @@ async fn async_main(config: config::Config) -> Result<()> {
         user_pubkey: trading_keypair.pubkey().to_string(),
         sim_cache,
         sim_pool,
-        instruction_cache,
     });
 
     // ── Spawn persistent calc workers. Jito throughput is enforced later, right

@@ -1,4 +1,3 @@
-use crate::instruction_cache::InstructionCache;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,21 +57,8 @@ pub struct Metrics {
     pub dropped_busy: AtomicU64,
     pub tx_dropped: AtomicU64,
 
-    // ── Instruction cache ─────────────────────────────────────────────────────
-    /// New (route, amount) entries added to the cache for the first time.
-    pub cache_saved_new: AtomicU64,
-
-    // ── Instruction serving: from RAM vs from Metis ───────────────────────────
-    /// Instructions served directly from RAM cache (bypassed Metis entirely).
-    pub cache_served: AtomicU64,
-    /// Microseconds spent on all cache-served instructions (for avg latency).
-    pub cache_build_us_total: AtomicU64,
-    /// Sample count for cache_build_us_total.
-    pub cache_build_samples: AtomicU64,
-
-    /// Instructions received from Metis and sent to the queue (cache miss path).
-    pub metis_served: AtomicU64,
-    /// Milliseconds spent waiting for all Metis responses (for avg latency).
+    // ── swap_instructions latency ─────────────────────────────────────────────
+    /// Milliseconds spent waiting for all Metis swap_instructions responses.
     pub metis_fetch_ms_total: AtomicU64,
     /// Sample count for metis_fetch_ms_total.
     pub metis_fetch_samples: AtomicU64,
@@ -101,22 +87,13 @@ impl Metrics {
             jito_sent: AtomicU64::new(0),
             dropped_busy: AtomicU64::new(0),
             tx_dropped: AtomicU64::new(0),
-            cache_saved_new: AtomicU64::new(0),
-            cache_served: AtomicU64::new(0),
-            cache_build_us_total: AtomicU64::new(0),
-            cache_build_samples: AtomicU64::new(0),
-            metis_served: AtomicU64::new(0),
             metis_fetch_ms_total: AtomicU64::new(0),
             metis_fetch_samples: AtomicU64::new(0),
         })
     }
 
     /// Prints a funnel-style report every 30 s so every drop reason is visible.
-    pub fn spawn_reporter(
-        self: &Arc<Self>,
-        queue_max_age_ms: u64,
-        cache: Arc<InstructionCache>,
-    ) {
+    pub fn spawn_reporter(self: &Arc<Self>, queue_max_age_ms: u64) {
         let m = self.clone();
         let ttl_secs = queue_max_age_ms as f64 / 1000.0;
         tokio::spawn(async move {
@@ -149,27 +126,17 @@ impl Metrics {
                 let jfail     = m.jito_send_failed.swap(0, Ordering::Relaxed);
                 let jito      = m.jito_sent.swap(0, Ordering::Relaxed);
 
-                // ── Cache serving ────────────────────────────────────────────
-                let new_saved = m.cache_saved_new.swap(0, Ordering::Relaxed);
-
-                let cs        = m.cache_served.swap(0, Ordering::Relaxed);
-                let cs_us     = m.cache_build_us_total.swap(0, Ordering::Relaxed);
-                let cs_n      = m.cache_build_samples.swap(0, Ordering::Relaxed);
-
-                let ms_srv    = m.metis_served.swap(0, Ordering::Relaxed);
+                // ── swap_instructions latency ────────────────────────────────
                 let ms_ms     = m.metis_fetch_ms_total.swap(0, Ordering::Relaxed);
                 let ms_n      = m.metis_fetch_samples.swap(0, Ordering::Relaxed);
 
                 // ── Gauges (read without reset) ───────────────────────────────
                 let depth      = m.queue_depth.load(Ordering::Relaxed);
-                let c_routes   = cache.route_count();
-                let c_entries  = cache.entry_count();
 
                 // ── Drain legacy aggregates ───────────────────────────────────
                 let _ = m.tx_dropped.swap(0, Ordering::Relaxed);
                 let _ = m.dropped_busy.swap(0, Ordering::Relaxed);
 
-                let avg_cache_us = if cs_n > 0 { cs_us / cs_n } else { 0 };
                 let avg_metis_ms = if ms_n > 0 { ms_ms / ms_n } else { 0 };
 
                 eprintln!(
@@ -179,8 +146,7 @@ PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={
 IN-QUEUE  : stale={stale} (ONLY drop reason: waited >{ttl_secs}s for a send slot)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
 JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \
-CACHE     : routes={c_routes} entries={c_entries} new_saved={new_saved}\n  \
-SERVING   : from_cache={cs} (avg={avg_cache_us}µs)  from_metis={ms_srv} (avg={avg_metis_ms}ms)"
+SWAP-IX   : avg_metis={avg_metis_ms}ms"
                 );
             }
         });

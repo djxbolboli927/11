@@ -195,19 +195,8 @@ pub struct PerformanceConfig {
     /// Metis responses; lower to discard stale opportunities faster.
     #[serde(default = "default_queue_max_age_ms")]
     pub queue_max_age_ms: u64,
-    /// Master switch for the whole instruction-cache layer. When `false`, the
-    /// bot never looks up, records, loads-from-disk, or flushes the cache — it
-    /// behaves exactly like the pre-cache version, calling Metis
-    /// swap_instructions fresh for every opportunity. Use this to isolate
-    /// whether the cache layer is what perturbs a co-located Metis process.
-    #[serde(default = "default_cache_enabled")]
-    pub cache_enabled: bool,
     #[serde(default)]
     pub bot_cpu_cores: Vec<usize>,
-}
-
-fn default_cache_enabled() -> bool {
-    true
 }
 
 fn default_max_concurrent_quotes() -> usize {
