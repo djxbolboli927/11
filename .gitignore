@@ -19,4 +19,7 @@ target/
 # Editors
 .vscode/
 .idea/
+
+# Claude Code internal data
+.claude/
 ```
