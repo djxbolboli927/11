@@ -112,12 +112,10 @@ endpoints = [
 auth_keypair = "/root/c/wallet/grpc.json"
 max_bundles_per_second = 5
 
-[instruction_cache]
-# مرحله ۱: فقط save_new را روشن کنید تا کش پر شود (رفتار بدون تغییر)
-# مرحله ۲: compare=true برای تست صحت (هر RAM hit یک درخواست پس‌زمینه به متیس میفرستد)
-# مرحله ۳: compare=false, serve_from_ram=true برای استفاده از رم
-# مرحله ۴: serve_from_metis=false فقط وقتی کش کاملاً پر است (skip روی miss)
+[template_cache]
+# مرحله ۱: save_new=true — template های route و hop از پاسخ های متیس استخراج و ذخیره می شوند
+# مرحله ۲: serve_route=true — RouteTemplate را از RAM سرو کنید (مقادیر in_amount/quoted_out patch می شوند)
+# مرحله ۳: serve_from_metis=false — فقط وقتی کاملاً به RAM اعتماد دارید
 save_new = false
-compare = false
-serve_from_ram = false
+serve_route = false
 serve_from_metis = true

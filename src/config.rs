@@ -15,7 +15,7 @@ pub struct Config {
     #[serde(default)]
     pub jito_grpc: JitoGrpcConfig,
     #[serde(default)]
-    pub instruction_cache: InstructionCacheConfig,
+    pub template_cache: TemplateCacheConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -217,44 +217,39 @@ fn default_queue_max_age_ms() -> u64 {
     5000
 }
 
-/// Four independent switches for the instruction-cache layer.
+/// Template cache configuration.
 ///
-/// Recommended rollout order:
-///   1. save_new=true       — fill the cache silently (no behaviour change)
-///   2. compare=true        — verify RAM matches Metis (each RAM hit adds one
-///                            background Metis call for logging only)
-///   3. compare=false, serve_from_ram=true — start serving from RAM on hits
-///   4. serve_from_metis=false             — RAM-only mode (skip on miss)
+/// Rollout order:
+///   1. save_new=true       — extract and store route/hop templates from Metis
+///                            responses. No behaviour change yet.
+///   2. serve_route=true    — serve from RouteTemplate on hit, patching
+///                            in_amount / quoted_out_amount in the Borsh data.
+///                            Falls back to Metis when patching is not possible.
+///   3. serve_from_metis=false — RAM-only (miss = drop, no Metis call).
 #[derive(Debug, Deserialize, Clone)]
-pub struct InstructionCacheConfig {
-    /// Store swap_instructions responses in RAM as they arrive from Metis.
+pub struct TemplateCacheConfig {
+    /// Extract and save route/hop templates from every Metis response.
     #[serde(default)]
     pub save_new: bool,
-    /// On a RAM hit, also call Metis in background and compare swap_instruction.data.
-    /// Logs a warning when they differ. Adds one extra Metis call per RAM hit.
+    /// Serve from RouteTemplate when available (patches amounts if needed).
     #[serde(default)]
-    pub compare: bool,
-    /// Serve instructions from RAM when available (no Metis call on cache hit).
-    /// Falls back to Metis if serve_from_metis=true and cache misses.
-    #[serde(default)]
-    pub serve_from_ram: bool,
-    /// Call Metis for instructions. Set to false only when fully relying on RAM.
-    #[serde(default = "default_true_ic")]
+    pub serve_route: bool,
+    /// Call Metis for instructions when no route template hits.
+    #[serde(default = "default_true_tc")]
     pub serve_from_metis: bool,
 }
 
-impl Default for InstructionCacheConfig {
+impl Default for TemplateCacheConfig {
     fn default() -> Self {
         Self {
             save_new: false,
-            compare: false,
-            serve_from_ram: false,
+            serve_route: false,
             serve_from_metis: true,
         }
     }
 }
 
-fn default_true_ic() -> bool {
+fn default_true_tc() -> bool {
     true
 }
 

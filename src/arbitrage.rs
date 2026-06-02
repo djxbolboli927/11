@@ -10,7 +10,6 @@ use crate::account_cache::AccountCache;
 use crate::alt_cache::AltCache;
 use crate::blockhash_cache::BlockhashCache;
 use crate::config::Config;
-use crate::instruction_cache::InstructionCache;
 use crate::jito::JitoClient;
 use crate::jito_grpc::JitoGrpcClient;
 use crate::litesvm_sim::SimulatorPool;
@@ -18,6 +17,7 @@ use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
 use crate::metrics::Metrics;
 use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS, PMM_PROGRAM_IDS};
 use crate::rate_limiter::RateLimiter;
+use crate::template_cache::{self, TemplateStore};
 use crate::token_metrics::TokenMetrics;
 use crate::tokens::WSOL_MINT;
 use crate::transaction;
@@ -26,10 +26,6 @@ const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 const JITO_TIP_LAMPORTS: u64 = 1_600;
 const NETWORK_FEE_LAMPORTS: u64 = 5_000;
 
-/// How long a worker sleeps before retrying when both Jito limiters are full.
-/// The sliding-window limiter frees a slot within ≤1s of a prior send, so a
-/// short poll keeps latency low while the item waits (it is never dropped for
-/// rate-limit reasons — only when it ages past queue_max_age_ms).
 const RATE_RETRY_BACKOFF_MS: u64 = 20;
 
 // ─── Route helpers ───────────────────────────────────────────────────────────
@@ -113,10 +109,6 @@ struct ReadyInstruction {
     swap_ixs: SwapInstructionsResponse,
     hop_count: usize,
     arrived_at: Instant,
-    /// True once this item has been requeued at least once for a Jito slot.
-    /// Used so the rate_requeued metric counts DISTINCT waiting transactions
-    /// rather than every 20ms poll (which inflated the number into the tens of
-    /// thousands). Bounded by queue_in.
     waited_for_slot: bool,
 }
 
@@ -138,12 +130,11 @@ pub struct CalcCtx {
     pub sim_cache: Option<Arc<AccountCache>>,
     #[allow(dead_code)]
     pub sim_pool: Option<Arc<SimulatorPool>>,
-    pub instruction_cache: Arc<InstructionCache>,
+    pub template_store: Arc<TemplateStore>,
 }
 
 // ─── Pipeline handle ──────────────────────────────────────────────────────────
 
-/// Shared LIFO queue + semaphore. Pass to scan_all_tokens.
 pub struct Pipeline {
     lifo: Arc<Mutex<Vec<ReadyInstruction>>>,
     lifo_sem: Arc<tokio::sync::Semaphore>,
@@ -156,6 +147,11 @@ pub struct Pipeline {
 /// Free and direct entries are separate items in all_pairs so they never
 /// block each other — a direct-route timeout does not delay the free-route
 /// check for the same token.
+///
+/// Note: Both free (only_direct=false) and direct (only_direct=true) routes
+/// are scanned for every token. Free routes often return multi-hop paths
+/// (hop_count > 2) which are filtered later — only 1-hop-each-leg routes
+/// (hop_count == 2) are safe to send to /swap-instructions.
 async fn quote_check(
     metis: &MetisClient,
     token_mint: &str,
@@ -165,14 +161,12 @@ async fn quote_check(
     metrics: &Metrics,
     token_metrics: &TokenMetrics,
 ) -> Option<QuotePair> {
-    // 2 HTTP requests per check (quote1 + quote2).
     metrics.metis_req_sent.fetch_add(2, Ordering::Relaxed);
     let ts = token_metrics.get(token_mint);
     if let Some(ts) = ts {
         ts.q_sent.fetch_add(2, Ordering::Relaxed);
     }
 
-    // quote1: WSOL → token
     let quote1 = match metis.get_quote(WSOL_MINT, token_mint, amount, only_direct).await {
         Ok(q) => q,
         Err(_) => {
@@ -193,7 +187,6 @@ async fn quote_check(
         }
     };
 
-    // quote2: token → WSOL
     let quote2 = match metis.get_quote(token_mint, WSOL_MINT, token_amount, only_direct).await {
         Ok(q) => q,
         Err(_) => {
@@ -210,6 +203,7 @@ async fn quote_check(
         ts.route_ok.fetch_add(1, Ordering::Relaxed);
     }
 
+    // min_profit_lamports is GROSS profit at quote stage (before fees).
     let stage1_threshold = amount.saturating_add(min_profit_lamports);
     if output_wsol <= stage1_threshold {
         if let Some(ts) = ts {
@@ -256,16 +250,6 @@ async fn quote_check(
 
 // ─── Worker pool ──────────────────────────────────────────────────────────────
 
-/// Spawn `worker_count` persistent pipeline workers and return the Pipeline handle.
-///
-/// Workers wait on the semaphore for a ReadyInstruction to arrive in the LIFO
-/// queue. When one arrives they pop the **newest** item (LIFO order), discard it
-/// if older than `queue_max_age_ms`, then build a versioned transaction and
-/// submit it to Jito.
-///
-/// Workers build the transaction first, then claim a Jito rate-limit slot right
-/// before `send_bundle`. This keeps slow/failed swap-instructions or tx builds
-/// from burning one of the 10 per-second Jito slots.
 pub fn spawn_workers(
     ctx: Arc<CalcCtx>,
     metrics: Arc<Metrics>,
@@ -282,7 +266,6 @@ pub fn spawn_workers(
         let met_c = metrics.clone();
         tokio::spawn(async move {
             loop {
-                // Block until at least one item is available.
                 sem_c.acquire().await.unwrap().forget();
 
                 let item = lifo_c.lock().unwrap().pop();
@@ -294,22 +277,12 @@ pub fn spawn_workers(
                     None => continue,
                 };
 
-                // Drop only when the item has waited longer than queue_max_age_ms.
-                // This is the ONLY reason an item leaves the queue without being
-                // sent — rate limiting never drops it (see the requeue below).
                 if item.arrived_at.elapsed().as_millis() as u64 > queue_max_age_ms {
                     met_c.dropped_stale.fetch_add(1, Ordering::Relaxed);
                     met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
-                // Claim a Jito send slot BEFORE building. The send rate stays at
-                // 10/sec (REST + gRPC limiters). If both are full we must NOT
-                // drop: put the item back on the queue (newest-first preserved,
-                // arrived_at unchanged) and retry after a short backoff. Claiming
-                // before the build means a rate-limited retry costs no build work,
-                // and the item keeps waiting until either a slot frees or it ages
-                // past the 2s TTL.
                 let use_grpc = if ctx_c.jito_limiter.lock().unwrap().try_acquire() {
                     false
                 } else if ctx_c
@@ -320,10 +293,6 @@ pub fn spawn_workers(
                 {
                     true
                 } else {
-                    // Both limiters full — keep the item in the queue. Count the
-                    // metric only the FIRST time an item waits, so rate_requeued
-                    // reflects distinct transactions that queued for a slot (not
-                    // every poll). It can never exceed queue_in.
                     if !item.waited_for_slot {
                         item.waited_for_slot = true;
                         met_c.rate_requeued.fetch_add(1, Ordering::Relaxed);
@@ -331,14 +300,11 @@ pub fn spawn_workers(
                     lifo_c.lock().unwrap().push(item);
                     met_c.queue_depth.fetch_add(1, Ordering::Relaxed);
                     sem_c.add_permits(1);
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        RATE_RETRY_BACKOFF_MS,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(RATE_RETRY_BACKOFF_MS))
+                        .await;
                     continue;
                 };
 
-                // Slot held — build the versioned transaction.
                 let cu_limit = lookup_cu_limit(item.hop_count, &ctx_c.cu_limits);
                 let recent_blockhash = ctx_c.blockhash_cache.get();
                 let keypair = ctx_c.trading_keypair.clone();
@@ -367,7 +333,6 @@ pub fn spawn_workers(
                     }
                 };
 
-                // Size guard (Solana hard limit: 1232 bytes).
                 match bincode::serialize(&tx) {
                     Ok(bytes) if bytes.len() > 1232 => {
                         met_c.tx_too_large.fetch_add(1, Ordering::Relaxed);
@@ -384,7 +349,6 @@ pub fn spawn_workers(
 
                 met_c.calc_done.fetch_add(1, Ordering::Relaxed);
 
-                // Send bundle to Jito via the slot we just claimed.
                 let result = if use_grpc {
                     match &ctx_c.jito_grpc {
                         Some(grpc) => grpc.send_bundle(&tx).await,
@@ -410,16 +374,45 @@ pub fn spawn_workers(
     Pipeline { lifo, lifo_sem }
 }
 
+// ─── Queue helper ─────────────────────────────────────────────────────────────
+
+fn push_to_queue(
+    swap_ixs: SwapInstructionsResponse,
+    hop_count: usize,
+    pipeline: &Pipeline,
+    metrics: &Metrics,
+) {
+    let item = ReadyInstruction {
+        swap_ixs,
+        hop_count,
+        arrived_at: Instant::now(),
+        waited_for_slot: false,
+    };
+    pipeline.lifo.lock().unwrap().push(item);
+    metrics.queue_in.fetch_add(1, Ordering::Relaxed);
+    metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+    pipeline.lifo_sem.add_permits(1);
+}
+
 // ─── Main scan entry ─────────────────────────────────────────────────────────
 
-/// One scan cycle over all (token × amount) pairs.
+/// One scan cycle over all (token × amount × route_mode) triples.
 ///
-/// Stage 1: buffer_unordered quote scanner (`performance.max_concurrent_quotes`).
-/// For each profitable pair:
-///   - Merge quotes and fire a detached tokio task for swap_instructions.
-///   - The task pushes a ReadyInstruction into the Pipeline's LIFO queue.
-/// Stage 2: pre-spawned workers drain the LIFO queue newest-first, build the tx,
-/// then claim a Jito rate-limit slot only immediately before send_bundle.
+/// For each profitable 2-hop pair the three-tier flow is:
+///
+///   Tier 1 — RouteTemplate hit:
+///     Serve from RAM using a cached SwapInstructionsResponse.
+///     If amounts differ from the template, patch in_amount and
+///     quoted_out_amount in the Borsh data at pre-discovered byte offsets.
+///     Skips /swap-instructions entirely on a hit.
+///
+///   Tier 2 — HopTemplate check (metrics only, no composer yet):
+///     If all hops in the route have been seen before, record the metric.
+///     Still falls through to Metis until a composer is implemented.
+///
+///   Tier 3 — Metis fallback:
+///     Call /swap-instructions as before.
+///     On success: save RouteTemplate + record hops (if save_new=true).
 pub async fn scan_all_tokens(
     token_mints: &[String],
     config: &Config,
@@ -434,8 +427,11 @@ pub async fn scan_all_tokens(
     let min_profit_lamports = config.trading.min_profit_lamports;
 
     // Each (amount, token) generates two independent entries: free routes and
-    // direct-only routes. They are processed separately by buffer_unordered so
-    // a slow/timing-out direct request never blocks the free-route check.
+    // direct-only routes. They run concurrently so a slow/timing-out direct
+    // request never blocks the free-route check for the same token.
+    // Note: free routes (only_direct=false) often return multi-hop paths that
+    // are filtered later by the hop_count==2 gate, but direct routes that
+    // happen to share the same 2-hop structure ARE also included.
     let all_pairs: Vec<(u64, String, bool)> = {
         let mut pairs = Vec::new();
         let mut amount = min_lamports;
@@ -481,8 +477,10 @@ pub async fn scan_all_tokens(
             "send_candidate"
         );
 
-        // Only 2-hop routes (1 hop each side) are safe to send to swap_instructions.
-        // Multi-hop merged routes (from only_direct=false) cause Metis 500 errors.
+        // Only 2-hop routes (1 hop each leg) are safe for /swap-instructions.
+        // Multi-hop free-route results are filtered here. This is visible in
+        // the metrics: quoted_profitable counts all passing quote-stage checks
+        // (including multi-hop), but swap_ix_ok only counts what reaches Jito.
         if pair.hop_count != 2 {
             metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -498,59 +496,41 @@ pub async fn scan_all_tokens(
 
         let hop_count = pair.hop_count;
         let amount = pair.amount;
-        let sig = crate::instruction_cache::route_sig(&merged.route_plan);
-        let ic = &config.instruction_cache;
+        let sig = template_cache::route_sig(&merged.route_plan);
+        let tc = &config.template_cache;
+        let context_slot = merged.context_slot;
 
-        // ── RAM path ──────────────────────────────────────────────────────────
-        // Only entered when serve_from_ram=true and we have a cache hit.
-        if ic.serve_from_ram {
-            if let Some(cached) = ctx.instruction_cache.get(sig, amount) {
-                metrics.cache_hit.fetch_add(1, Ordering::Relaxed);
-                metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
-
-                // If compare=true, fire a background task to call Metis and
-                // compare swap_instruction.data. The result served to the queue
-                // is always the RAM copy — the compare task is diagnostic only.
-                if ic.compare {
-                    let merged_cmp = merged.clone();
-                    let ctx_c = ctx.clone();
-                    let met_c = metrics.clone();
-                    let cached_data = cached.swap_instruction.data.clone();
-                    tokio::spawn(async move {
-                        match ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged_cmp).await {
-                            Ok(fresh) => {
-                                if fresh.swap_instruction.data == cached_data {
-                                    met_c.cache_compare_match.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    met_c.cache_compare_differ.fetch_add(1, Ordering::Relaxed);
-                                    tracing::warn!(sig, amount, "cache compare: swap_instruction differs");
-                                }
-                            }
-                            Err(_) => {
-                                met_c.cache_compare_fail.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    });
+        // ── Tier 1: RouteTemplate hit ─────────────────────────────────────────
+        // RouteTemplate is keyed by route_sig (NO amount). When the same route
+        // structure is requested with a different amount, the Borsh instruction
+        // data is patched at pre-discovered byte offsets.
+        if tc.serve_route {
+            if let Some(tmpl) = ctx.template_store.get_route(sig) {
+                if let Some(patched) = template_cache::serve_route(&tmpl, amount, on_chain_floor) {
+                    metrics.route_template_hit.fetch_add(1, Ordering::Relaxed);
+                    metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
+                    ctx.template_store.record_route_hit(sig);
+                    push_to_queue(patched, hop_count, pipeline, metrics);
+                    continue;
                 }
-
-                let item = ReadyInstruction {
-                    swap_ixs: cached,
-                    hop_count,
-                    arrived_at: std::time::Instant::now(),
-                    waited_for_slot: false,
-                };
-                pipeline.lifo.lock().unwrap().push(item);
-                metrics.queue_in.fetch_add(1, Ordering::Relaxed);
-                metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
-                pipeline.lifo_sem.add_permits(1);
-                continue;
+                // Patching failed (no offsets discovered): fall through to Metis.
             }
-            // cache miss: fall through to Metis path if serve_from_metis=true
         }
 
-        // ── Metis path ────────────────────────────────────────────────────────
-        // Skipped when serve_from_metis=false (e.g. RAM-only mode).
-        if !ic.serve_from_metis {
+        // ── Tier 2: HopTemplate check ─────────────────────────────────────────
+        // Metrics only — no composer yet. If all hops are known, we still call
+        // Metis for now (composition will be added once the encoder is validated).
+        {
+            let (all_hit, missing) = ctx.template_store.check_hops(&merged.route_plan);
+            if all_hit {
+                metrics.hop_template_all_hit.fetch_add(1, Ordering::Relaxed);
+            } else if missing > 0 {
+                metrics.hop_template_missing.fetch_add(missing as u64, Ordering::Relaxed);
+            }
+        }
+
+        // ── Tier 3: Metis fallback ────────────────────────────────────────────
+        if !tc.serve_from_metis {
             metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -559,13 +539,14 @@ pub async fn scan_all_tokens(
         let met_c = metrics.clone();
         let lifo_c = pipeline.lifo.clone();
         let sem_c = pipeline.lifo_sem.clone();
-        let save_new = ic.save_new;
+        let save_new = tc.save_new;
 
         metrics.metis_req_sent.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
             let t = std::time::Instant::now();
-            let result = ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged).await;
+            let result =
+                ctx_c.metis.get_swap_instructions(&ctx_c.user_pubkey, &merged).await;
             let fetch_ms = t.elapsed().as_millis() as u64;
 
             let swap_ixs = match result {
@@ -574,14 +555,18 @@ pub async fn scan_all_tokens(
                     met_c.swap_ix_failed.fetch_add(1, Ordering::Relaxed);
                     met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                     match e {
-                        crate::metis::SwapIxError::Timeout =>
-                            met_c.swap_ix_timeout.fetch_add(1, Ordering::Relaxed),
-                        crate::metis::SwapIxError::Http(_) =>
-                            met_c.swap_ix_http.fetch_add(1, Ordering::Relaxed),
-                        crate::metis::SwapIxError::Network =>
-                            met_c.swap_ix_network.fetch_add(1, Ordering::Relaxed),
-                        crate::metis::SwapIxError::Parse =>
-                            met_c.swap_ix_parse.fetch_add(1, Ordering::Relaxed),
+                        crate::metis::SwapIxError::Timeout => {
+                            met_c.swap_ix_timeout.fetch_add(1, Ordering::Relaxed)
+                        }
+                        crate::metis::SwapIxError::Http(_) => {
+                            met_c.swap_ix_http.fetch_add(1, Ordering::Relaxed)
+                        }
+                        crate::metis::SwapIxError::Network => {
+                            met_c.swap_ix_network.fetch_add(1, Ordering::Relaxed)
+                        }
+                        crate::metis::SwapIxError::Parse => {
+                            met_c.swap_ix_parse.fetch_add(1, Ordering::Relaxed)
+                        }
                     };
                     return;
                 }
@@ -592,7 +577,16 @@ pub async fn scan_all_tokens(
             met_c.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
 
             if save_new {
-                ctx_c.instruction_cache.set(sig, amount, swap_ixs.clone());
+                // Insert RouteTemplate (amount-independent key, patches amounts
+                // for future hits with different amounts).
+                ctx_c.template_store.insert_route(
+                    sig,
+                    swap_ixs.clone(),
+                    amount,
+                    on_chain_floor,
+                );
+                // Record each hop (amount-independent: pool + direction only).
+                ctx_c.template_store.record_hops(&merged.route_plan, context_slot);
             }
 
             let item = ReadyInstruction {

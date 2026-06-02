@@ -5,7 +5,6 @@ mod arbitrage;
 mod blockhash_cache;
 mod config;
 mod dex_accounts;
-mod instruction_cache;
 mod jito;
 #[allow(dead_code)]
 mod jito_grpc;
@@ -15,6 +14,7 @@ mod metis;
 mod metrics;
 mod program_registry;
 mod rate_limiter;
+mod template_cache;
 mod token_metrics;
 mod tokens;
 mod transaction;
@@ -35,8 +35,6 @@ use blockhash_cache::BlockhashCache;
 use rate_limiter::RateLimiter;
 
 fn main() -> Result<()> {
-    // Default to ERROR so the terminal is silent except for the 60s report.
-    // Override with RUST_LOG=info/debug if you need verbose output.
     let log_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "error".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(
@@ -85,16 +83,16 @@ async fn async_main(config: config::Config) -> Result<()> {
         &wsol_mint,
     );
 
-    // ── Instruction cache: load persisted entries and start periodic flush ───
-    let instruction_cache = instruction_cache::InstructionCache::new();
-    if config.instruction_cache.save_new || config.instruction_cache.serve_from_ram {
-        let loaded = instruction_cache.load_from_disk();
-        eprintln!("[cache] loaded {loaded} entries from /root/c/cache/routes/hot_routes.json");
-        instruction_cache.spawn_flush_task(60); // flush to disk every 60s
+    // ── Template cache: load hop templates from disk and start periodic flush ─
+    let template_store = template_cache::TemplateStore::new();
+    if config.template_cache.save_new || config.template_cache.serve_route {
+        let hops_loaded = template_store.load_from_disk();
+        eprintln!("[template] loaded {hops_loaded} hop templates from /root/c/cache/hops/");
+        template_store.spawn_flush_task(60);
     }
 
     let metrics = metrics::Metrics::new();
-    metrics.spawn_reporter(config.performance.queue_max_age_ms, instruction_cache.clone());
+    metrics.spawn_reporter(config.performance.queue_max_age_ms, template_store.clone());
 
     let token_metrics = token_metrics::TokenMetrics::new(&token_mints);
     token_metrics.spawn_reporter();
@@ -201,11 +199,9 @@ async fn async_main(config: config::Config) -> Result<()> {
         user_pubkey: trading_keypair.pubkey().to_string(),
         sim_cache,
         sim_pool,
-        instruction_cache,
+        template_store,
     });
 
-    // ── Spawn persistent calc workers. Jito throughput is enforced later, right
-    // before send_bundle, so calc concurrency can be higher than Jito capacity.
     let worker_count = config.performance.calc_workers.max(1);
     let jito_capacity = config.jito.max_bundles_per_second as usize
         + jito_grpc_limiter
