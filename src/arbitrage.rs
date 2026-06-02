@@ -508,12 +508,13 @@ pub async fn scan_all_tokens(
             if let Some(tmpl) = ctx.template_store.get_route(sig) {
                 if let Some(patched) = template_cache::serve_route(&tmpl, amount, on_chain_floor) {
                     metrics.route_template_hit.fetch_add(1, Ordering::Relaxed);
+                    metrics.ix_from_ram.fetch_add(1, Ordering::Relaxed);
                     metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
                     ctx.template_store.record_route_hit(sig);
                     push_to_queue(patched, hop_count, pipeline, metrics);
                     continue;
                 }
-                // Patching failed (no offsets discovered): fall through to Metis.
+                // Patching failed (no offsets discovered): fall through to Tier-2.
             }
         }
 
@@ -533,6 +534,7 @@ pub async fn scan_all_tokens(
                             template_cache::serve_route(&tmpl, amount, on_chain_floor)
                         {
                             metrics.route_template_hit.fetch_add(1, Ordering::Relaxed);
+                            metrics.ix_from_ram.fetch_add(1, Ordering::Relaxed);
                             metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
                             ctx.template_store.record_route_hit(tmpl.route_signature);
                             push_to_queue(patched, hop_count, pipeline, metrics);
@@ -591,6 +593,7 @@ pub async fn scan_all_tokens(
             met_c.metis_fetch_ms_total.fetch_add(fetch_ms, Ordering::Relaxed);
             met_c.metis_fetch_samples.fetch_add(1, Ordering::Relaxed);
             met_c.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
+            met_c.ix_from_metis.fetch_add(1, Ordering::Relaxed);
 
             if save_new {
                 // Insert RouteTemplate (amount-independent key, patches amounts

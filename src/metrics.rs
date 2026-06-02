@@ -16,6 +16,11 @@ pub struct Metrics {
     pub swap_ix_ok: AtomicU64,
 
     // ── Stage 1.5: template lookup + swap_instructions ────────────────────────
+    /// Instructions served from RouteTemplate in RAM (Tier-1 exact + Tier-2 hop-pair).
+    /// No /swap-instructions call was made for these.
+    pub ix_from_ram: AtomicU64,
+    /// Instructions obtained from Metis /swap-instructions (Tier-3 fallback).
+    pub ix_from_metis: AtomicU64,
     /// RouteTemplate hit: served from RAM with amount patching (no Metis call).
     pub route_template_hit: AtomicU64,
     /// All hops in the route had a HopTemplate (metrics only; no composer yet).
@@ -64,6 +69,8 @@ impl Metrics {
             metis_resp_total: AtomicU64::new(0),
             metis_resp_ok: AtomicU64::new(0),
             swap_ix_ok: AtomicU64::new(0),
+            ix_from_ram: AtomicU64::new(0),
+            ix_from_metis: AtomicU64::new(0),
             route_template_hit: AtomicU64::new(0),
             hop_template_all_hit: AtomicU64::new(0),
             hop_template_missing: AtomicU64::new(0),
@@ -107,6 +114,8 @@ impl Metrics {
                 let profit    = m.metis_resp_ok.swap(0, Ordering::Relaxed);
                 let sw_ok     = m.swap_ix_ok.swap(0, Ordering::Relaxed);
 
+                let from_ram   = m.ix_from_ram.swap(0, Ordering::Relaxed);
+                let from_metis = m.ix_from_metis.swap(0, Ordering::Relaxed);
                 let rt_hit    = m.route_template_hit.swap(0, Ordering::Relaxed);
                 let ht_all    = m.hop_template_all_hit.swap(0, Ordering::Relaxed);
                 let ht_miss   = m.hop_template_missing.swap(0, Ordering::Relaxed);
@@ -137,10 +146,13 @@ impl Metrics {
                 let n_routes  = store.route_count();
                 let n_hops    = store.hop_count();
 
+                let ram_pct = if sw_ok > 0 { from_ram * 100 / sw_ok } else { 0 };
+
                 eprintln!(
                     "[{WINDOW_SECS}s] \
 metis_sent={sent} routes={routes} quoted_profitable={profit}\n  \
 TEMPLATE  : route_hit={rt_hit}  hop_all_hit={ht_all}  hop_miss={ht_miss}  routes={n_routes}  hops={n_hops}\n  \
+IX-SOURCE : from_ram={from_ram}  from_metis={from_metis}  ram_pct={ram_pct}%\n  \
 PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
 IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
