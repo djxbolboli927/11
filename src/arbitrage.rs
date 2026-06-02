@@ -335,6 +335,17 @@ pub fn spawn_workers(
                     }
                 };
 
+                // Solana hard limit: a tx may lock at most 64 distinct accounts
+                // (static keys + every ALT-loaded account). Multi-hop circular
+                // routes routinely exceed this; the block engine rejects them
+                // with "too many account locks". Drop them here so we don't
+                // waste a Jito rate-limit slot on a guaranteed 400.
+                if transaction::account_lock_count(&tx) > 64 {
+                    met_c.dropped_account_locks.fetch_add(1, Ordering::Relaxed);
+                    met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
                 match bincode::serialize(&tx) {
                     Ok(bytes) if bytes.len() > 1232 => {
                         met_c.tx_too_large.fetch_add(1, Ordering::Relaxed);

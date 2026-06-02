@@ -148,6 +148,30 @@ pub fn build_arb_transaction(
     Ok(tx)
 }
 
+/// Number of distinct accounts the transaction locks.
+///
+/// Solana enforces MAX_TX_ACCOUNT_LOCKS = 64: the total of static account
+/// keys PLUS every account pulled in through an Address Lookup Table counts
+/// toward this limit. ALTs shrink the *serialized size* of a tx but do NOT
+/// reduce the lock count, so a multi-hop circular swap with >64 distinct
+/// accounts is rejected by the block engine ("too many account locks") no
+/// matter how many ALTs it references. We compute this before sending so the
+/// guaranteed-reject transactions are dropped locally instead of burning a
+/// Jito rate-limit slot.
+pub fn account_lock_count(tx: &VersionedTransaction) -> usize {
+    match &tx.message {
+        VersionedMessage::V0(msg) => {
+            let from_alt: usize = msg
+                .address_table_lookups
+                .iter()
+                .map(|l| l.writable_indexes.len() + l.readonly_indexes.len())
+                .sum();
+            msg.account_keys.len() + from_alt
+        }
+        VersionedMessage::Legacy(msg) => msg.account_keys.len(),
+    }
+}
+
 /// Deserialize the addresses stored in an Address Lookup Table account.
 pub fn deserialize_alt_addresses(data: &[u8]) -> Result<Vec<Pubkey>> {
     const HEADER_SIZE: usize = 56;

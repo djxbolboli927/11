@@ -52,6 +52,9 @@ pub struct Metrics {
     pub dropped_stale: AtomicU64,
     pub tx_build_failed: AtomicU64,
     pub tx_too_large: AtomicU64,
+    /// Built tx exceeded Solana's 64 distinct-account-lock limit (guaranteed
+    /// block-engine reject). Dropped locally instead of burning a Jito slot.
+    pub dropped_account_locks: AtomicU64,
     pub calc_done: AtomicU64,
 
     // ── Stage 3: Jito send ────────────────────────────────────────────────────
@@ -90,6 +93,7 @@ impl Metrics {
             dropped_stale: AtomicU64::new(0),
             tx_build_failed: AtomicU64::new(0),
             tx_too_large: AtomicU64::new(0),
+            dropped_account_locks: AtomicU64::new(0),
             calc_done: AtomicU64::new(0),
             rate_requeued: AtomicU64::new(0),
             jito_send_failed: AtomicU64::new(0),
@@ -139,6 +143,7 @@ impl Metrics {
                 let stale     = m.dropped_stale.swap(0, Ordering::Relaxed);
                 let build     = m.tx_build_failed.swap(0, Ordering::Relaxed);
                 let too_big   = m.tx_too_large.swap(0, Ordering::Relaxed);
+                let too_locks = m.dropped_account_locks.swap(0, Ordering::Relaxed);
                 let calc      = m.calc_done.swap(0, Ordering::Relaxed);
                 let requeued  = m.rate_requeued.swap(0, Ordering::Relaxed);
                 let jfail     = m.jito_send_failed.swap(0, Ordering::Relaxed);
@@ -170,7 +175,7 @@ IX-SOURCE : from_ram={from_ram}  from_metis={from_metis}  ram_pct={ram_pct}%\n  
 FUNNEL    : profitable={profit}  drop_multi_hop={drop_hop}  drop_merge_fail={drop_merge}  drop_no_serve={drop_no_srv}  -> swap_ix_ok={sw_ok}\n  \
 PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
 IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \
-TX-BUILD  : build_fail={build}  too_large={too_big}  calc_ok={calc}\n  \
+TX-BUILD  : build_fail={build}  too_large={too_big}  too_many_locks={too_locks}  calc_ok={calc}\n  \
 JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \
 SWAP-IX   : avg_metis={avg_ms}ms"
                 );
