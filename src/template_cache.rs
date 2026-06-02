@@ -337,6 +337,10 @@ struct StoreInner {
     routes_hot: HashMap<u128, RouteTemplate>,
     routes_cold: HashMap<u128, RouteTemplate>,
     hops: HashMap<HopKey, HopTemplate>,
+    /// Secondary index: "hop1_id|hop2_id" -> route_sig.
+    /// Allows Tier-2 lookup when the primary route_sig misses (e.g. an
+    /// unstable extra field in swapInfo) but both pools have been seen.
+    hop_pair_index: HashMap<String, u128>,
 }
 
 impl TemplateStore {
@@ -346,6 +350,7 @@ impl TemplateStore {
                 routes_hot: HashMap::new(),
                 routes_cold: HashMap::new(),
                 hops: HashMap::new(),
+                hop_pair_index: HashMap::new(),
             }),
         })
     }
@@ -384,6 +389,8 @@ impl TemplateStore {
     }
 
     /// Insert a new RouteTemplate (first time we see this route structure).
+    /// `route_plan` is used to build the secondary hop-pair index so Tier-2
+    /// lookups work even when the primary route_sig doesn't match exactly.
     /// If the route already exists, only increments seen_count.
     pub fn insert_route(
         &self,
@@ -391,6 +398,7 @@ impl TemplateStore {
         swap_ixs: SwapInstructionsResponse,
         in_amount: u64,
         quoted_out: u64,
+        route_plan: &serde_json::Value,
     ) {
         let offsets = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
@@ -421,6 +429,55 @@ impl TemplateStore {
             hit_count: 0,
         };
         Self::push_hot_route(&mut g, sig, tmpl);
+
+        // Build secondary hop-pair index for 2-hop routes.
+        // Key = "hop1_template_id|hop2_template_id" → route_sig.
+        // Allows Tier-2 to find a valid RouteTemplate even when the exact
+        // route_sig changes between scans (e.g. an extra Metis field).
+        if let Some(arr) = route_plan.as_array() {
+            if arr.len() == 2 {
+                let id0 = arr[0]
+                    .get("swapInfo")
+                    .and_then(|s| s.as_object())
+                    .and_then(HopKey::from_swap_info)
+                    .map(|k| k.template_id());
+                let id1 = arr[1]
+                    .get("swapInfo")
+                    .and_then(|s| s.as_object())
+                    .and_then(HopKey::from_swap_info)
+                    .map(|k| k.template_id());
+                if let (Some(id0), Some(id1)) = (id0, id1) {
+                    let pair_key = format!("{id0}|{id1}");
+                    g.hop_pair_index.entry(pair_key).or_insert(sig);
+                }
+            }
+        }
+    }
+
+    /// Tier-2 lookup: find a RouteTemplate by hop-pair identity rather than
+    /// exact route_sig. Returns Some only when a previously saved template
+    /// shares the same two DEX pools (in the same order and direction).
+    pub fn get_route_for_hops(&self, route_plan: &serde_json::Value) -> Option<RouteTemplate> {
+        let arr = route_plan.as_array()?;
+        if arr.len() != 2 {
+            return None;
+        }
+        let id0 = arr[0]
+            .get("swapInfo")
+            .and_then(|s| s.as_object())
+            .and_then(HopKey::from_swap_info)
+            .map(|k| k.template_id())?;
+        let id1 = arr[1]
+            .get("swapInfo")
+            .and_then(|s| s.as_object())
+            .and_then(HopKey::from_swap_info)
+            .map(|k| k.template_id())?;
+        let pair_key = format!("{id0}|{id1}");
+        let sig = {
+            let g = self.inner.read().ok()?;
+            *g.hop_pair_index.get(&pair_key)?
+        };
+        self.get_route(sig)
     }
 
     fn push_hot_route(g: &mut StoreInner, sig: u128, tmpl: RouteTemplate) {

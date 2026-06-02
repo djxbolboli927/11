@@ -113,9 +113,9 @@ auth_keypair = "/root/c/wallet/grpc.json"
 max_bundles_per_second = 5
 
 [template_cache]
-# مرحله ۱: save_new=true — template های route و hop از پاسخ های متیس استخراج و ذخیره می شوند
-# مرحله ۲: serve_route=true — RouteTemplate را از RAM سرو کنید (مقادیر in_amount/quoted_out patch می شوند)
-# مرحله ۳: serve_from_metis=false — فقط وقتی کاملاً به RAM اعتماد دارید
-save_new = false
-serve_route = false
+# Tier-1: route_signature دقیق → patch amounts → بدون Metis call
+# Tier-2: hop-pair index (هر دو pool دیده شده) → patch amounts → بدون Metis call
+# Tier-3: fallback به /swap-instructions + ذخیره template برای دفعات بعد
+save_new = true
+serve_route = true
 serve_from_metis = true

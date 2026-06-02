@@ -517,13 +517,29 @@ pub async fn scan_all_tokens(
             }
         }
 
-        // ── Tier 2: HopTemplate check ─────────────────────────────────────────
-        // Metrics only — no composer yet. If all hops are known, we still call
-        // Metis for now (composition will be added once the encoder is validated).
+        // ── Tier 2: HopTemplate check + hop-pair secondary route lookup ──────
+        // When all hops are known, try to find a RouteTemplate via the
+        // hop-pair index. This serves from RAM even when the primary route_sig
+        // doesn't match exactly (e.g. an extra unstable field in swapInfo).
         {
             let (all_hit, missing) = ctx.template_store.check_hops(&merged.route_plan);
             if all_hit {
                 metrics.hop_template_all_hit.fetch_add(1, Ordering::Relaxed);
+                if tc.serve_route {
+                    if let Some(tmpl) =
+                        ctx.template_store.get_route_for_hops(&merged.route_plan)
+                    {
+                        if let Some(patched) =
+                            template_cache::serve_route(&tmpl, amount, on_chain_floor)
+                        {
+                            metrics.route_template_hit.fetch_add(1, Ordering::Relaxed);
+                            metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
+                            ctx.template_store.record_route_hit(tmpl.route_signature);
+                            push_to_queue(patched, hop_count, pipeline, metrics);
+                            continue;
+                        }
+                    }
+                }
             } else if missing > 0 {
                 metrics.hop_template_missing.fetch_add(missing as u64, Ordering::Relaxed);
             }
@@ -578,12 +594,14 @@ pub async fn scan_all_tokens(
 
             if save_new {
                 // Insert RouteTemplate (amount-independent key, patches amounts
-                // for future hits with different amounts).
+                // for future hits with different amounts). Also indexes by
+                // hop-pair for Tier-2 fallback lookups.
                 ctx_c.template_store.insert_route(
                     sig,
                     swap_ixs.clone(),
                     amount,
                     on_chain_floor,
+                    &merged.route_plan,
                 );
                 // Record each hop (amount-independent: pool + direction only).
                 ctx_c.template_store.record_hops(&merged.route_plan, context_slot);
