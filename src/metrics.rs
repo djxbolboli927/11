@@ -144,6 +144,7 @@ impl Metrics {
 
                 let avg_ms    = if ms_n > 0 { ms_ms / ms_n } else { 0 };
                 let n_routes  = store.route_count();
+                let n_patch   = store.patchable_route_count();
                 let n_hops    = store.hop_count();
 
                 let ram_pct = if sw_ok > 0 { from_ram * 100 / sw_ok } else { 0 };
@@ -151,7 +152,7 @@ impl Metrics {
                 eprintln!(
                     "[{WINDOW_SECS}s] \
 metis_sent={sent} routes={routes} quoted_profitable={profit}\n  \
-TEMPLATE  : route_hit={rt_hit}  hop_all_hit={ht_all}  hop_miss={ht_miss}  routes={n_routes}  hops={n_hops}\n  \
+TEMPLATE  : route_hit={rt_hit}  hop_all_hit={ht_all}  hop_miss={ht_miss}  routes={n_routes}(patchable={n_patch})  hops={n_hops}\n  \
 IX-SOURCE : from_ram={from_ram}  from_metis={from_metis}  ram_pct={ram_pct}%\n  \
 PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
 IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \

@@ -603,6 +603,23 @@ impl TemplateStore {
         self.inner.read().map(|g| g.hops.len()).unwrap_or(0)
     }
 
+    /// How many stored routes have Borsh offsets discovered (i.e. can be
+    /// served from RAM at ANY amount via patching). If this is far below
+    /// route_count, the byte-search in discover_offsets is failing and the
+    /// route_v2 layout needs investigation.
+    pub fn patchable_route_count(&self) -> usize {
+        self.inner
+            .read()
+            .map(|g| {
+                g.routes_hot
+                    .values()
+                    .chain(g.routes_cold.values())
+                    .filter(|t| t.in_amount_offset.is_some())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     // ── Disk persistence ──────────────────────────────────────────────────────
 
     /// Load HopTemplates from per-DEX JSON files in cache/hops/.
