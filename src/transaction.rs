@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rand::seq::SliceRandom;
 use solana_client::rpc_client::RpcClient;
+#[allow(deprecated)]
 use solana_sdk::{
     address_lookup_table::AddressLookupTableAccount,
     hash::Hash,

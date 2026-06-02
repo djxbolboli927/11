@@ -87,7 +87,7 @@ pub enum SwapIxError {
     Timeout,
     /// Metis returned a non-2xx status — it could not route/build this quote
     /// (e.g. 400 "no route", 422, 500). A genuine rejection, not a stall.
-    Http(u16),
+    Http(#[allow(dead_code)] u16),
     /// Connection-level failure (TCP/TLS reset, pool exhausted, etc.).
     Network,
     /// 2xx received but the body could not be parsed as SwapInstructionsResponse.
@@ -207,7 +207,7 @@ impl MetisClient {
             input_mint: quote1.input_mint.clone(),
             in_amount: quote1.in_amount.clone(),
             output_mint: quote2.output_mint.clone(),
-            out_amount: quote2.out_amount.clone(),
+            out_amount: min_acceptable_out.to_string(),
             other_amount_threshold: min_acceptable_out.to_string(),
             swap_mode: quote1.swap_mode.clone(),
             price_impact_pct: "0".to_string(),

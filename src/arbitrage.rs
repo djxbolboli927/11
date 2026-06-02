@@ -134,7 +134,9 @@ pub struct CalcCtx {
     pub jito_grpc_limiter: Option<Arc<Mutex<RateLimiter>>>,
     pub cu_limits: Vec<u32>,
     pub user_pubkey: String,
+    #[allow(dead_code)]
     pub sim_cache: Option<Arc<AccountCache>>,
+    #[allow(dead_code)]
     pub sim_pool: Option<Arc<SimulatorPool>>,
     pub instruction_cache: Arc<InstructionCache>,
 }

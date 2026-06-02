@@ -18,7 +18,6 @@
 //!
 //! Files starting with `_` (e.g. `_template.toml`) are skipped.
 
-use anyhow::Result;
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 use std::path::Path;

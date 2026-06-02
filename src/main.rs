@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod account_cache;
 mod alt_cache;
 mod arbitrage;
@@ -6,7 +7,9 @@ mod config;
 mod dex_accounts;
 mod instruction_cache;
 mod jito;
+#[allow(dead_code)]
 mod jito_grpc;
+#[allow(dead_code)]
 mod litesvm_sim;
 mod metis;
 mod metrics;

@@ -32,6 +32,7 @@ pub struct TradingConfig {
     pub step_sol: f64,
     pub min_profit_lamports: u64,
     /// Standard Solana transaction fee in lamports (5000 = one signature fee).
+    #[allow(dead_code)]
     pub base_fee_lamports: u64,
     pub tokens_file: String,
 }
@@ -42,8 +43,11 @@ pub struct JitoConfig {
     pub urls: Vec<String>,
     pub uuid: String,
     pub trading_keypair: String,
+    #[allow(dead_code)]
     pub tip_min_lamports: u64,
+    #[allow(dead_code)]
     pub tip_max_lamports: u64,
+    #[allow(dead_code)]
     pub tip_profit_percent: f64,
     pub max_bundles_per_second: u32,
 }
