@@ -235,21 +235,35 @@ pub struct HopTemplate {
 // ─── RouteTemplate (in-RAM only, keyed by route_sig with NO amount) ───────────
 
 /// Stores one complete SwapInstructionsResponse per route structure.
-/// When the same route is needed with a different amount, the in_amount and
-/// quoted_out_amount bytes are patched in place using known Borsh offsets.
+///
+/// Fast path: `amount_variants` maps each `in_amount` seen to the exact
+/// SwapInstructionsResponse that Metis returned for it.  A lookup here is
+/// O(1) and never wrong — no Borsh patching required.
+///
+/// Slow path (new amounts not yet cached): `in_amount_offset` /
+/// `quoted_out_offset` allow the amounts to be patched in-place in the base
+/// instruction's Borsh data.  Works for route_v2; falls through to Metis on
+/// failure.  Once Metis succeeds for an amount it is added to
+/// `amount_variants` so every subsequent hit is served from the fast path.
 #[derive(Clone, Debug)]
 pub struct RouteTemplate {
     #[allow(dead_code)]
     pub route_signature: u128,
+    /// Base instruction (first captured). Used as the source for Borsh patching.
     pub swap_ixs: SwapInstructionsResponse,
-    /// in_amount that was active when this template was first captured.
+    /// in_amount stored in the base instruction.
     pub template_in_amount: u64,
-    /// quoted_out_amount (= on_chain_floor) captured with the template.
+    /// quoted_out_amount stored in the base instruction.
     pub template_quoted_out: u64,
     /// Byte offset of in_amount in the decoded swap_instruction.data.
     /// None when the Borsh layout didn't validate on first capture.
     pub in_amount_offset: Option<usize>,
     pub quoted_out_offset: Option<usize>,
+    /// Per-amount instruction cache.  Key = in_amount (quoted_out is always
+    /// in_amount + 6600 for our arb so we only need one key dimension).
+    /// After one successful Metis call for (route, amount), all future calls
+    /// with the same amount are served from here — no Metis, no patching.
+    pub amount_variants: HashMap<u64, SwapInstructionsResponse>,
     pub seen_count: u64,
     pub hit_count: u64,
 }
@@ -308,18 +322,27 @@ fn patch_amounts_b64(
     ))
 }
 
-/// Try to serve a RouteTemplate with new amounts.
-/// Returns None only when patching is required but offsets are unknown —
-/// the caller must fall through to Metis in that case.
+/// Serve a RouteTemplate with the requested amounts.
+///
+/// Lookup order:
+///   1. `amount_variants[new_in]` — exact cached instruction, always correct.
+///   2. Borsh patch of the base instruction at pre-discovered byte offsets.
+///
+/// Returns None only when both paths fail (no cached variant AND patching
+/// is impossible because offsets were never validated).  The caller must
+/// then fall through to Metis.
 pub fn serve_route(
     tmpl: &RouteTemplate,
     new_in: u64,
-    new_out: u64,
+    _new_out: u64,
 ) -> Option<SwapInstructionsResponse> {
-    if new_in == tmpl.template_in_amount && new_out == tmpl.template_quoted_out {
-        return Some(tmpl.swap_ixs.clone());
+    // Fast path: exact per-amount cached instruction.
+    if let Some(v) = tmpl.amount_variants.get(&new_in) {
+        return Some(v.clone());
     }
+    // Slow path: Borsh patch the base instruction for this (unseen) amount.
     let (in_off, out_off) = (tmpl.in_amount_offset?, tmpl.quoted_out_offset?);
+    let new_out = new_in + (tmpl.template_quoted_out - tmpl.template_in_amount);
     let new_data =
         patch_amounts_b64(&tmpl.swap_ixs.swap_instruction.data, in_off, out_off, new_in, new_out)?;
     let mut patched = tmpl.swap_ixs.clone();
@@ -410,13 +433,21 @@ impl TemplateStore {
         let Ok(mut g) = self.inner.write() else { return };
 
         if g.routes_hot.contains_key(&sig) {
-            g.routes_hot.get_mut(&sig).unwrap().seen_count += 1;
+            let t = g.routes_hot.get_mut(&sig).unwrap();
+            t.seen_count += 1;
+            // Cache this amount so the next scan for (route, amount) is instant.
+            t.amount_variants.entry(in_amount).or_insert(swap_ixs);
             return;
         }
         if g.routes_cold.contains_key(&sig) {
-            g.routes_cold.get_mut(&sig).unwrap().seen_count += 1;
+            let t = g.routes_cold.get_mut(&sig).unwrap();
+            t.seen_count += 1;
+            t.amount_variants.entry(in_amount).or_insert(swap_ixs);
             return;
         }
+
+        let mut amount_variants = HashMap::new();
+        amount_variants.insert(in_amount, swap_ixs.clone());
 
         let tmpl = RouteTemplate {
             route_signature: sig,
@@ -425,6 +456,7 @@ impl TemplateStore {
             template_quoted_out: quoted_out,
             in_amount_offset: offsets.map(|(i, _)| i),
             quoted_out_offset: offsets.map(|(_, o)| o),
+            amount_variants,
             seen_count: 1,
             hit_count: 0,
         };
