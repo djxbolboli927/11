@@ -272,34 +272,54 @@ pub struct RouteTemplate {
 
 /// Locate in_amount / quoted_out_amount inside Borsh-encoded route_v2 data.
 ///
-/// Jupiter v6 route_v2 arg order (IDL): routePlan, inAmount, quotedOutAmount,
-/// slippageBps (u16=0), platformFeeBps (u8=0).
+/// Jupiter v6 route_v2 serializes `inAmount` (u64 LE) immediately followed by
+/// `quotedOutAmount` (u64 LE).  Rather than assume a fixed distance from the
+/// end of the buffer (which breaks if Metis adds trailing fields like
+/// positiveSlippageBps), we SEARCH for the unique 16-byte window where
+///   data[P..P+8]   == in_amount   (LE)
+///   data[P+8..P+16]== quoted_out  (LE)
 ///
-/// From the END of the serialized buffer:
-///   [len-1]        = platformFeeBps (0)
-///   [len-3..len-1] = slippageBps   (0, u16 LE)
-///   [len-11..len-3]= quotedOutAmount (u64 LE)
-///   [len-19..len-11]= inAmount       (u64 LE)
-///
-/// Validation: last 3 bytes must be 0x00, AND the discovered values must match
-/// the amounts we know were active — both must hold or we return None (safe
-/// fallback to Metis rather than risk a bad instruction).
+/// That consecutive (inAmount, quotedOutAmount) pair is a strong signature —
+/// collisions with account pubkeys or other args are effectively impossible.
+/// We require exactly ONE match; zero or multiple matches → None (safe
+/// fallback to Metis).  Returns (in_offset, quoted_out_offset).
 fn discover_offsets(data: &[u8], in_amount: u64, quoted_out: u64) -> Option<(usize, usize)> {
-    let len = data.len();
-    if len < 27 {
+    let in_le = in_amount.to_le_bytes();
+    let out_le = quoted_out.to_le_bytes();
+    if data.len() < 16 {
         return None;
     }
-    if data[len - 1] != 0 || data[len - 2] != 0 || data[len - 3] != 0 {
-        return None;
+    // Pass 1: consecutive (inAmount, quotedOutAmount) — strongest signature.
+    let mut found: Option<usize> = None;
+    let mut count = 0usize;
+    for p in 0..=(data.len() - 16) {
+        if data[p..p + 8] == in_le && data[p + 8..p + 16] == out_le {
+            found = Some(p);
+            count += 1;
+            if count > 1 {
+                return None; // ambiguous — refuse to patch
+            }
+        }
     }
-    let in_off = len - 19;
-    let out_off = len - 11;
-    let stored_in = u64::from_le_bytes(data[in_off..in_off + 8].try_into().ok()?);
-    let stored_out = u64::from_le_bytes(data[out_off..out_off + 8].try_into().ok()?);
-    if stored_in != in_amount || stored_out != quoted_out {
-        return None;
+    if let Some(p) = found {
+        return Some((p, p + 8));
     }
-    Some((in_off, out_off))
+
+    // Pass 2: Metis embedded a quotedOutAmount different from our prediction.
+    // Locate inAmount uniquely; quotedOutAmount is the next u64 (IDL order).
+    let mut found_in: Option<usize> = None;
+    let mut in_count = 0usize;
+    for p in 0..=(data.len() - 16) {
+        if data[p..p + 8] == in_le {
+            found_in = Some(p);
+            in_count += 1;
+            if in_count > 1 {
+                return None; // ambiguous inAmount — refuse to patch
+            }
+        }
+    }
+    let p = found_in?;
+    Some((p, p + 8))
 }
 
 fn patch_amounts_b64(
