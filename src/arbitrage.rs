@@ -99,6 +99,7 @@ struct QuotePair {
     quote1: QuoteResponse,
     quote2: QuoteResponse,
     hop_count: usize,
+    only_direct: bool,
     #[allow(dead_code)]
     is_pmm: bool,
 }
@@ -148,10 +149,10 @@ pub struct Pipeline {
 /// block each other — a direct-route timeout does not delay the free-route
 /// check for the same token.
 ///
-/// Note: Both free (only_direct=false) and direct (only_direct=true) routes
-/// are scanned for every token. Free routes often return multi-hop paths
-/// (hop_count > 2) which are filtered later — only 1-hop-each-leg routes
-/// (hop_count == 2) are safe to send to /swap-instructions.
+/// Both free (only_direct=false) and direct (only_direct=true) routes are
+/// scanned for every token.  Free routes may return multi-hop paths
+/// (hop_count > 2) which are also sent to /swap-instructions when profitable.
+/// Direct routes should always be 2-hop (1 hop per leg).
 async fn quote_check(
     metis: &MetisClient,
     token_mint: &str,
@@ -244,6 +245,7 @@ async fn quote_check(
         quote1,
         quote2,
         hop_count,
+        only_direct,
         is_pmm,
     })
 }
@@ -477,11 +479,10 @@ pub async fn scan_all_tokens(
             "send_candidate"
         );
 
-        // Only 2-hop routes (1 hop each leg) are safe for /swap-instructions.
-        // Multi-hop free-route results are filtered here. This is visible in
-        // the metrics: quoted_profitable counts all passing quote-stage checks
-        // (including multi-hop), but swap_ix_ok only counts what reaches Jito.
-        if pair.hop_count != 2 {
+        // Direct routes (only_direct=true) must be exactly 2-hop.
+        // Free routes (only_direct=false) may be multi-hop — all are forwarded.
+        if pair.only_direct && pair.hop_count != 2 {
+            metrics.dropped_multi_hop.fetch_add(1, Ordering::Relaxed);
             metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -489,6 +490,7 @@ pub async fn scan_all_tokens(
         let merged = match MetisClient::merge_quotes(&pair.quote1, &pair.quote2, on_chain_floor) {
             Ok(m) => m,
             Err(_) => {
+                metrics.dropped_merge_fail.fetch_add(1, Ordering::Relaxed);
                 metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -549,6 +551,7 @@ pub async fn scan_all_tokens(
 
         // ── Tier 3: Metis fallback ────────────────────────────────────────────
         if !tc.serve_from_metis {
+            metrics.dropped_no_serve.fetch_add(1, Ordering::Relaxed);
             metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }

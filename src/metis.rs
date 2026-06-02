@@ -132,16 +132,22 @@ impl MetisClient {
         amount_lamports: u64,
         only_direct: bool,
     ) -> Result<QuoteResponse> {
+        // Free routes: restrictIntermediateTokens=true limits intermediary tokens
+        // to highly-liquid ones (SOL, USDC, USDT, etc.) for reliable multi-hop arb.
+        // Direct routes: onlyDirectRoutes=true — no intermediate tokens anyway.
         let url = format!(
             "{}/quote?inputMint={}&outputMint={}&amount={}\
              &slippageBps=0\
              &maxAccounts=50\
              &swapMode=ExactIn\
              &forJitoBundle=true\
-             &restrictIntermediateTokens=false\
              &instructionVersion=V2{}",
             self.base_url, input_mint, output_mint, amount_lamports,
-            if only_direct { "&onlyDirectRoutes=true" } else { "" }
+            if only_direct {
+                "&onlyDirectRoutes=true"
+            } else {
+                "&restrictIntermediateTokens=true"
+            }
         );
 
         let resp = self

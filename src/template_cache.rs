@@ -9,8 +9,6 @@ const BASE_DIR: &str = "/root/c/cache";
 /// Max distinct routes kept live (hot+cold ≤ 2×). For 200 pools ×2 directions
 /// that's ~400 routes; 2000 gives plenty of headroom without growing unbounded.
 const ROUTE_SEG_CAP: usize = 2_000;
-/// Max distinct hops tracked (one entry per pool+direction, amount-independent).
-const HOP_CAP: usize = 2_000;
 
 // ─── Route signature ──────────────────────────────────────────────────────────
 
@@ -564,9 +562,6 @@ impl TemplateStore {
     /// Record hops from a successful Metis response (amount-independent).
     pub fn record_hops(&self, route_plan: &serde_json::Value, context_slot: Option<u64>) {
         let Ok(mut g) = self.inner.write() else { return };
-        if g.hops.len() >= HOP_CAP {
-            return;
-        }
         if let Some(arr) = route_plan.as_array() {
             for hop in arr {
                 if let Some(si) = hop.get("swapInfo").and_then(|s| s.as_object()) {
