@@ -43,6 +43,9 @@ pub struct Metrics {
     pub dropped_merge_fail: AtomicU64,
     /// Profitable opp dropped: no template AND serve_from_metis=false.
     pub dropped_no_serve: AtomicU64,
+    /// Both legs of this "profitable" quote share an AMM pool; round-trip
+    /// on the same pool always loses. Filtered before /swap-instructions.
+    pub dropped_same_pool: AtomicU64,
     /// Items pushed into the LIFO queue.
     pub queue_in: AtomicU64,
     /// Current LIFO queue depth (gauge).
@@ -105,6 +108,7 @@ impl Metrics {
             dropped_multi_hop: AtomicU64::new(0),
             dropped_merge_fail: AtomicU64::new(0),
             dropped_no_serve: AtomicU64::new(0),
+            dropped_same_pool: AtomicU64::new(0),
         })
     }
 
@@ -159,6 +163,7 @@ impl Metrics {
                 let drop_hop    = m.dropped_multi_hop.swap(0, Ordering::Relaxed);
                 let drop_merge  = m.dropped_merge_fail.swap(0, Ordering::Relaxed);
                 let drop_no_srv = m.dropped_no_serve.swap(0, Ordering::Relaxed);
+                let drop_pool   = m.dropped_same_pool.swap(0, Ordering::Relaxed);
 
                 let avg_ms    = if ms_n > 0 { ms_ms / ms_n } else { 0 };
                 let n_routes  = store.route_count();
@@ -172,7 +177,7 @@ impl Metrics {
 metis_sent={sent} routes={routes} quoted_profitable={profit}\n  \
 TEMPLATE  : route_hit={rt_hit}  hop_all_hit={ht_all}  hop_miss={ht_miss}  routes={n_routes}(patchable={n_patch})  hops={n_hops}\n  \
 IX-SOURCE : from_ram={from_ram}  from_metis={from_metis}  ram_pct={ram_pct}%\n  \
-FUNNEL    : profitable={profit}  drop_multi_hop={drop_hop}  drop_merge_fail={drop_merge}  drop_no_serve={drop_no_srv}  -> swap_ix_ok={sw_ok}\n  \
+FUNNEL    : profitable={profit}  drop_same_pool={drop_pool}  drop_multi_hop={drop_hop}  drop_merge={drop_merge}  drop_no_serve={drop_no_srv}  -> swap_ix_ok={sw_ok}\n  \
 PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
 IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  too_many_locks={too_locks}  calc_ok={calc}\n  \

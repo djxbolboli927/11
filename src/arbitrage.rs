@@ -81,6 +81,35 @@ fn route_uses_pmm(quote: &QuoteResponse) -> bool {
     false
 }
 
+/// Returns true if quote1 and quote2 share at least one pool (ammKey).
+/// A round-trip through the same pool always loses money (pays fee twice).
+fn routes_share_pool(q1: &QuoteResponse, q2: &QuoteResponse) -> bool {
+    let keys1: Vec<&str> = q1
+        .route_plan
+        .as_array()
+        .map(|hops| {
+            hops.iter()
+                .filter_map(|h| h.get("swapInfo")?.get("ammKey")?.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if keys1.is_empty() {
+        return false;
+    }
+    let arr2 = match q2.route_plan.as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    for hop in arr2 {
+        if let Some(key) = hop.get("swapInfo").and_then(|s| s.get("ammKey")).and_then(|v| v.as_str()) {
+            if keys1.contains(&key) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn lookup_cu_limit(hop_count: usize, cu_limits: &[u32]) -> u32 {
     if cu_limits.is_empty() {
         return 200_000;
@@ -214,6 +243,17 @@ async fn quote_check(
     }
 
     if route_uses_forbidden_dex(&quote1) || route_uses_forbidden_dex(&quote2) {
+        if let Some(ts) = ts {
+            ts.not_profitable.fetch_add(1, Ordering::Relaxed);
+        }
+        return None;
+    }
+
+    // Same-pool guard: round-tripping through the same AMM pool pays the fee
+    // twice and always loses. These look profitable only due to Metis's
+    // optimistic slippage=0 simulation; they revert on-chain every time.
+    if routes_share_pool(&quote1, &quote2) {
+        metrics.dropped_same_pool.fetch_add(1, Ordering::Relaxed);
         if let Some(ts) = ts {
             ts.not_profitable.fetch_add(1, Ordering::Relaxed);
         }
