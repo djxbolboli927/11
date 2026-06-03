@@ -87,7 +87,10 @@ async fn async_main(config: config::Config) -> Result<()> {
     let template_store = template_cache::TemplateStore::new();
     if config.template_cache.save_new || config.template_cache.serve_route {
         let hops_loaded = template_store.load_from_disk();
-        eprintln!("[template] loaded {hops_loaded} hop templates from /root/c/cache/hops/");
+        let routes_loaded = template_store.load_routes_from_disk();
+        eprintln!(
+            "[template] loaded {hops_loaded} hop templates and {routes_loaded} route templates from /root/c/cache/"
+        );
         template_store.spawn_flush_task(60);
     }
 

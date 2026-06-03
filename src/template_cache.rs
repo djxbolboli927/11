@@ -618,8 +618,11 @@ impl TemplateStore {
     // ── Disk persistence ──────────────────────────────────────────────────────
 
     /// Load HopTemplates from per-DEX JSON files in cache/hops/.
-    /// RouteTemplates are NOT persisted (they contain full instruction data
-    /// that must be re-validated each run to stay fresh).
+    ///
+    /// HopTemplates carry only metadata (pool, mints, direction) — they let
+    /// `check_hops` report `hop_all_hit` but cannot, on their own, serve any
+    /// instruction. The actual RAM-serve path needs RouteTemplates, which are
+    /// loaded separately by `load_routes_from_disk`.
     pub fn load_from_disk(&self) -> usize {
         let hops_dir = format!("{BASE_DIR}/hops");
         let entries = match std::fs::read_dir(&hops_dir) {
@@ -654,7 +657,83 @@ impl TemplateStore {
         count
     }
 
+    /// Load RouteTemplates + the hop-pair index from cache/routes.json.
+    ///
+    /// This is what makes RAM-serving work across restarts. Without it the
+    /// store starts empty every run, so with `serve_from_metis=false` every
+    /// opportunity is dropped (drop_no_serve) until Metis re-populates RAM.
+    ///
+    /// We persist only the BASE instruction + Borsh offsets, not the per-amount
+    /// `amount_variants` cache (which would bloat the file). Patchable routes
+    /// re-derive any amount from the base on load; the variants cache simply
+    /// re-warms at runtime.
+    pub fn load_routes_from_disk(&self) -> usize {
+        let path = format!("{BASE_DIR}/routes.json");
+        let Ok(data) = std::fs::read_to_string(&path) else { return 0 };
+        let file: RouteFile = match serde_json::from_str(&data) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+        let Ok(mut g) = self.inner.write() else { return 0 };
+        let mut count = 0usize;
+        for rec in file.routes {
+            let Ok(sig) = rec.sig.parse::<u128>() else { continue };
+            if g.routes_hot.contains_key(&sig) || g.routes_cold.contains_key(&sig) {
+                continue;
+            }
+            let tmpl = RouteTemplate {
+                route_signature: sig,
+                swap_ixs: rec.swap_ixs,
+                template_in_amount: rec.template_in_amount,
+                template_quoted_out: rec.template_quoted_out,
+                in_amount_offset: rec.in_amount_offset,
+                quoted_out_offset: rec.quoted_out_offset,
+                amount_variants: HashMap::new(),
+                seen_count: rec.seen_count,
+                hit_count: rec.hit_count,
+            };
+            g.routes_hot.insert(sig, tmpl);
+            count += 1;
+        }
+        for (pair_key, sig_str) in file.hop_pairs {
+            if let Ok(sig) = sig_str.parse::<u128>() {
+                g.hop_pair_index.entry(pair_key).or_insert(sig);
+            }
+        }
+        count
+    }
+
+    fn flush_routes_to_disk(&self) {
+        let (routes, hop_pairs): (Vec<RouteRecord>, HashMap<String, String>) = {
+            let Ok(g) = self.inner.read() else { return };
+            let routes = g
+                .routes_hot
+                .values()
+                .chain(g.routes_cold.values())
+                .map(RouteRecord::from_template)
+                .collect();
+            let hop_pairs = g
+                .hop_pair_index
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect();
+            (routes, hop_pairs)
+        };
+
+        let _ = std::fs::create_dir_all(BASE_DIR);
+        let file = RouteFile { schema_version: 1, routes, hop_pairs };
+        // Compact (not pretty) — this file holds full instruction blobs and is
+        // rewritten on every flush; keep it small.
+        let Ok(json) = serde_json::to_string(&file) else { return };
+        let path = format!("{BASE_DIR}/routes.json");
+        let tmp = format!("{path}.tmp");
+        if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
     fn flush_to_disk(&self) {
+        self.flush_routes_to_disk();
         let hops: Vec<(HopKey, HopTemplate)> = {
             let Ok(g) = self.inner.read() else { return };
             g.hops.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -707,4 +786,43 @@ struct DexHopFile {
     dex: DexKind,
     /// Keyed by template_id() so repeated pool/direction never adds a second row.
     templates: HashMap<String, HopTemplate>,
+}
+
+/// On-disk form of a RouteTemplate. `route_signature` is stored as a decimal
+/// string (JSON has no native u128) and the runtime-only `amount_variants`
+/// cache is omitted — patchable routes rebuild any amount from the base.
+#[derive(Serialize, Deserialize)]
+struct RouteRecord {
+    sig: String,
+    swap_ixs: SwapInstructionsResponse,
+    template_in_amount: u64,
+    template_quoted_out: u64,
+    in_amount_offset: Option<usize>,
+    quoted_out_offset: Option<usize>,
+    seen_count: u64,
+    hit_count: u64,
+}
+
+impl RouteRecord {
+    fn from_template(t: &RouteTemplate) -> Self {
+        RouteRecord {
+            sig: t.route_signature.to_string(),
+            swap_ixs: t.swap_ixs.clone(),
+            template_in_amount: t.template_in_amount,
+            template_quoted_out: t.template_quoted_out,
+            in_amount_offset: t.in_amount_offset,
+            quoted_out_offset: t.quoted_out_offset,
+            seen_count: t.seen_count,
+            hit_count: t.hit_count,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RouteFile {
+    schema_version: u32,
+    routes: Vec<RouteRecord>,
+    /// "hop1_id|hop2_id" -> route_sig (decimal string). Rebuilds the Tier-2
+    /// secondary index so hop-pair lookups work on a fresh process.
+    hop_pairs: HashMap<String, String>,
 }
