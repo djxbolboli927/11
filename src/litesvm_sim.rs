@@ -46,6 +46,7 @@ use tracing::{debug, info, warn};
 
 use crate::account_cache::AccountCache;
 use crate::metrics::Metrics;
+use crate::reject_log::RejectLog;
 
 pub struct SimOutcome {
     pub compute_units: u64,
@@ -73,6 +74,9 @@ pub struct Simulator {
     wsol_ata: Pubkey,
     /// Live mainnet slot from the Yellowstone gRPC stream (zero RPC).
     current_slot: Arc<AtomicU64>,
+    /// Records non-slippage rejections (with the accounts that were missing)
+    /// to a file in the project root for diagnosis.
+    reject_log: Arc<RejectLog>,
 }
 
 // ── Type-conversion helpers at the solana-sdk 2.x / LiteSVM 3.x boundary ───
@@ -105,6 +109,7 @@ impl Simulator {
         so_dir: &str,
         wsol_ata: Pubkey,
         current_slot: Arc<AtomicU64>,
+        reject_log: Arc<RejectLog>,
     ) -> Result<Self> {
         // Build the SVM with the full mainnet feature set.
         //
@@ -166,6 +171,7 @@ impl Simulator {
             svm: Mutex::new(svm),
             wsol_ata,
             current_slot,
+            reject_log,
         })
     }
 
@@ -239,6 +245,18 @@ impl Simulator {
         }
         debug!(injected, missing = missing_cnt, accounts = accounts.len(), "sim prepared");
 
+        // Accounts referenced by the tx but absent from BOTH the cache and the
+        // SVM (loaded programs/sysvars). These get a default System-owned empty
+        // account inside LiteSVM, which is the usual cause of InvalidAccountOwner
+        // / RequireGtViolated(0,0) / Jupiter panics. Captured for the reject log.
+        let missing_accounts: Vec<Pubkey> = accounts
+            .iter()
+            .filter(|pk| {
+                cache.get(pk).is_none() && svm.get_account(&pk_to_addr(**pk)).is_none()
+            })
+            .copied()
+            .collect();
+
         let wsol_before = parse_wsol_amount(&svm, self.wsol_ata);
 
         // Convert solana-sdk 2.x VersionedTransaction → solana-transaction 3.x.
@@ -291,7 +309,16 @@ impl Simulator {
                     SimVerdict::Slippage
                 } else {
                     metrics.sim_reverted.fetch_add(1, Ordering::Relaxed);
-                    warn!(err = ?meta.err, logs = ?meta.meta.logs, "sim reverted (non-slippage)");
+                    warn!(err = ?meta.err, missing = missing_accounts.len(), "sim reverted (non-slippage)");
+                    // Persist the rejection (with the missing accounts) so the
+                    // operator can see exactly why each tx was dropped.
+                    self.reject_log.record(
+                        &format!("{:?}", meta.err),
+                        &meta.meta.logs,
+                        &missing_accounts,
+                        accounts.len(),
+                        meta.meta.compute_units_consumed,
+                    );
                     SimVerdict::Revert
                 }
             }
@@ -361,11 +388,12 @@ impl SimulatorPool {
         so_dir: &str,
         wsol_ata: Pubkey,
         current_slot: Arc<AtomicU64>,
+        reject_log: Arc<RejectLog>,
     ) -> Result<Self> {
         let workers = workers.max(1);
         let mut sims = Vec::with_capacity(workers);
         for i in 0..workers {
-            let sim = Simulator::new(so_dir, wsol_ata, current_slot.clone())
+            let sim = Simulator::new(so_dir, wsol_ata, current_slot.clone(), reject_log.clone())
                 .with_context(|| format!("failed to build sim worker #{i}"))?;
             sims.push(Arc::new(sim));
             info!(worker = i, "sim worker initialised");

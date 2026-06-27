@@ -204,7 +204,7 @@ FUNNEL    : profitable={profit}  drop_same_pool={drop_pool}  drop_multi_hop={dro
 PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
 IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  too_many_locks={too_locks}  calc_ok={calc}\n  \
-SIM       : passed={sim_pass}  reverted={sim_rev}  slippage_6001={sim_slip}  skipped_pmm={sim_skip}\n  \
+SIM       : passed={sim_pass}  reverted={sim_rev}  slippage_6001={sim_slip}  failopen_sent={sim_skip}\n  \
 JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \
 SWAP-IX   : avg_metis={avg_ms}ms"
                 );

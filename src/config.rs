@@ -85,6 +85,11 @@ pub struct SimulationConfig {
     /// static warm-up disabled (dynamic per-instruction subscription still runs).
     #[serde(default = "default_pools_file")]
     pub pools_file: String,
+    /// File (project-root relative) where non-slippage sim rejections are
+    /// appended as JSON lines, including the accounts that were missing from
+    /// the simulator — the main diagnostic for "why was this tx dropped?".
+    #[serde(default = "default_reject_log_file")]
+    pub reject_log_file: String,
     /// When sim reverts or errors, `fail_closed=true` drops the send (safest);
     /// `false` logs and forwards to Jito anyway (useful during rollout).
     #[serde(default = "default_true")]
@@ -106,6 +111,7 @@ impl Default for SimulationConfig {
             so_dir: default_so_dir(),
             dex_dir: default_dex_dir(),
             pools_file: default_pools_file(),
+            reject_log_file: default_reject_log_file(),
             fail_closed: true,
             workers: default_workers(),
         }
@@ -114,6 +120,10 @@ impl Default for SimulationConfig {
 
 fn default_pools_file() -> String {
     "pools.json".to_string()
+}
+
+fn default_reject_log_file() -> String {
+    "sim_rejects.jsonl".to_string()
 }
 
 fn default_so_dir() -> String {

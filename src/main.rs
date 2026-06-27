@@ -14,6 +14,7 @@ mod metis;
 mod metrics;
 mod pools;
 mod program_registry;
+mod reject_log;
 mod rate_limiter;
 mod template_cache;
 mod token_metrics;
@@ -204,11 +205,16 @@ async fn async_main(config: config::Config) -> Result<()> {
         warm.extend_from_slice(&static_pools.accounts);
         cache.prefetch(&warm);
 
+        let reject_log = Arc::new(reject_log::RejectLog::new(
+            &config.simulation.reject_log_file,
+        ));
+
         let pool = litesvm_sim::SimulatorPool::new(
             config.simulation.workers,
             &config.simulation.so_dir,
             wsol_ata,
             cache.stream_slot(),
+            reject_log,
         )?;
         (Some(Arc::new(cache)), Some(Arc::new(pool)))
     } else {
