@@ -51,7 +51,12 @@ x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
 threads = 4
 quote_timeout_ms = 200
 # CU limit بر اساس تعداد هاپ: [2 hops, 3 hops, 4 hops, 5 hops, 6 hops]
-cu_limits = [170000, 220000, 280000, 330000, 380000]
+# قبلاً 170k برای ۲هاپ خیلی کم بود: صرافی‌های سنگین مثل SolFi V2 (~100k CU) +
+# 1Dex (~58k CU) دقیقاً به سقف 170k می‌خوردند و با ComputationalBudgetExceeded
+# revert می‌شدند (هم در شبیه‌ساز هم روی زنجیره چون همین limit روی tx واقعی ست
+# می‌شود). مقادیر بالاتر فضای کافی می‌دهند؛ برای باندل Jito هزینه‌ی اضافه ندارد
+# (tip-based، نه priority-fee). در صورت نیاز بعداً برای landing بهتر کم کنید.
+cu_limits = [300000, 450000, 600000, 750000, 900000]
 # حداکثر درخواست‌های همزمان به Metis در هر chunk.
 # 256 تا = نصف بار قبلی (512) تا متیس پهنای باند کافی برای swap_instructions داشته باشد
 max_concurrent_quotes = 256

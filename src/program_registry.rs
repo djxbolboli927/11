@@ -48,7 +48,7 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     // --- Previously forbidden — now allowed at user's request ---
     ("ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA", "AlphaQ.so"),
     ("AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45", "Aquifer.so"),
-    ("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq", "Byreal:_CLMM.so"),
+    ("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq", "Byreal_CLMM.so"),
     ("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2", "REALQq.so"),
 
     // --- PMM DEXes — bypass simulation when enabled, otherwise go direct ---
@@ -72,6 +72,17 @@ pub const PMM_PROGRAM_IDS: &[&str] = &[
     "SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe",   // SolFi
     "SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF",   // SolFi V2
     "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",   // ZeroFi
+];
+
+/// PMM DEX *labels* as they appear in Metis `route_plan[].swapInfo.label`.
+/// Metis route data carries the human label (e.g. "SolFi V2"), NOT the program
+/// id, so PMM detection must also match on label. Matched case-insensitively as
+/// a substring. Routes hitting any of these are simulated but fail-open (their
+/// oracle freshness / compute cost can't be perfectly reproduced locally).
+pub const PMM_LABELS: &[&str] = &[
+    "tessera",
+    "solfi",   // matches "SolFi" and "SolFi V2"
+    "zerofi",
 ];
 
 /// Program ids the bot refuses to route through. Currently empty — every

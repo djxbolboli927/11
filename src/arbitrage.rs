@@ -15,7 +15,9 @@ use crate::jito_grpc::JitoGrpcClient;
 use crate::litesvm_sim::{SimVerdict, SimulatorPool};
 use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
 use crate::metrics::Metrics;
-use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS, PMM_PROGRAM_IDS};
+use crate::program_registry::{
+    FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS, PMM_LABELS, PMM_PROGRAM_IDS,
+};
 use crate::rate_limiter::RateLimiter;
 use crate::template_cache::{self, TemplateStore};
 use crate::token_metrics::TokenMetrics;
@@ -69,6 +71,16 @@ fn route_uses_pmm(quote: &QuoteResponse) -> bool {
     };
     for hop in arr {
         if let Some(swap_info) = hop.get("swapInfo").and_then(|s| s.as_object()) {
+            // Match on the human label (what Metis actually sends, e.g.
+            // "SolFi V2") — substring, case-insensitive.
+            if let Some(label) = swap_info.get("label").and_then(|v| v.as_str()) {
+                let label_lc = label.to_ascii_lowercase();
+                if PMM_LABELS.iter().any(|p| label_lc.contains(p)) {
+                    return true;
+                }
+            }
+            // Belt-and-suspenders: also match a raw program id if Metis ever
+            // includes one in swapInfo.
             for v in swap_info.values() {
                 if let Some(s) = v.as_str() {
                     if PMM_PROGRAM_IDS.iter().any(|p| *p == s) {
