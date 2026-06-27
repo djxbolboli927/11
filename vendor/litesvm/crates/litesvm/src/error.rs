@@ -1,4 +1,4 @@
-use {solana_instruction_error::InstructionError, thiserror::Error};
+use {solana_instruction::error::InstructionError, thiserror::Error};
 
 #[derive(Error, Debug)]
 pub enum InvalidSysvarDataError {
@@ -32,6 +32,4 @@ pub enum LiteSVMError {
     InvalidPath(#[from] std::io::Error),
     #[error("{0}")]
     InvalidLoader(String),
-    #[error("{0}")]
-    ProgramLoad(String),
 }

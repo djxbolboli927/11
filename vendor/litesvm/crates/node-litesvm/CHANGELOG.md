@@ -2,31 +2,6 @@
 
 ## [Unreleased]
 
-## [1.2.0] - 2026-06-19
-
-### Added
-
-- Add `sbpf-debugger` feature exposing GDB remote stub and trace filtering [(#354)](https://github.com/LiteSVM/litesvm/pull/354).
-
-### Changed
-
-- Bump to Agave 4.0 [(#322)](https://github.com/LiteSVM/litesvm/pull/322).
-- Update Solana JS dependencies (`@solana/kit`, `@solana-program/system`, `@solana-program/token`).
-
-### Fixed
-
-- Fix the balance null check in the minimal README example [(#348)](https://github.com/LiteSVM/litesvm/pull/348).
-
-## [1.1.0] - 2026-05-20
-
-### Changed
-
-- Refresh the Node wrapper documentation and README [(#328)](https://github.com/LiteSVM/litesvm/pull/328).
-
-### Fixed
-
-- Replace an `unwrap` with proper error handling for owner addresses [(#323)](https://github.com/LiteSVM/litesvm/pull/323).
-
 ## [1.0.0] - 2026-03-30
 
 ### Changed

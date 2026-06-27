@@ -3,7 +3,8 @@ use {
     agave_feature_set::replace_spl_token_with_p_token,
     solana_address::address,
     solana_sdk_ids::{
-        address_lookup_table, bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, stake,
+        address_lookup_table, bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, config,
+        stake,
     },
 };
 
@@ -31,7 +32,7 @@ pub fn load_default_programs(svm: &mut LiteSVM) {
 
     svm.add_program_preverified(
         address!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
-        include_bytes!("elf/spl_token_2022-11.0.0.so"),
+        include_bytes!("elf/spl_token_2022-10.0.0.so"),
         &bpf_loader_upgradeable::id(),
     )
     .unwrap();
@@ -54,6 +55,12 @@ pub fn load_default_programs(svm: &mut LiteSVM) {
     )
     .unwrap();
     svm.add_program_preverified(
+        config::ID,
+        include_bytes!("elf/config.so"),
+        &bpf_loader_upgradeable::id(),
+    )
+    .unwrap();
+    svm.add_program_preverified(
         address_lookup_table::ID,
         include_bytes!("elf/address_lookup_table.so"),
         &bpf_loader_upgradeable::id(),
@@ -61,7 +68,7 @@ pub fn load_default_programs(svm: &mut LiteSVM) {
     .unwrap();
     svm.add_program_preverified(
         stake::ID,
-        include_bytes!("elf/core_bpf_stake-5.0.0.so"),
+        include_bytes!("elf/core_bpf_stake-1.0.1.so"),
         &bpf_loader_upgradeable::id(),
     )
     .unwrap();
