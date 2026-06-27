@@ -41,7 +41,7 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     // --- Previously forbidden — now allowed at user's request ---
     ("ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA", "AlphaQ.so"),
     ("AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45", "Aquifer.so"),
-    ("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq", "Byreal_CLMM.so"),
+    ("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq", "Byreal:_CLMM.so"),
     ("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2", "REALQq.so"),
 
     // --- PMM DEXes — bypass simulation when enabled, otherwise go direct ---
@@ -53,7 +53,7 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     // --- PMM DEX — LiteSVM simulatable (no oracle staleness check) ---
     // GoonFi V2: uses sysvar_instructions whitelist (passes because we send
     // real Jupiter txs). Token vault accounts lazily RPC-fetched on first sim.
-    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "goofni_v2.so"),
+    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "GoonFi_V2.so"),
 ];
 
 /// PMM (Proprietary Market Maker) program ids. Routes through these DEXes

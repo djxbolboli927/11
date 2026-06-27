@@ -244,6 +244,10 @@ impl Simulator {
                 let cu = info.meta.compute_units_consumed;
 
                 if wsol_after < min_acceptable_out {
+                    // Output fell below the on-chain floor — economically the
+                    // same outcome as the Jupiter slippage revert (6001): the
+                    // opportunity is not real. Count it as a slippage drop.
+                    metrics.sim_slippage.fetch_add(1, Ordering::Relaxed);
                     metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
                     anyhow::bail!(
                         "sim unprofitable: wsol_after={} < min={}",
@@ -251,21 +255,36 @@ impl Simulator {
                         min_acceptable_out
                     );
                 }
+                metrics.sim_passed.fetch_add(1, Ordering::Relaxed);
                 Ok(SimOutcome {
                     compute_units: cu,
                     wsol_after,
                 })
             }
             Err(meta) => {
+                // Jupiter's "Slippage tolerance exceeded" is Custom(6001), which
+                // shows in logs/err as 0x1771. Classify it separately from real
+                // reverts (missing/stale account, other program errors) so the
+                // SIM metric line distinguishes "not profitable on-chain" from
+                // "sim infrastructure / other failure".
+                let is_slippage = format!("{:?}", meta.err).contains("Custom(6001)");
+                if is_slippage {
+                    metrics.sim_slippage.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    metrics.sim_reverted.fetch_add(1, Ordering::Relaxed);
+                }
+
                 if self.fail_closed {
                     anyhow::bail!(
-                        "sim reverted: err={:?} logs={:#?}",
+                        "sim reverted (slippage={}): err={:?} logs={:#?}",
+                        is_slippage,
                         meta.err,
                         meta.meta.logs
                     );
                 } else {
                     warn!(
                         err = ?meta.err,
+                        slippage = is_slippage,
                         logs = ?meta.meta.logs,
                         "sim reverted but fail_open=true, allowing send"
                     );
