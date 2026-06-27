@@ -175,7 +175,7 @@ fn test_register_tracing_handler() {
         litesvm::InvocationInspectCallback,
         solana_program_runtime::invoke_context::{Executable, InvokeContext, RegisterTrace},
         solana_transaction::{sanitized::SanitizedTransaction, Address},
-        solana_transaction_context::{IndexOfAccount, InstructionContext},
+        solana_transaction_context::{instruction::InstructionContext, IndexOfAccount},
         std::{
             collections::HashMap,
             sync::{Arc, Mutex},
@@ -218,8 +218,8 @@ fn test_register_tracing_handler() {
                     )
                 })
                 .filter(|(_registers, insn)| {
-                    insn.opc & 7 == solana_program_runtime::solana_sbpf::ebpf::BPF_JMP
-                        && insn.opc != solana_program_runtime::solana_sbpf::ebpf::BPF_JA
+                    insn.opc & 7 == solana_program_runtime::solana_sbpf::ebpf::BPF_JMP64
+                        && insn.opc != solana_program_runtime::solana_sbpf::ebpf::JA
                 })
                 .count();
             let entry = tracing_data.entry(*program_id).or_insert(TracingData {
@@ -240,13 +240,16 @@ fn test_register_tracing_handler() {
             _: &LiteSVM,
             _: &SanitizedTransaction,
             _: &[IndexOfAccount],
-            _: &InvokeContext,
+            _: &mut InvokeContext,
+            _register_tracing_enabled: bool,
         ) {
         }
 
         fn after_invocation(
             &self,
             _: &LiteSVM,
+            _: &SanitizedTransaction,
+            _: &[IndexOfAccount],
             invoke_context: &InvokeContext,
             register_tracing_enabled: bool,
         ) {

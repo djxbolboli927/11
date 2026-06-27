@@ -256,6 +256,16 @@ SHA-256 identifier is that files may grow in number, and consumers need a
 deterministic way to evaluate which shared object should be used when
 analyzing the tracing data.
 
+When the `sbpf-debugger` feature is enabled and `SBF_DEBUG_PORT` is set, the
+VM will start a GDB remote stub on the specified TCP port. A debugger client
+can then connect to inspect registers, memory, set
+breakpoints, and step through SBPF execution.
+
+The `SBF_TRACE_FILTER` environment variable can be used to narrow which
+traces are collected and what is going to be debugged. It supports filtering
+by `txsig` and `program_id` with the `==`, `!=`, `||`, and `&&` operators.
+For example: `SBF_TRACE_FILTER="txsig == A && (program_id == B || program_id == C)"`.
+
 Once enabled register tracing can't be changed afterwards because in nature
 it's baked into the program executables at load time. Yet a user may want a
 more fine-grained control over when register tracing data should be
@@ -300,6 +310,8 @@ much easier.
 
 #[cfg(feature = "register-tracing")]
 use crate::register_tracing::DefaultRegisterTracingCallback;
+#[cfg(feature = "persistence-internal")]
+use indexmap::IndexMap;
 #[cfg(feature = "precompiles")]
 use precompiles::load_precompiles;
 #[cfg(feature = "nodejs-internal")]
@@ -362,7 +374,8 @@ use {
     },
     solana_rent::Rent,
     solana_sdk_ids::{
-        bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, native_loader, system_program,
+        bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, config as config_program,
+        native_loader, system_program,
     },
     solana_signature::Signature,
     solana_signer::Signer,
@@ -371,7 +384,7 @@ use {
     solana_stake_interface::stake_history::StakeHistory,
     solana_svm_log_collector::LogCollector,
     solana_svm_timings::ExecuteTimings,
-    solana_svm_transaction::svm_message::SVMMessage,
+    solana_svm_transaction::svm_message::SVMStaticMessage,
     solana_system_program::{get_system_account_kind, SystemAccountKind},
     solana_sysvar::{Sysvar, SysvarSerialize},
     solana_sysvar_id::SysvarId,
@@ -379,7 +392,10 @@ use {
         sanitized::{MessageHash, SanitizedTransaction, MAX_TX_ACCOUNT_LOCKS},
         versioned::VersionedTransaction,
     },
-    solana_transaction_context::{ExecutionRecord, IndexOfAccount, TransactionContext},
+    solana_transaction_context::{
+        transaction::{ExecutionRecord, TransactionContext},
+        IndexOfAccount,
+    },
     solana_transaction_error::TransactionError,
     std::{cell::RefCell, path::Path, rc::Rc, sync::Arc},
     types::SimulatedTransactionInfo,
@@ -394,6 +410,8 @@ pub mod types;
 
 mod accounts_db;
 mod callback;
+#[cfg(feature = "sbpf-debugger")]
+pub mod debugger;
 mod features;
 mod format_logs;
 mod history;
@@ -403,6 +421,8 @@ mod precompiles;
 mod programs;
 #[cfg(feature = "register-tracing")]
 pub mod register_tracing;
+#[cfg(feature = "register-tracing")]
+pub mod register_tracing_filter;
 mod utils;
 
 #[derive(Clone)]
@@ -580,7 +600,35 @@ impl LiteSVM {
             latest_blockhash,
         )]));
         self.set_sysvar(&SlotHistory::default());
-        self.set_sysvar(&StakeHistory::default());
+
+        // StakeHistory::size_of() is hard-coded to 16 KiB (512 max entries). Using set_sysvar
+        // would allocate that padded buffer, and sol_get_sysvar reads beyond the actual data
+        // would return zeros. The Stake BPF program asserts entry_epoch == target_epoch after
+        // each partial read, so those zero bytes trigger a panic at epoch >= 1. Serialize only
+        // the actual data so reads beyond the end return an error instead.
+        {
+            let data = bincode::serialize(&StakeHistory::default()).unwrap();
+            let mut account = AccountSharedData::new(1, data.len(), &solana_sdk_ids::sysvar::id());
+            account.data_as_mut_slice().copy_from_slice(&data);
+            self.accounts
+                .add_account(StakeHistory::id(), account)
+                .unwrap();
+        }
+
+        // Initialize the deprecated StakeConfig account so it is available to programs
+        // that still pass it as a transaction account (e.g. older DelegateStake callers).
+        // Format: ConfigKeys header (8-byte u64 key count = 0) followed by
+        // bincode-serialised Config::default().
+        #[allow(deprecated)]
+        {
+            use solana_stake_interface::config::Config;
+            let mut data = bincode::serialize(&0u64).unwrap(); // 0 authorized keys
+            data.extend(bincode::serialize(&Config::default()).unwrap());
+            let mut account = AccountSharedData::new(1, data.len(), &config_program::id());
+            account.data_as_mut_slice().copy_from_slice(&data);
+            self.accounts
+                .add_account_no_checks(solana_sdk_ids::stake::config::id(), account);
+        }
     }
 
     /// Includes the default sysvars.
@@ -598,10 +646,8 @@ impl LiteSVM {
     /// Returns a [`FeatureSet`] containing only the features currently
     /// activated on Solana mainnet-beta.
     ///
-    /// The list of active features was captured from
-    /// `https://api.mainnet-beta.solana.com` on 2026-04-26 and will need to
-    /// be refreshed as mainnet activates new features. See also
-    /// <https://www.simd.wtf/>.
+    /// The list of active features will need to be refreshed as mainnet
+    /// activates new features. See also <https://www.simd.wtf/>.
     pub fn mainnet_feature_set() -> FeatureSet {
         let mut feature_set = FeatureSet::default();
         for feature_id in MAINNET_ACTIVE_FEATURES {
@@ -886,7 +932,7 @@ impl LiteSVM {
             .programs_cache
             .replenish(program_id, Arc::new(builtin));
 
-        let mut account = AccountSharedData::new(1, 1, &bpf_loader::id());
+        let mut account = AccountSharedData::new(1, 1, &native_loader::id());
         account.set_executable(true);
         self.accounts.add_account_no_checks(program_id, account);
     }
@@ -973,17 +1019,33 @@ impl LiteSVM {
             )));
         };
 
-        let mut loaded_program = solana_bpf_loader_program::load_program_from_bytes(
-            None,
-            &mut LoadProgramMetrics::default(),
-            program_bytes,
-            loader_id,
-            program_size,
-            current_slot,
-            self.accounts.environments.program_runtime_v1.clone(),
-            PREVERIFIED,
-        )
-        .map_err(LiteSVMError::from)?;
+        let effective_slot = current_slot
+            .saturating_add(solana_program_runtime::loaded_programs::DELAY_VISIBILITY_SLOT_OFFSET);
+        let mut loaded_program = if PREVERIFIED {
+            // Safety: PREVERIFIED means the program was previously verified.
+            unsafe {
+                ProgramCacheEntry::reload(
+                    loader_id,
+                    self.accounts.environments.program_runtime_v1.clone(),
+                    current_slot,
+                    effective_slot,
+                    program_bytes,
+                    program_size,
+                    &mut LoadProgramMetrics::default(),
+                )
+            }
+        } else {
+            ProgramCacheEntry::new(
+                loader_id,
+                self.accounts.environments.program_runtime_v1.clone(),
+                current_slot,
+                effective_slot,
+                program_bytes,
+                program_size,
+                &mut LoadProgramMetrics::default(),
+            )
+        }
+        .map_err(|e| LiteSVMError::ProgramLoad(e.to_string()))?;
         loaded_program.effective_slot = current_slot;
 
         self.accounts
@@ -1031,12 +1093,14 @@ impl LiteSVM {
         &self,
         compute_budget: ComputeBudget,
         accounts: Vec<(Address, AccountSharedData)>,
+        number_of_top_level_instructions: usize,
     ) -> TransactionContext<'_> {
         TransactionContext::new(
             accounts,
             self.get_sysvar(),
             compute_budget.max_instruction_stack_depth,
             compute_budget.max_instruction_trace_length,
+            number_of_top_level_instructions,
         )
     }
 
@@ -1232,7 +1296,11 @@ impl LiteSVM {
 
         match maybe_program_indices {
             Ok(program_indices) => {
-                let mut context = self.create_transaction_context(compute_budget, accounts);
+                let mut context = self.create_transaction_context(
+                    compute_budget,
+                    accounts,
+                    message.num_instructions(),
+                );
                 let feature_set = self.feature_set.runtime_features();
                 let mut invoke_context = InvokeContext::new(
                     &mut context,
@@ -1256,7 +1324,8 @@ impl LiteSVM {
                     self,
                     tx,
                     &program_indices,
-                    &invoke_context,
+                    &mut invoke_context,
+                    self.enable_register_tracing,
                 );
 
                 let mut tx_result = process_message(
@@ -1271,6 +1340,8 @@ impl LiteSVM {
                 #[cfg(feature = "invocation-inspect-callback")]
                 self.invocation_inspect_callback.after_invocation(
                     self,
+                    tx,
+                    &program_indices,
                     &invoke_context,
                     self.enable_register_tracing,
                 );
@@ -1718,6 +1789,89 @@ impl LiteSVM {
 
         self
     }
+
+    // ── persistence-internal: getters ──────────────────────────────────
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn airdrop_keypair_bytes(&self) -> &[u8; 64] {
+        &self.airdrop_kp
+    }
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn get_blockhash_check(&self) -> bool {
+        self.blockhash_check
+    }
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn get_fee_structure(&self) -> &FeeStructure {
+        &self.fee_structure
+    }
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn get_log_bytes_limit(&self) -> Option<usize> {
+        self.log_bytes_limit
+    }
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn get_feature_set_ref(&self) -> &FeatureSet {
+        &self.feature_set
+    }
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn transaction_history_entries(&self) -> &IndexMap<Signature, TransactionResult> {
+        self.history.entries()
+    }
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn transaction_history_capacity(&self) -> usize {
+        self.history.capacity()
+    }
+
+    // ── persistence-internal: setters ──────────────────────────────────
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn set_latest_blockhash(&mut self, hash: Hash) {
+        self.latest_blockhash = hash;
+    }
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn set_airdrop_keypair(&mut self, kp: [u8; 64]) {
+        self.airdrop_kp = kp;
+    }
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn set_account_no_checks(&mut self, pubkey: Address, account: AccountSharedData) {
+        self.accounts.add_account_no_checks(pubkey, account);
+    }
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn restore_transaction_history(
+        &mut self,
+        entries: IndexMap<Signature, TransactionResult>,
+        capacity: usize,
+    ) {
+        self.history = TransactionHistory::from_entries(entries, capacity);
+    }
+
+    #[cfg(feature = "persistence-internal")]
+    pub fn set_fee_structure(&mut self, fee_structure: FeeStructure) {
+        self.fee_structure = fee_structure;
+    }
+
+    // ── persistence-internal: cache rebuild ────────────────────────────
+
+    /// Rebuilds all derived caches after bulk account insertion.
+    ///
+    /// Must be called after restoring accounts via `set_account_no_checks`.
+    /// Order matters: environments first, then sysvars, then BPF programs.
+    #[cfg(feature = "persistence-internal")]
+    pub fn rebuild_caches(&mut self) -> Result<(), LiteSVMError> {
+        self.reserved_account_keys = Self::reserved_account_keys_for_feature_set(&self.feature_set);
+        self.set_builtins();
+        self.accounts.rebuild_sysvar_cache();
+        self.accounts.load_all_existing_programs()?;
+        Ok(())
+    }
 }
 
 struct CheckAndProcessTransactionSuccessCore<'ix_data> {
@@ -1758,7 +1912,7 @@ fn execute_tx_helper(
     ctx: TransactionContext,
 ) -> (
     Signature,
-    solana_transaction_context::TransactionReturnData,
+    solana_transaction_context::transaction::TransactionReturnData,
     InnerInstructionsList,
     Vec<(Address, AccountSharedData)>,
 ) {
@@ -1783,14 +1937,11 @@ fn get_compute_budget_limits(
     sanitized_tx: &SanitizedTransaction,
     feature_set: &FeatureSet,
 ) -> Result<ComputeBudgetLimits, ExecutionResult> {
-    process_compute_budget_instructions(
-        SVMMessage::program_instructions_iter(sanitized_tx),
-        feature_set,
-    )
-    .map_err(|e| ExecutionResult {
-        tx_result: Err(e),
-        ..Default::default()
-    })
+    process_compute_budget_instructions(sanitized_tx.program_instructions_iter(), feature_set)
+        .map_err(|e| ExecutionResult {
+            tx_result: Err(e),
+            ..Default::default()
+        })
 }
 
 /// Get the max number of accounts that a transaction may lock in this block
@@ -1882,12 +2033,15 @@ pub trait InvocationInspectCallback: Send + Sync {
         svm: &LiteSVM,
         tx: &SanitizedTransaction,
         program_indices: &[IndexOfAccount],
-        invoke_context: &InvokeContext,
+        invoke_context: &mut InvokeContext,
+        enable_register_tracing: bool,
     );
 
     fn after_invocation(
         &self,
         svm: &LiteSVM,
+        tx: &SanitizedTransaction,
+        program_indices: &[IndexOfAccount],
         invoke_context: &InvokeContext,
         enable_register_tracing: bool,
     );
@@ -1903,11 +2057,20 @@ impl InvocationInspectCallback for EmptyInvocationInspectCallback {
         _: &LiteSVM,
         _: &SanitizedTransaction,
         _: &[IndexOfAccount],
-        _: &InvokeContext,
+        _: &mut InvokeContext,
+        _enable_register_tracing: bool,
     ) {
     }
 
-    fn after_invocation(&self, _: &LiteSVM, _: &InvokeContext, _enable_register_tracing: bool) {}
+    fn after_invocation(
+        &self,
+        _: &LiteSVM,
+        _: &SanitizedTransaction,
+        _: &[IndexOfAccount],
+        _: &InvokeContext,
+        _enable_register_tracing: bool,
+    ) {
+    }
 }
 
 #[cfg(test)]

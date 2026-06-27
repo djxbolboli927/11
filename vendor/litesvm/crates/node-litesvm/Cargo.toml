@@ -1,17 +1,19 @@
 [package]
 edition = "2021"
 name = "litesvm-node"
-version = "1.0.0"
+version = "1.2.0"
 include = ["/src", "build.rs"]
 repository = "https://github.com/LiteSVM/litesvm"
 license = "MIT"
 
 [features]
 default = []
+sbpf-debugger = ["litesvm/sbpf-debugger"]
 register-tracing = ["litesvm/register-tracing"]
 
 [lib]
 crate-type = ["cdylib"]
+test = false
 
 [dependencies]
 agave-feature-set.workspace = true
