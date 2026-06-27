@@ -12,6 +12,7 @@ mod jito_grpc;
 mod litesvm_sim;
 mod metis;
 mod metrics;
+mod pools;
 mod program_registry;
 mod rate_limiter;
 mod template_cache;
@@ -146,8 +147,35 @@ async fn async_main(config: config::Config) -> Result<()> {
         }
 
         let dex_pools = dex_accounts::load(&config.simulation.dex_dir);
+        // Fixed-pool registry from pools.json: every referenced account
+        // (pool, vaults, mints, oracle, ALT, …) is subscribed live so the sim
+        // always sees fresh state, and pre-fetched below for warm-up.
+        let static_pools = pools::load(&config.simulation.pools_file);
+        if !static_pools.is_empty() {
+            // Flag any configured pool whose owning program isn't registered:
+            // its .so won't load, so that pool's routes can't be simulated.
+            let registered: std::collections::HashSet<String> =
+                program_registry::all_program_ids().into_iter().collect();
+            for owner in &static_pools.owners {
+                if !registered.contains(&owner.to_string()) {
+                    eprintln!(
+                        "[pools] WARNING: owner {owner} not in program_registry — \
+                         its pool routes cannot be simulated (add it + dump the .so)"
+                    );
+                }
+            }
+            eprintln!(
+                "[pools] loaded {} pools / {} accounts for sim warm-up + live subscription",
+                static_pools.pool_count,
+                static_pools.accounts.len()
+            );
+        }
+
         let mut live_extra = vec![wsol_ata];
         live_extra.extend_from_slice(&dex_pools.subscribe_accounts);
+        live_extra.extend_from_slice(&static_pools.accounts);
+        live_extra.sort_unstable();
+        live_extra.dedup();
 
         cache.spawn_subscription(
             config.yellowstone_grpc.endpoint.clone(),
@@ -173,13 +201,13 @@ async fn async_main(config: config::Config) -> Result<()> {
             }
         }
         warm.extend_from_slice(&dex_pools.all_accounts);
+        warm.extend_from_slice(&static_pools.accounts);
         cache.prefetch(&warm);
 
         let pool = litesvm_sim::SimulatorPool::new(
             config.simulation.workers,
             &config.simulation.so_dir,
             wsol_ata,
-            config.simulation.fail_closed,
             cache.stream_slot(),
         )?;
         (Some(Arc::new(cache)), Some(Arc::new(pool)))
@@ -202,6 +230,7 @@ async fn async_main(config: config::Config) -> Result<()> {
         user_pubkey: trading_keypair.pubkey().to_string(),
         sim_cache,
         sim_pool,
+        sim_fail_closed: config.simulation.fail_closed,
         template_store,
     });
 

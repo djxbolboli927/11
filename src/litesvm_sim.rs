@@ -52,10 +52,25 @@ pub struct SimOutcome {
     pub wsol_after: u64,
 }
 
+/// Outcome of a pre-flight simulation. The send/drop *policy* lives in the
+/// caller (the worker) so it can apply per-route rules (e.g. PMM fail-open)
+/// on top of the global `fail_closed` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimVerdict {
+    /// Tx executed and left ≥ the on-chain floor in the WSOL ATA. Send it.
+    Pass,
+    /// Jupiter slippage error (Custom(6001)/0x1771) OR output below the floor:
+    /// the opportunity is not real on-chain. ALWAYS drop — never send.
+    Slippage,
+    /// Any other revert/error (missing-or-stale account, unloaded program,
+    /// other program error, tx-conversion failure). The caller decides whether
+    /// to drop (fail-closed) or send anyway (fail-open) based on the route.
+    Revert,
+}
+
 pub struct Simulator {
     svm: Mutex<LiteSVM>,
     wsol_ata: Pubkey,
-    fail_closed: bool,
     /// Live mainnet slot from the Yellowstone gRPC stream (zero RPC).
     current_slot: Arc<AtomicU64>,
 }
@@ -89,7 +104,6 @@ impl Simulator {
     pub fn new(
         so_dir: &str,
         wsol_ata: Pubkey,
-        fail_closed: bool,
         current_slot: Arc<AtomicU64>,
     ) -> Result<Self> {
         // Build the SVM with the full mainnet feature set.
@@ -151,18 +165,18 @@ impl Simulator {
         Ok(Self {
             svm: Mutex::new(svm),
             wsol_ata,
-            fail_closed,
             current_slot,
         })
     }
 
-    /// Simulate `tx` against the Yellowstone-fed `cache`. Returns
-    /// `Ok(SimOutcome)` when the tx succeeds AND leaves at least
-    /// `min_acceptable_out` lamports in the user's WSOL ATA. Returns `Err`
-    /// for reverts or unprofitable outcomes — caller should drop the bundle.
+    /// Simulate `tx` against the Yellowstone-fed `cache` and classify the
+    /// result as [`SimVerdict`]. `Pass` when the tx succeeds AND leaves at
+    /// least `min_acceptable_out` lamports in the user's WSOL ATA; `Slippage`
+    /// when it is provably unprofitable on-chain; `Revert` for everything else.
+    /// The send/drop decision is left to the caller.
     ///
-    /// ZERO RPC calls. Every account read from the Yellowstone-fed cache.
-    /// The live slot is sourced from the same stream via `current_slot`.
+    /// ZERO RPC calls on the hot path (missing accounts are lazily fetched once
+    /// then cached). The live slot is sourced from the Yellowstone stream.
     pub fn simulate(
         &self,
         tx: &VersionedTransaction,
@@ -170,7 +184,7 @@ impl Simulator {
         cache: &AccountCache,
         min_acceptable_out: u64,
         metrics: &Metrics,
-    ) -> Result<SimOutcome> {
+    ) -> SimVerdict {
         let accounts = collect_tx_accounts(tx, alts);
 
         // Lazy-fetch any accounts missing from the Yellowstone cache.
@@ -228,7 +242,14 @@ impl Simulator {
         let wsol_before = parse_wsol_amount(&svm, self.wsol_ata);
 
         // Convert solana-sdk 2.x VersionedTransaction → solana-transaction 3.x.
-        let litesvm_tx = to_litesvm_tx(tx)?;
+        let litesvm_tx = match to_litesvm_tx(tx) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "tx conversion for sim failed");
+                metrics.sim_reverted.fetch_add(1, Ordering::Relaxed);
+                return SimVerdict::Revert;
+            }
+        };
 
         match svm.simulate_transaction(litesvm_tx) {
             Ok(info) => {
@@ -246,52 +267,32 @@ impl Simulator {
                 if wsol_after < min_acceptable_out {
                     // Output fell below the on-chain floor — economically the
                     // same outcome as the Jupiter slippage revert (6001): the
-                    // opportunity is not real. Count it as a slippage drop.
+                    // opportunity is not real. Treat as a slippage drop.
                     metrics.sim_slippage.fetch_add(1, Ordering::Relaxed);
                     metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
-                    anyhow::bail!(
-                        "sim unprofitable: wsol_after={} < min={}",
-                        wsol_after,
-                        min_acceptable_out
-                    );
+                    debug!(wsol_after, min = min_acceptable_out, "sim below floor → Slippage");
+                    return SimVerdict::Slippage;
                 }
                 metrics.sim_passed.fetch_add(1, Ordering::Relaxed);
-                Ok(SimOutcome {
-                    compute_units: cu,
-                    wsol_after,
-                })
+                debug!(cu, wsol_after, "sim passed");
+                SimVerdict::Pass
             }
             Err(meta) => {
                 // Jupiter's "Slippage tolerance exceeded" is Custom(6001), which
                 // shows in logs/err as 0x1771. Classify it separately from real
                 // reverts (missing/stale account, other program errors) so the
                 // SIM metric line distinguishes "not profitable on-chain" from
-                // "sim infrastructure / other failure".
+                // "sim infrastructure / other failure", and so the caller can
+                // ALWAYS drop slippage but fail-open on other reverts.
                 let is_slippage = format!("{:?}", meta.err).contains("Custom(6001)");
                 if is_slippage {
                     metrics.sim_slippage.fetch_add(1, Ordering::Relaxed);
+                    debug!(err = ?meta.err, "sim reverted with slippage 6001");
+                    SimVerdict::Slippage
                 } else {
                     metrics.sim_reverted.fetch_add(1, Ordering::Relaxed);
-                }
-
-                if self.fail_closed {
-                    anyhow::bail!(
-                        "sim reverted (slippage={}): err={:?} logs={:#?}",
-                        is_slippage,
-                        meta.err,
-                        meta.meta.logs
-                    );
-                } else {
-                    warn!(
-                        err = ?meta.err,
-                        slippage = is_slippage,
-                        logs = ?meta.meta.logs,
-                        "sim reverted but fail_open=true, allowing send"
-                    );
-                    Ok(SimOutcome {
-                        compute_units: meta.meta.compute_units_consumed,
-                        wsol_after: 0,
-                    })
+                    warn!(err = ?meta.err, logs = ?meta.meta.logs, "sim reverted (non-slippage)");
+                    SimVerdict::Revert
                 }
             }
         }
@@ -359,13 +360,12 @@ impl SimulatorPool {
         workers: usize,
         so_dir: &str,
         wsol_ata: Pubkey,
-        fail_closed: bool,
         current_slot: Arc<AtomicU64>,
     ) -> Result<Self> {
         let workers = workers.max(1);
         let mut sims = Vec::with_capacity(workers);
         for i in 0..workers {
-            let sim = Simulator::new(so_dir, wsol_ata, fail_closed, current_slot.clone())
+            let sim = Simulator::new(so_dir, wsol_ata, current_slot.clone())
                 .with_context(|| format!("failed to build sim worker #{i}"))?;
             sims.push(Arc::new(sim));
             info!(worker = i, "sim worker initialised");

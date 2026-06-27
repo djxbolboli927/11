@@ -23,6 +23,13 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     ("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "Jupiter_Aggregator_v6.so"),
 
     // --- AMM / CLMM / orderbook DEXes ---
+    ("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", "Raydium_AMM_v4.so"),
+    // BiSON: present in pools.json but no .so shipped yet. Listed here so
+    // `scripts/redump_so.sh` dumps BiSON.so automatically and the Yellowstone
+    // owner-filter subscribes its pools. Until BiSON.so exists on disk the
+    // loader skips it (warns) and BiSON routes revert in sim → dropped under
+    // fail_closed. Run redump_so.sh to enable BiSON simulation.
+    ("BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi", "BiSON.so"),
     ("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG", "Meteora_DAMM_v2.so"),
     ("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", "Raydium_Concentrated_Liquidity.so"),
     ("MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms", "Manifest.so"),

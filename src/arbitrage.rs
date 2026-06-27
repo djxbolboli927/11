@@ -12,7 +12,7 @@ use crate::blockhash_cache::BlockhashCache;
 use crate::config::Config;
 use crate::jito::JitoClient;
 use crate::jito_grpc::JitoGrpcClient;
-use crate::litesvm_sim::SimulatorPool;
+use crate::litesvm_sim::{SimVerdict, SimulatorPool};
 use crate::metis::{MetisClient, QuoteResponse, SwapInstructionsResponse};
 use crate::metrics::Metrics;
 use crate::program_registry::{FORBIDDEN_DEX_LABELS, FORBIDDEN_DEX_PROGRAM_IDS, PMM_PROGRAM_IDS};
@@ -170,9 +170,11 @@ struct ReadyInstruction {
     /// Input leg size in lamports — needed to recompute the on-chain profit
     /// floor for the LiteSVM pre-flight gate (input + tip + network fee).
     amount: u64,
-    /// True when the route touches a PMM DEX whose oracle freshness cannot be
-    /// reproduced locally; such routes skip simulation and go straight to Jito.
-    bypass_sim: bool,
+    /// True for routes that touch a PMM DEX. They ARE still simulated (we get
+    /// metrics and the 6001 slippage drop), but a NON-slippage revert does not
+    /// drop them — PMM oracle freshness can't be perfectly reproduced locally,
+    /// so we fail-open to avoid discarding a real PMM opportunity.
+    sim_fail_open: bool,
     arrived_at: Instant,
     waited_for_slot: bool,
 }
@@ -193,6 +195,12 @@ pub struct CalcCtx {
     pub user_pubkey: String,
     pub sim_cache: Option<Arc<AccountCache>>,
     pub sim_pool: Option<Arc<SimulatorPool>>,
+    /// Global policy for NON-slippage sim reverts on non-PMM routes:
+    /// true  → drop (strict pre-flight gate, default),
+    /// false → send anyway (rollout / fail-open everywhere).
+    /// Slippage (6001) reverts are ALWAYS dropped regardless. PMM routes are
+    /// always fail-open (see `ReadyInstruction::sim_fail_open`).
+    pub sim_fail_closed: bool,
     pub template_store: Arc<TemplateStore>,
 }
 
@@ -442,9 +450,13 @@ pub fn spawn_workers(
 
                 // ── LiteSVM pre-flight simulation gate ────────────────────────
                 // Run the exact tx locally on real DEX bytecode before paying a
-                // Jito slot. A revert (especially Jupiter slippage 6001/0x1771)
-                // means the opportunity is not real on-chain → drop (fail-closed).
-                // PMM routes bypass (oracle staleness can't be reproduced).
+                // Jito slot. EVERY DEX (incl. PMM) is simulated. The verdict
+                // decides the action:
+                //   Pass     → send.
+                //   Slippage → drop ALWAYS (6001/0x1771 or output below floor;
+                //              the opportunity is not real on-chain).
+                //   Revert   → drop if the global gate is fail-closed AND the
+                //              route is not PMM; otherwise send (fail-open).
                 if let (Some(pool), Some(cache)) =
                     (ctx_c.sim_pool.as_ref(), ctx_c.sim_cache.as_ref())
                 {
@@ -452,43 +464,52 @@ pub fn spawn_workers(
                     // live Yellowstone updates (no-op for already-seen accounts).
                     cache.ensure_subscribed(&sim_writable);
 
-                    if item.bypass_sim {
-                        met_c.sim_skipped.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        match crate::litesvm_sim::resolve_alts(
-                            &alt_addrs,
-                            &ctx_c.alt_cache,
-                            &ctx_c.rpc_client,
-                        ) {
-                            Ok(alts) => {
-                                let floor = item
-                                    .amount
-                                    .saturating_add(JITO_TIP_LAMPORTS)
-                                    .saturating_add(NETWORK_FEE_LAMPORTS);
-                                let sim = pool.acquire();
-                                let cache_c = cache.clone();
-                                let met_sim = met_c.clone();
-                                let tx_for_sim = tx.clone();
-                                let sim_ok = tokio::task::spawn_blocking(move || {
-                                    sim.simulate(&tx_for_sim, &alts, &cache_c, floor, &met_sim)
-                                        .is_ok()
-                                })
-                                .await
-                                .unwrap_or(false);
-                                if !sim_ok {
-                                    // simulate() already bumped sim_slippage /
-                                    // sim_reverted with the precise reason.
+                    match crate::litesvm_sim::resolve_alts(
+                        &alt_addrs,
+                        &ctx_c.alt_cache,
+                        &ctx_c.rpc_client,
+                    ) {
+                        Ok(alts) => {
+                            let floor = item
+                                .amount
+                                .saturating_add(JITO_TIP_LAMPORTS)
+                                .saturating_add(NETWORK_FEE_LAMPORTS);
+                            let sim = pool.acquire();
+                            let cache_c = cache.clone();
+                            let met_sim = met_c.clone();
+                            let tx_for_sim = tx.clone();
+                            let verdict = tokio::task::spawn_blocking(move || {
+                                sim.simulate(&tx_for_sim, &alts, &cache_c, floor, &met_sim)
+                            })
+                            .await
+                            .unwrap_or(SimVerdict::Revert);
+
+                            // simulate() already bumped sim_passed / sim_slippage
+                            // / sim_reverted with the precise reason.
+                            match verdict {
+                                SimVerdict::Pass => {}
+                                SimVerdict::Slippage => {
                                     met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
                                     continue;
                                 }
+                                SimVerdict::Revert => {
+                                    let send_anyway =
+                                        item.sim_fail_open || !ctx_c.sim_fail_closed;
+                                    if send_anyway {
+                                        met_c.sim_skipped.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        met_c.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                // ALT resolution is infrastructure, not a revert;
-                                // don't let a transient failure block a real
-                                // opportunity — forward without the local gate.
-                                tracing::debug!(error = %e, "alt resolve for sim failed; sending without pre-flight");
-                                met_c.sim_skipped.fetch_add(1, Ordering::Relaxed);
-                            }
+                        }
+                        Err(e) => {
+                            // ALT resolution is infrastructure, not a revert;
+                            // don't let a transient failure block a real
+                            // opportunity — forward without the local gate.
+                            tracing::debug!(error = %e, "alt resolve for sim failed; sending without pre-flight");
+                            met_c.sim_skipped.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -524,7 +545,7 @@ fn push_to_queue(
     swap_ixs: SwapInstructionsResponse,
     hop_count: usize,
     amount: u64,
-    bypass_sim: bool,
+    sim_fail_open: bool,
     pipeline: &Pipeline,
     metrics: &Metrics,
 ) {
@@ -532,7 +553,7 @@ fn push_to_queue(
         swap_ixs,
         hop_count,
         amount,
-        bypass_sim,
+        sim_fail_open,
         arrived_at: Instant::now(),
         waited_for_slot: false,
     };
@@ -644,9 +665,10 @@ pub async fn scan_all_tokens(
 
         let hop_count = pair.hop_count;
         let amount = pair.amount;
-        // Routes touching a PMM DEX bypass the local sim (oracle freshness can't
-        // be reproduced); computed once and carried through every queue path.
-        let bypass_sim = route_uses_pmm(&merged);
+        // Routes touching a PMM DEX are still simulated but fail-open on a
+        // non-slippage revert (oracle freshness can't be reproduced locally);
+        // computed once and carried through every queue path.
+        let sim_fail_open = route_uses_pmm(&merged);
         let sig = template_cache::route_sig(&merged.route_plan);
         let tc = &config.template_cache;
         let context_slot = merged.context_slot;
@@ -662,7 +684,7 @@ pub async fn scan_all_tokens(
                     metrics.ix_from_ram.fetch_add(1, Ordering::Relaxed);
                     metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
                     ctx.template_store.record_route_hit(sig);
-                    push_to_queue(patched, hop_count, amount, bypass_sim, pipeline, metrics);
+                    push_to_queue(patched, hop_count, amount, sim_fail_open, pipeline, metrics);
                     continue;
                 }
                 // Patching failed (no offsets discovered): fall through to Tier-2.
@@ -688,7 +710,7 @@ pub async fn scan_all_tokens(
                             metrics.ix_from_ram.fetch_add(1, Ordering::Relaxed);
                             metrics.swap_ix_ok.fetch_add(1, Ordering::Relaxed);
                             ctx.template_store.record_route_hit(tmpl.route_signature);
-                            push_to_queue(patched, hop_count, amount, bypass_sim, pipeline, metrics);
+                            push_to_queue(patched, hop_count, amount, sim_fail_open, pipeline, metrics);
                             continue;
                         }
                     }
@@ -766,7 +788,7 @@ pub async fn scan_all_tokens(
                 swap_ixs,
                 hop_count,
                 amount,
-                bypass_sim,
+                sim_fail_open,
                 arrived_at: std::time::Instant::now(),
                 waited_for_slot: false,
             };
