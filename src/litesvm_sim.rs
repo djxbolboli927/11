@@ -383,13 +383,62 @@ impl Simulator {
                             },
                         })
                         .collect();
+
+                    // First occurrence of this (error, failed_program) shape:
+                    // audit the sim's account state against the LIVE chain so we
+                    // can tell a load bug (owner/data mismatch) apart from the
+                    // program's own logic over correctly-loaded state. This is
+                    // the decisive check that removes guesswork on errors like
+                    // InvalidAccountOwner. Skipped for repeats (cost: one RPC).
+                    let err_str = format!("{:?}", meta.err);
+                    let failed_program =
+                        crate::reject_log::failed_program_from_logs(&meta.meta.logs);
+                    let chain_mismatches: Vec<crate::reject_log::ChainMismatch> =
+                        if self.reject_log.seen_before(&err_str, &failed_program) {
+                            Vec::new()
+                        } else {
+                            // Audit only non-executable accounts (programs/sysvars
+                            // are loaded from .so / synthesized, not from chain).
+                            let to_audit: Vec<Pubkey> = acct_views
+                                .iter()
+                                .filter(|v| !v.executable)
+                                .map(|v| v.pubkey)
+                                .collect();
+                            let chain = cache.audit_fetch(&to_audit);
+                            acct_views
+                                .iter()
+                                .filter(|v| !v.executable)
+                                .filter_map(|v| {
+                                    let chain_entry = chain.get(&v.pubkey)?;
+                                    let (chain_owner, chain_len) = match chain_entry {
+                                        Some((o, l)) => (Some(*o), Some(*l)),
+                                        None => (None, None),
+                                    };
+                                    let owner_differs = v.owner != chain_owner;
+                                    let len_differs = chain_len != Some(v.data_len);
+                                    if owner_differs || len_differs {
+                                        Some(crate::reject_log::ChainMismatch {
+                                            pubkey: v.pubkey,
+                                            sim_owner: v.owner,
+                                            chain_owner,
+                                            sim_data_len: v.data_len,
+                                            chain_data_len: chain_len,
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        };
+
                     // Persist the rejection (first occurrence of each shape) so
                     // the operator can see exactly why each tx was dropped.
                     self.reject_log.record(
-                        &format!("{:?}", meta.err),
+                        &err_str,
                         &meta.meta.logs,
                         &acct_views,
                         &missing_accounts,
+                        &chain_mismatches,
                         meta.meta.compute_units_consumed,
                     );
                     SimVerdict::Revert

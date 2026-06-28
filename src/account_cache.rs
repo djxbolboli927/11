@@ -164,6 +164,27 @@ impl AccountCache {
         }
     }
 
+    /// Diagnostic-only: fetch the CURRENT on-chain owner + data length of each
+    /// account directly from RPC (bypassing the cache), so a sim revert can be
+    /// compared against the truth on chain. Returns, per pubkey, `Some((owner,
+    /// data_len))` if the account exists on chain, or `None` if it is absent.
+    /// Accounts the RPC call fails for are simply omitted from the map. This is
+    /// NOT on the hot path — it runs once per distinct failure shape.
+    pub fn audit_fetch(&self, pubkeys: &[Pubkey]) -> HashMap<Pubkey, Option<(Pubkey, usize)>> {
+        let mut out = HashMap::new();
+        for chunk in pubkeys.chunks(100) {
+            if let Ok(results) = self.rpc.get_multiple_accounts(chunk) {
+                for (pk, maybe) in chunk.iter().zip(results) {
+                    out.insert(
+                        *pk,
+                        maybe.map(|a| (Pubkey::new_from_array(a.owner.to_bytes()), a.data.len())),
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// Pre-fetch a batch of accounts (used at startup to warm up mints, ATAs,
     /// etc. that won't naturally stream in via the owner filter).
     pub fn prefetch(&self, pubkeys: &[Pubkey]) {

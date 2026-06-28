@@ -33,6 +33,31 @@ pub struct AcctView {
     pub executable: bool,
 }
 
+/// An account whose state in the simulator differs from the live chain. This is
+/// the decisive diagnostic for `InvalidAccountOwner` and similar: if the sim
+/// loaded an account with a different owner / data length than mainnet, THAT is
+/// the load bug. If nothing mismatches, the revert is the program's own logic
+/// on the (correctly loaded) state — i.e. latency/state, not an account bug.
+pub struct ChainMismatch {
+    pub pubkey: Pubkey,
+    pub sim_owner: Option<Pubkey>,
+    pub chain_owner: Option<Pubkey>,
+    pub sim_data_len: usize,
+    pub chain_data_len: Option<usize>,
+}
+
+/// Derive the program id that failed from the program logs (the first
+/// "Program <id> failed" line). Shared so the audit gate and the record use the
+/// exact same signature for dedup.
+pub fn failed_program_from_logs(logs: &[String]) -> String {
+    logs.iter()
+        .find(|l| l.starts_with("Program ") && l.contains(" failed"))
+        .and_then(|l| l.strip_prefix("Program "))
+        .and_then(|r| r.split_whitespace().next())
+        .unwrap_or("")
+        .to_string()
+}
+
 pub struct RejectLog {
     file: Mutex<Option<File>>,
     /// (error, failed_program) signatures already written — dedup so identical
@@ -63,25 +88,30 @@ impl RejectLog {
         }
     }
 
+    /// Has a rejection of this (error, failed_program) shape already been
+    /// recorded? Lets the caller skip the expensive on-chain audit for repeats
+    /// without consuming the dedup slot (record() still inserts it).
+    pub fn seen_before(&self, error: &str, failed_program: &str) -> bool {
+        let sig = format!("{error}|{failed_program}");
+        self.seen.lock().unwrap().contains(&sig)
+    }
+
     /// Append one non-slippage rejection (first occurrence only). `accounts` is
     /// the full account view at sim time; `missing` are accounts absent from the
     /// SVM (note: the Instructions sysvar always appears absent — it is
     /// synthesized per-transaction by LiteSVM and is NOT a real problem).
+    /// `chain_mismatches` are accounts whose sim state differs from the live
+    /// chain (empty unless this was the first occurrence and an audit ran).
     pub fn record(
         &self,
         error: &str,
         logs: &[String],
         accounts: &[AcctView],
         missing: &[Pubkey],
+        chain_mismatches: &[ChainMismatch],
         compute_units: u64,
     ) {
-        let failed_program = logs
-            .iter()
-            .find(|l| l.starts_with("Program ") && l.contains(" failed"))
-            .and_then(|l| l.strip_prefix("Program "))
-            .and_then(|r| r.split_whitespace().next())
-            .unwrap_or("")
-            .to_string();
+        let failed_program = failed_program_from_logs(logs);
 
         // Dedup on (error, failing program): one rich line per distinct failure.
         let sig = format!("{error}|{failed_program}");
@@ -120,11 +150,6 @@ impl RejectLog {
         // Plain-language root-cause hint so the operator does not have to decode
         // Anchor/loader error numbers. Derived from the error and program logs.
         let joined = logs.join("\n");
-        let missing_list = missing
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
         let hint = if error.contains("Custom(4100)") || joined.contains("DeclaredProgramIdMismatch") {
             format!(
                 "WRONG .so binary for program {failed_program}: its embedded declare_id does \
@@ -136,10 +161,19 @@ impl RejectLog {
              filename in program_registry.rs). Provide its correct .so file."
                 .to_string()
         } else if error.contains("InvalidAccountOwner") {
-            format!(
-                "A required account is absent/empty in the sim (System-owned, data_len 0). \
-                 Absent account(s): [{missing_list}]. They must be loaded before simulating."
-            )
+            if chain_mismatches.is_empty() {
+                "InvalidAccountOwner, but EVERY account's owner/data in the sim matches the live \
+                 chain (see chain_mismatches: none). So no account is loaded wrong — the program \
+                 rejected on its own logic over correctly-loaded state (oracle/state/latency), \
+                 NOT an account-loading bug."
+                    .to_string()
+            } else {
+                format!(
+                    "InvalidAccountOwner AND {} account(s) differ from the live chain — see \
+                     chain_mismatches. Those are loaded wrong and are the real cause.",
+                    chain_mismatches.len()
+                )
+            }
         } else if error.contains("ProgramFailedToComplete") {
             format!(
                 "Program {failed_program} panicked (not a clean error). Usually an account it \
@@ -150,6 +184,19 @@ impl RejectLog {
             String::new()
         };
 
+        let chain_mismatches_json: Vec<serde_json::Value> = chain_mismatches
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "pubkey": m.pubkey.to_string(),
+                    "sim_owner": m.sim_owner.map(|o| o.to_string()),
+                    "chain_owner": m.chain_owner.map(|o| o.to_string()),
+                    "sim_data_len": m.sim_data_len,
+                    "chain_data_len": m.chain_data_len,
+                })
+            })
+            .collect();
+
         let entry = serde_json::json!({
             "seq": seq,
             "ts_ms": ts_ms,
@@ -159,6 +206,8 @@ impl RejectLog {
             "compute_units": compute_units,
             "missing_count": missing.len(),
             "missing_accounts": missing.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+            "chain_mismatch_count": chain_mismatches.len(),
+            "chain_mismatches": chain_mismatches_json,
             "accounts": accounts_json,
             "logs": logs,
         });
