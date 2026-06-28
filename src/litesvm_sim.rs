@@ -291,10 +291,17 @@ impl Simulator {
         // SVM (loaded programs/sysvars). These get a default System-owned empty
         // account inside LiteSVM, which is the usual cause of InvalidAccountOwner
         // / RequireGtViolated(0,0) / Jupiter panics. Captured for the reject log.
+        //
+        // The Instructions sysvar is EXCLUDED: LiteSVM synthesizes it per-tx in
+        // process_transaction (lib.rs:1142 construct_instructions_account) and
+        // never stores it as an account, so it always shows "absent" here even
+        // though it is built correctly. Listing it as missing is a false alarm.
         let missing_accounts: Vec<Pubkey> = accounts
             .iter()
             .filter(|pk| {
-                cache.get(pk).is_none() && svm.get_account(&pk_to_addr(**pk)).is_none()
+                **pk != instructions_sysvar
+                    && cache.get(pk).is_none()
+                    && svm.get_account(&pk_to_addr(**pk)).is_none()
             })
             .copied()
             .collect();

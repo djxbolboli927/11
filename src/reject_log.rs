@@ -117,11 +117,45 @@ impl RejectLog {
             })
             .collect();
 
+        // Plain-language root-cause hint so the operator does not have to decode
+        // Anchor/loader error numbers. Derived from the error and program logs.
+        let joined = logs.join("\n");
+        let missing_list = missing
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let hint = if error.contains("Custom(4100)") || joined.contains("DeclaredProgramIdMismatch") {
+            format!(
+                "WRONG .so binary for program {failed_program}: its embedded declare_id does \
+                 not match the address it is loaded at. Re-dump it from mainnet with \
+                 `solana program dump {failed_program} <FILE>.so` and register that exact file."
+            )
+        } else if error.contains("UnsupportedProgramId") {
+            "A program the route CPIs into is NOT loaded in the simulator (missing or empty \
+             filename in program_registry.rs). Provide its correct .so file."
+                .to_string()
+        } else if error.contains("InvalidAccountOwner") {
+            format!(
+                "A required account is absent/empty in the sim (System-owned, data_len 0). \
+                 Absent account(s): [{missing_list}]. They must be loaded before simulating."
+            )
+        } else if error.contains("ProgramFailedToComplete") {
+            format!(
+                "Program {failed_program} panicked (not a clean error). Usually an account it \
+                 deserializes has unexpected/empty data, or a clock/oracle value it depends on \
+                 is wrong. Inspect the per-account owner/data_len dump below."
+            )
+        } else {
+            String::new()
+        };
+
         let entry = serde_json::json!({
             "seq": seq,
             "ts_ms": ts_ms,
             "error": error,
             "failed_program": failed_program,
+            "diagnosis": hint,
             "compute_units": compute_units,
             "missing_count": missing.len(),
             "missing_accounts": missing.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
