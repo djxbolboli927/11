@@ -217,22 +217,6 @@ impl Simulator {
         let live_slot = self.current_slot.load(Ordering::Relaxed);
         svm.warp_to_slot(live_slot);
 
-        // warp_to_slot only sets Clock.slot — it leaves unix_timestamp at the
-        // genesis default (0). DEX oracle freshness checks then fail:
-        // Whirlpool rejects with 6022 "timestamp <= last_updated", and PMM
-        // DEXes (SolFi/Tessera) mis-price against a zero clock, producing 0
-        // output that poisons the next hop. Set a live wall-clock timestamp.
-        {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let mut clock: Clock = svm.get_sysvar();
-            clock.unix_timestamp = now;
-            clock.epoch_start_timestamp = now;
-            svm.set_sysvar(&clock);
-        }
-
         // Inject ALT raw accounts so the SVM can expand v0 address lookups.
         for alt in alts {
             if let Some(raw) = cache.get(&alt.key) {
@@ -265,6 +249,27 @@ impl Simulator {
             }
         }
         debug!(injected, missing = missing_cnt, accounts = accounts.len(), "sim prepared");
+
+        // Set the live wall-clock timestamp on the Clock sysvar — done AFTER the
+        // injection loop on purpose. `warp_to_slot` only sets Clock.slot and
+        // leaves unix_timestamp at the genesis default (0); DEX oracle freshness
+        // checks then fail (Whirlpool 6022 "timestamp <= last_updated", and PMM
+        // DEXes mis-price against a zero clock → 0 output that poisons the next
+        // hop). The injection loop above could itself write the Clock sysvar
+        // account (if a tx references it, get_or_fetch_many pulls it from RPC and
+        // set_account overwrites our value — set_sysvar and set_account share the
+        // same store), so we set the clock LAST to guarantee our timestamp wins
+        // for the syscall the DEX programs read.
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut clock: Clock = svm.get_sysvar();
+            clock.unix_timestamp = now;
+            clock.epoch_start_timestamp = now;
+            svm.set_sysvar(&clock);
+        }
 
         // Accounts referenced by the tx but absent from BOTH the cache and the
         // SVM (loaded programs/sysvars). These get a default System-owned empty
