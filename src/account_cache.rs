@@ -122,6 +122,48 @@ impl AccountCache {
         Ok(account)
     }
 
+    /// Fetch many accounts in ONE `getMultipleAccounts` RPC call and cache the
+    /// ones that exist. Used on the hot path to load accounts a transaction
+    /// references that aren't streamed (static configs, oracles, the AlphaQ
+    /// vendor account, …). Batching is critical: the previous per-account
+    /// `get_account` loop fired N requests per sim across every worker and
+    /// overwhelmed the RPC (timeouts → accounts never loaded → InvalidAccountOwner).
+    /// Accounts already cached are skipped; missing/nonexistent ones are ignored.
+    pub fn get_or_fetch_many(&self, pubkeys: &[Pubkey]) {
+        let to_fetch: Vec<Pubkey> = pubkeys
+            .iter()
+            .filter(|p| !self.inner.contains_key(*p))
+            .copied()
+            .collect();
+        if to_fetch.is_empty() {
+            return;
+        }
+        // getMultipleAccounts caps at 100 keys per request.
+        for chunk in to_fetch.chunks(100) {
+            match self.rpc.get_multiple_accounts(chunk) {
+                Ok(results) => {
+                    for (pk, maybe) in chunk.iter().zip(results) {
+                        if let Some(acct) = maybe {
+                            self.inner.insert(
+                                *pk,
+                                Account {
+                                    lamports: acct.lamports,
+                                    data: acct.data,
+                                    owner: Address::from(acct.owner.to_bytes()),
+                                    executable: acct.executable,
+                                    rent_epoch: acct.rent_epoch,
+                                },
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, n = chunk.len(), "batch account fetch failed");
+                }
+            }
+        }
+    }
+
     /// Pre-fetch a batch of accounts (used at startup to warm up mints, ATAs,
     /// etc. that won't naturally stream in via the owner filter).
     pub fn prefetch(&self, pubkeys: &[Pubkey]) {

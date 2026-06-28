@@ -48,14 +48,14 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     // --- Previously forbidden — now allowed at user's request ---
     ("ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA", "AlphaQ.so"),
     ("AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45", "Aquifer.so"),
-    // Byreal CLMM. The .so the operator dumped declares program id
+    // Byreal CLMM: the operator's binary declares program id
     // REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2, so it is registered there.
-    // NOTE: pools.json routes Byreal pools through HpNfyc2Saw7..., which Metis
-    // invokes; loading the REALQq binary at HpNfyc2 triggers Anchor
-    // DeclaredProgramIdMismatch (4100). If those pools must simulate, dump the
-    // binary actually deployed at HpNfyc2 and map it below.
     ("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2", "Byreal_CLMM.so"),
-    ("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq", "Byreal_CLMM.so"),
+    // HpNfyc2Saw7... is a DISTINCT program (operator reports PancakeSwap-family,
+    // not Byreal). It needs its OWN dumped binary — loading Byreal_CLMM.so here
+    // caused DeclaredProgramIdMismatch (4100). Left with an empty filename so it
+    // is skipped (no wrong binary) until its real .so is provided.
+    ("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq", ""),
 
     // --- PMM DEXes — bypass simulation when enabled, otherwise go direct ---
     ("TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", "Tessera_V.so"),

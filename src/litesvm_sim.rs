@@ -33,6 +33,7 @@ use anyhow::{anyhow, Context, Result};
 use litesvm::LiteSVM;
 use solana_account::ReadableAccount;
 use solana_address::Address as LsAddr;
+use solana_clock::Clock;
 use solana_sdk::{
     address_lookup_table::AddressLookupTableAccount,
     message::VersionedMessage,
@@ -193,17 +194,21 @@ impl Simulator {
     ) -> SimVerdict {
         let accounts = collect_tx_accounts(tx, alts);
 
-        // Lazy-fetch any accounts missing from the Yellowstone cache.
-        // For AMM pools this is a no-op (all accounts already streamed).
-        // For PMM oracle accounts not in the owner-filter, this fetches them
-        // once via RPC and caches permanently — subsequent sims are zero-RPC.
-        // Runs BEFORE the svm mutex so a blocking RPC does not stall workers.
-        for pk in &accounts {
-            if cache.get(pk).is_none() {
-                if let Err(e) = cache.get_or_fetch(pk) {
-                    debug!(pubkey = %pk, error = %e, "lazy RPC fetch for missing account");
-                }
-            }
+        // Batch-fetch any accounts missing from the Yellowstone cache in ONE
+        // getMultipleAccounts call. For AMM pools this is a no-op (all accounts
+        // already streamed). For static config / oracle / vendor accounts not
+        // covered by the owner filter (e.g. AlphaQ's Enc6rB84…), this loads them
+        // once and caches permanently. Runs BEFORE the svm mutex so the RPC does
+        // not stall workers. The Instructions sysvar is skipped — LiteSVM
+        // synthesizes it per-transaction and the RPC never returns it.
+        let instructions_sysvar = solana_sdk::sysvar::instructions::id();
+        let to_fetch: Vec<Pubkey> = accounts
+            .iter()
+            .filter(|pk| **pk != instructions_sysvar && cache.get(pk).is_none())
+            .copied()
+            .collect();
+        if !to_fetch.is_empty() {
+            cache.get_or_fetch_many(&to_fetch);
         }
 
         let mut svm = self.svm.lock().unwrap();
@@ -211,6 +216,22 @@ impl Simulator {
         // Advance the SVM clock to the live Yellowstone slot.
         let live_slot = self.current_slot.load(Ordering::Relaxed);
         svm.warp_to_slot(live_slot);
+
+        // warp_to_slot only sets Clock.slot — it leaves unix_timestamp at the
+        // genesis default (0). DEX oracle freshness checks then fail:
+        // Whirlpool rejects with 6022 "timestamp <= last_updated", and PMM
+        // DEXes (SolFi/Tessera) mis-price against a zero clock, producing 0
+        // output that poisons the next hop. Set a live wall-clock timestamp.
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut clock: Clock = svm.get_sysvar();
+            clock.unix_timestamp = now;
+            clock.epoch_start_timestamp = now;
+            svm.set_sysvar(&clock);
+        }
 
         // Inject ALT raw accounts so the SVM can expand v0 address lookups.
         for alt in alts {
