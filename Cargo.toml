@@ -77,11 +77,6 @@ solana-account = "3.2.0"
 # conversion adapters at the solana-sdk 2.x / litesvm 3.x type boundary.
 solana-address = "2"
 solana-transaction = "3"
-# Matches litesvm's solana-clock pin so we can read/write the Clock sysvar
-# (set unix_timestamp to live wall-clock time — DEX oracle freshness checks
-# like Whirlpool 6022 / PMM pricing require a current timestamp, which
-# warp_to_slot does NOT set).
-solana-clock = "3.0"
 dashmap = "6"
 
 # Yellowstone gRPC — live account-state stream (feeds sim cache, same source as Metis).

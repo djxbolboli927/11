@@ -33,7 +33,6 @@ use anyhow::{anyhow, Context, Result};
 use litesvm::LiteSVM;
 use solana_account::ReadableAccount;
 use solana_address::Address as LsAddr;
-use solana_clock::Clock;
 use solana_sdk::{
     address_lookup_table::AddressLookupTableAccount,
     message::VersionedMessage,
@@ -265,10 +264,27 @@ impl Simulator {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let mut clock: Clock = svm.get_sysvar();
-            clock.unix_timestamp = now;
-            clock.epoch_start_timestamp = now;
-            svm.set_sysvar(&clock);
+            // Patch the Clock sysvar account bytes directly instead of going
+            // through a typed solana_clock::Clock — that would require pinning an
+            // extra solana-clock crate that must exactly match litesvm's version,
+            // which broke the build when Cargo.toml drifted. Clock is a fixed
+            // 40-byte bincode (fixint, little-endian) struct:
+            //   slot[0..8] epoch_start_timestamp[8..16] epoch[16..24]
+            //   leader_schedule_epoch[24..32] unix_timestamp[32..40]
+            // We rewrite epoch_start_timestamp and unix_timestamp to live time.
+            // Writing the account re-triggers LiteSVM's sysvar_cache rebuild
+            // (accounts_db::maybe_handle_sysvar_account), so the
+            // sol_get_clock_sysvar syscall the DEX programs read returns this.
+            let clock_id = pk_to_addr(solana_sdk::sysvar::clock::id());
+            if let Some(mut acct) = svm.get_account(&clock_id) {
+                if acct.data.len() >= 40 {
+                    acct.data[8..16].copy_from_slice(&now.to_le_bytes());
+                    acct.data[32..40].copy_from_slice(&now.to_le_bytes());
+                    if let Err(e) = svm.set_account(clock_id, acct) {
+                        warn!(error = ?e, "set Clock sysvar timestamp failed");
+                    }
+                }
+            }
         }
 
         // Accounts referenced by the tx but absent from BOTH the cache and the
