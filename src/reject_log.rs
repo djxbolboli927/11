@@ -1,20 +1,21 @@
-//! Persistent log of simulation rejections.
+//! Persistent, de-duplicated log of simulation rejections.
 //!
 //! Every time the LiteSVM pre-flight gate drops a transaction for a reason
 //! OTHER than slippage (Jupiter 6001 / below-floor), we append one JSON line to
-//! a file in the project root describing WHY. The single most useful field is
-//! `missing_accounts`: accounts the transaction references that are absent from
-//! both the Yellowstone cache AND the loaded program set — i.e. accounts the
-//! simulator had no data for, which is the usual cause of
-//! `InvalidAccountOwner`, `RequireGtViolated (0/0)`, and Jupiter panics.
+//! a file in the project root describing WHY — but only the FIRST time we see a
+//! given (error, failing-program) combination, so the file stays small and
+//! readable instead of repeating the same failure hundreds of times.
 //!
-//! Slippage rejections are intentionally NOT logged (they are expected and
-//! high-volume).
+//! Each entry carries, for every account the transaction touches, its owner /
+//! lamports / data length AS SEEN BY THE SIMULATOR. This is the decisive
+//! diagnostic: an account that should be an SPL token account but shows
+//! `owner = 1111...1` (System) with `data_len = 0` was never loaded, and is the
+//! cause of `InvalidAccountOwner`, `RequireGtViolated(0/0)`, or Jupiter panics.
 //!
-//! Format: JSON Lines (`.jsonl`) — one self-contained JSON object per line, so
-//! the file can be tailed live and parsed with `jq`.
+//! Slippage rejections are intentionally NOT logged (expected, high-volume).
 
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,22 +23,32 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+/// One account as seen by the simulator at injection time.
+pub struct AcctView {
+    pub pubkey: Pubkey,
+    /// `None` => the account is absent from the SVM entirely (truly missing).
+    pub owner: Option<Pubkey>,
+    pub lamports: u64,
+    pub data_len: usize,
+    pub executable: bool,
+}
+
 pub struct RejectLog {
     file: Mutex<Option<File>>,
-    /// Monotonic counter so every entry has a stable id even within the same ms.
+    /// (error, failed_program) signatures already written — dedup so identical
+    /// failures aren't repeated.
+    seen: Mutex<HashSet<String>>,
     seq: AtomicU64,
 }
 
 impl RejectLog {
-    /// Open (create/append) the reject log at `path` (relative paths land in the
-    /// process working directory = project root). On failure, logging becomes a
-    /// no-op rather than crashing the bot.
     pub fn new(path: &str) -> Self {
         match OpenOptions::new().create(true).append(true).open(path) {
             Ok(f) => {
-                warn!(path, "sim reject log open — non-slippage drops will be recorded here");
+                warn!(path, "sim reject log open — first occurrence of each failure recorded here");
                 Self {
                     file: Mutex::new(Some(f)),
+                    seen: Mutex::new(HashSet::new()),
                     seq: AtomicU64::new(0),
                 }
             }
@@ -45,23 +56,42 @@ impl RejectLog {
                 warn!(path, error = %e, "could not open sim reject log; rejects won't be persisted");
                 Self {
                     file: Mutex::new(None),
+                    seen: Mutex::new(HashSet::new()),
                     seq: AtomicU64::new(0),
                 }
             }
         }
     }
 
-    /// Append one non-slippage rejection. `error` is the Debug of the
-    /// TransactionError; `logs` is the program log; `missing` are tx accounts
-    /// absent from the simulator.
+    /// Append one non-slippage rejection (first occurrence only). `accounts` is
+    /// the full account view at sim time; `missing` are accounts absent from the
+    /// SVM (note: the Instructions sysvar always appears absent — it is
+    /// synthesized per-transaction by LiteSVM and is NOT a real problem).
     pub fn record(
         &self,
         error: &str,
         logs: &[String],
+        accounts: &[AcctView],
         missing: &[Pubkey],
-        total_accounts: usize,
         compute_units: u64,
     ) {
+        let failed_program = logs
+            .iter()
+            .find(|l| l.starts_with("Program ") && l.contains(" failed"))
+            .and_then(|l| l.strip_prefix("Program "))
+            .and_then(|r| r.split_whitespace().next())
+            .unwrap_or("")
+            .to_string();
+
+        // Dedup on (error, failing program): one rich line per distinct failure.
+        let sig = format!("{error}|{failed_program}");
+        {
+            let mut seen = self.seen.lock().unwrap();
+            if !seen.insert(sig) {
+                return; // already recorded this failure shape
+            }
+        }
+
         let mut guard = self.file.lock().unwrap();
         let f = match guard.as_mut() {
             Some(f) => f,
@@ -74,29 +104,29 @@ impl RejectLog {
             .unwrap_or(0);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
 
-        // Innermost failing program = first "Program <id> failed ..." line.
-        let failed_program = logs
+        let accounts_json: Vec<serde_json::Value> = accounts
             .iter()
-            .find(|l| l.starts_with("Program ") && l.contains(" failed"))
-            .and_then(|l| l.strip_prefix("Program "))
-            .and_then(|r| r.split_whitespace().next())
-            .unwrap_or("")
-            .to_string();
-
-        // Keep the last few log lines for context (full logs can be large).
-        let tail: Vec<&String> = logs.iter().rev().take(6).collect::<Vec<_>>();
-        let tail: Vec<&String> = tail.into_iter().rev().collect();
+            .map(|a| {
+                serde_json::json!({
+                    "pubkey": a.pubkey.to_string(),
+                    "owner": a.owner.map(|o| o.to_string()),
+                    "lamports": a.lamports,
+                    "data_len": a.data_len,
+                    "executable": a.executable,
+                })
+            })
+            .collect();
 
         let entry = serde_json::json!({
             "seq": seq,
             "ts_ms": ts_ms,
             "error": error,
             "failed_program": failed_program,
+            "compute_units": compute_units,
             "missing_count": missing.len(),
             "missing_accounts": missing.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
-            "total_accounts": total_accounts,
-            "compute_units": compute_units,
-            "logs_tail": tail,
+            "accounts": accounts_json,
+            "logs": logs,
         });
 
         let _ = writeln!(f, "{entry}");

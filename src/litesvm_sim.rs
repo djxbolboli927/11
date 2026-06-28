@@ -310,13 +310,37 @@ impl Simulator {
                 } else {
                     metrics.sim_reverted.fetch_add(1, Ordering::Relaxed);
                     warn!(err = ?meta.err, missing = missing_accounts.len(), "sim reverted (non-slippage)");
-                    // Persist the rejection (with the missing accounts) so the
-                    // operator can see exactly why each tx was dropped.
+                    // Snapshot every account AS THE PROGRAM SAW IT (owner /
+                    // lamports / data length). An account that should be an SPL
+                    // token account but shows owner=1111..1 / data_len=0 was
+                    // never loaded — that is the real culprit behind
+                    // InvalidAccountOwner / RequireGtViolated / Jupiter panics.
+                    let acct_views: Vec<crate::reject_log::AcctView> = accounts
+                        .iter()
+                        .map(|pk| match svm.get_account(&pk_to_addr(*pk)) {
+                            Some(acc) => crate::reject_log::AcctView {
+                                pubkey: *pk,
+                                owner: Some(Pubkey::new_from_array(acc.owner().to_bytes())),
+                                lamports: acc.lamports(),
+                                data_len: acc.data().len(),
+                                executable: acc.executable(),
+                            },
+                            None => crate::reject_log::AcctView {
+                                pubkey: *pk,
+                                owner: None,
+                                lamports: 0,
+                                data_len: 0,
+                                executable: false,
+                            },
+                        })
+                        .collect();
+                    // Persist the rejection (first occurrence of each shape) so
+                    // the operator can see exactly why each tx was dropped.
                     self.reject_log.record(
                         &format!("{:?}", meta.err),
                         &meta.meta.logs,
+                        &acct_views,
                         &missing_accounts,
-                        accounts.len(),
                         meta.meta.compute_units_consumed,
                     );
                     SimVerdict::Revert
