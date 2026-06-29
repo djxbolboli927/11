@@ -30,7 +30,7 @@ urls = [
     "https://tokyo.mainnet.block-engine.jito.wtf",
 ]
 uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
-trading_keypair = "/root/c/wallet/wallet.json"
+trading_keypair = "/home/dj32/1/4/wallet/wallet.json"
 tip_min_lamports = 1000
 tip_max_lamports = 1000000
 tip_profit_percent = 0.50
@@ -42,8 +42,8 @@ max_bundles_per_second = 5
 url = "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok"
 
 [yellowstone_grpc]
-endpoint = "https://grpc.fra.shyft.to"
-x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
+endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
+x_token = "cba491e2cd18e339c6517a51d4d497737cb04edd08d8915fc872c8a30cd5656a"
 
 [performance]
 # تعداد worker thread های tokio برای ربات. در سرور 16 هسته‌ای،
@@ -81,7 +81,7 @@ bot_cpu_cores = [12,13,14,15,28,29,30,31]
 # منبع داده‌ی sim = همان gRPC شیفت که Metis هم می‌خواند (یک اتصال جدا،
 # هیچ سربار متقابلی با Metis ندارد).
 enabled = true
-so_dir = "/root/c/so"
+so_dir = "/home/dj32/1/4/so"
 # لیست استخرهای ثابت (pool + owner + همه‌ی اکانت‌ها). هر اکانت داخل آن
 # پیش‌فچ و به‌صورت زنده روی gRPC سابسکرایب می‌شود تا شبیه‌ساز همیشه داده‌ی
 # تازه داشته باشد. اگر فایل نبود فقط warm-up غیرفعال می‌شود (سابسکرایب پویا
@@ -133,7 +133,7 @@ endpoints = [
 ]
 # این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
 # تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
-auth_keypair = "/root/c/wallet/grpc.json"
+auth_keypair = "/home/dj32/1/4/wallet/grpc.json"
 max_bundles_per_second = 5
 
 [template_cache]
