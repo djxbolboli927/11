@@ -174,6 +174,38 @@ impl RejectLog {
                     chain_mismatches.len()
                 )
             }
+        } else if joined.contains("tick_array")
+            || joined.contains("TickArray")
+            || joined.contains("tick array")
+            || joined.contains("bin_array")
+            || joined.contains("InvalidFirstTickArrayAccount")
+            || joined.contains("InvalidTickArraySequence")
+        {
+            // Concentrated-liquidity DEXes (Whirlpool, Raydium CLMM, Meteora
+            // DLMM, PancakeSwap CLMM, Invariant) need the tick/bin-array accounts
+            // covering the pool's CURRENT price. Two distinct causes, told apart
+            // by whether the array account is absent:
+            //   * absent (in missing_accounts / owner=System): the array is
+            //     "cold" — it exists on chain but never changed since we
+            //     subscribed, so the Yellowstone owner-filter (which streams only
+            //     CHANGES, not a snapshot) never sent it. It must be loaded once
+            //     via getMultipleAccounts. If that RPC is rate-limited it stays
+            //     missing.
+            //   * present but wrong range: the price moved between Metis quoting
+            //     and our (lagged) sim state — pure latency, not an account bug.
+            if missing.is_empty() {
+                "CLMM tick/bin-array error with all accounts present: the arrays are loaded but \
+                 cover the wrong price range — the pool's tick moved between Metis quoting and the \
+                 (lagged) sim. This is latency/staleness, not an account-loading bug."
+                    .to_string()
+            } else {
+                "CLMM tick/bin-array error with MISSING arrays (see missing_accounts): those \
+                 arrays are 'cold' — they exist on chain but the Yellowstone owner-filter only \
+                 streams CHANGES, never a snapshot, so an array with no recent swap is never \
+                 pushed. It must be loaded once via getMultipleAccounts (RPC). Verify these exist \
+                 on chain; if they do, the only reason they're absent is the RPC fetch failing."
+                    .to_string()
+            }
         } else if error.contains("ProgramFailedToComplete") {
             format!(
                 "Program {failed_program} panicked (not a clean error). Usually an account it \
