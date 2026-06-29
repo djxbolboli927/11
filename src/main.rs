@@ -211,6 +211,29 @@ async fn async_main(config: config::Config) -> Result<()> {
         // the bot starts with its static pools already in memory; dynamically
         // discovered accounts (e.g. CLMM tick arrays) are loaded lazily later.
         cache.spawn_loader(config.simulation.bad_accounts_file.clone());
+
+        // Force-load operator-asserted accounts (manual file): ones known to
+        // exist on chain that the RPC keeps returning null for. Fetched at
+        // `processed` commitment, retried forever, never bad-listed.
+        let manual: Vec<solana_sdk::pubkey::Pubkey> =
+            match std::fs::read_to_string(&config.simulation.manual_accounts_file) {
+                Ok(text) => text
+                    .lines()
+                    .map(|l| l.split('#').next().unwrap_or("").trim())
+                    .filter(|l| !l.is_empty())
+                    .filter_map(|l| solana_sdk::pubkey::Pubkey::try_from(l).ok())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+        if !manual.is_empty() {
+            tracing::info!(
+                count = manual.len(),
+                file = %config.simulation.manual_accounts_file,
+                "force-loading operator-asserted accounts"
+            );
+            cache.force_load(&manual);
+        }
+
         cache.enqueue_load(&warm);
         let warm_total = warm.len();
         let warm_deadline =

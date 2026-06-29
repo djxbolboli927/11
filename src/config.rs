@@ -96,6 +96,14 @@ pub struct SimulationConfig {
     /// across all attempts), not a transient miss.
     #[serde(default = "default_bad_accounts_file")]
     pub bad_accounts_file: String,
+    /// File (project-root relative) listing accounts the operator KNOWS exist on
+    /// chain but the RPC fails to return (e.g. a fresh oracle / re-created ALT /
+    /// PDA visible only at a fresher commitment). One base58 pubkey per line
+    /// (blank lines and `#` comments ignored). These are force-loaded at
+    /// `processed` commitment, retried forever, and never written to
+    /// bad_accounts.
+    #[serde(default = "default_manual_accounts_file")]
+    pub manual_accounts_file: String,
     /// When sim reverts or errors, `fail_closed=true` drops the send (safest);
     /// `false` logs and forwards to Jito anyway (useful during rollout).
     #[serde(default = "default_true")]
@@ -119,6 +127,7 @@ impl Default for SimulationConfig {
             pools_file: default_pools_file(),
             reject_log_file: default_reject_log_file(),
             bad_accounts_file: default_bad_accounts_file(),
+            manual_accounts_file: default_manual_accounts_file(),
             fail_closed: true,
             workers: default_workers(),
         }
@@ -135,6 +144,10 @@ fn default_reject_log_file() -> String {
 
 fn default_bad_accounts_file() -> String {
     "bad_accounts.txt".to_string()
+}
+
+fn default_manual_accounts_file() -> String {
+    "manual_accounts.txt".to_string()
 }
 
 fn default_so_dir() -> String {

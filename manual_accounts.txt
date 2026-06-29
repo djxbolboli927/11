@@ -1,0 +1,16 @@
+# Manual account force-load list.
+#
+# Accounts the operator KNOWS exist on chain (verified on an explorer / present
+# in real Metis instructions) but the RPC keeps returning null for — typically
+# because the default RPC commitment lags behind the freshest state. These are
+# force-loaded by the background loader at `processed` commitment, retried
+# forever, and NEVER written to bad_accounts.txt.
+#
+# Format: one base58 pubkey per line. Blank lines and `#` comments are ignored.
+
+# ALT (Address Lookup Table)
+EidRhmEUpr4AxqRD1D3VfR1XD9dZKYu9LoBpxqiNrJRC
+# Whirlpool oracle (writable)
+6vK8gSiRHSnZzAa5JsvBF2ej1LrxpRX21Y185CzP4PeA
+# 1Dex pool authority PDA
+Enc6rB84ZwGxZU8aqAF41dRJxg3yesiJgD7uJFVhMraM

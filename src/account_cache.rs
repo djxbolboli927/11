@@ -21,6 +21,7 @@ use futures::{SinkExt, StreamExt};
 use solana_account::Account;
 use solana_address::Address;
 use solana_client::rpc_client::RpcClient;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -63,6 +64,10 @@ pub struct AccountCache {
     load_tx: mpsc::UnboundedSender<Pubkey>,
     /// Receiver half — taken (once) by `spawn_loader`.
     load_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<Pubkey>>>>,
+    /// Accounts the operator has asserted DO exist (from the manual-accounts
+    /// file) even though the RPC keeps returning null/erroring for them. The
+    /// loader retries these forever and never writes them to bad_accounts.
+    force: Arc<DashSet<Pubkey>>,
 }
 
 impl AccountCache {
@@ -79,6 +84,7 @@ impl AccountCache {
             queued: Arc::new(DashSet::new()),
             load_tx,
             load_rx: Arc::new(Mutex::new(Some(load_rx))),
+            force: Arc::new(DashSet::new()),
         }
     }
 
@@ -162,6 +168,23 @@ impl AccountCache {
         self.queued.len()
     }
 
+    /// Force-load accounts the operator listed in the manual-accounts file:
+    /// accounts known to exist on chain that the RPC nonetheless fails to
+    /// return (e.g. a freshly-created oracle / re-created ALT visible only at a
+    /// fresher commitment). These are fetched at `processed` commitment, retried
+    /// forever, and never written to bad_accounts.
+    pub fn force_load(&self, pubkeys: &[Pubkey]) {
+        for pk in pubkeys {
+            self.force.insert(*pk);
+            if self.inner.contains_key(pk) {
+                continue;
+            }
+            if self.queued.insert(*pk) {
+                let _ = self.load_tx.send(*pk);
+            }
+        }
+    }
+
     /// Spawn the single background account loader. It pulls pubkeys off the
     /// queue, fetches them with `getMultipleAccounts` at a fixed rate (well
     /// under the RPC's request budget), caches successes in RAM forever, and
@@ -178,6 +201,7 @@ impl AccountCache {
         let inner = self.inner.clone();
         let queued = self.queued.clone();
         let rpc = self.rpc.clone();
+        let force = self.force.clone();
 
         tokio::spawn(async move {
             use std::collections::VecDeque;
@@ -190,6 +214,9 @@ impl AccountCache {
             const TICK_MS: u64 = 1000; // 1 request/sec ⇒ ~10 accounts/sec
             const MAX_ATTEMPTS: u32 = 20;
             const RETRY_DELAY: Duration = Duration::from_secs(3);
+            // Force-listed accounts retry forever, but slowly, so a genuinely
+            // null-returning RPC doesn't waste the request budget.
+            const FORCE_RETRY_DELAY: Duration = Duration::from_secs(30);
 
             let mut bad_file = OpenOptions::new()
                 .create(true)
@@ -239,10 +266,20 @@ impl AccountCache {
                             continue;
                         }
                         // RpcClient is blocking → run it off the async worker.
+                        // Fetch at `processed` commitment (the freshest view,
+                        // same as the gRPC stream): a `finalized` read lags ~13s
+                        // and returns null for just-created/just-touched accounts
+                        // (fresh oracles, re-created ALTs, PDAs written this slot)
+                        // even though they exist — the exact symptom behind the
+                        // manual-accounts list.
                         let rpc2 = rpc.clone();
                         let keys = batch.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            rpc2.get_multiple_accounts(&keys)
+                            rpc2.get_multiple_accounts_with_commitment(
+                                &keys,
+                                CommitmentConfig::processed(),
+                            )
+                            .map(|r| r.value)
                         })
                         .await;
 
@@ -288,6 +325,14 @@ impl AccountCache {
                                     attempts.remove(&pk);
                                 }
                                 None => {
+                                    // Operator-asserted accounts (manual file):
+                                    // never give up, never bad-list — the RPC is
+                                    // wrong, not the account. Keep retrying with a
+                                    // longer back-off so we don't spin.
+                                    if force.contains(&pk) {
+                                        retry.push_back((now + FORCE_RETRY_DELAY, pk));
+                                        continue;
+                                    }
                                     let n = attempts.entry(pk).or_insert(0);
                                     *n += 1;
                                     if *n >= MAX_ATTEMPTS {

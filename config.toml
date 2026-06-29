@@ -97,6 +97,12 @@ reject_log_file = "sim_rejects.jsonl"
 # (یک pubkey در هر خط) نوشته می‌شود. وجود یک آدرس اینجا یعنی واقعاً غیرقابل‌دسترس
 # است یا RPC در تمام تلاش‌ها پایین بوده — نه یک خطای گذرای 429.
 bad_accounts_file = "bad_accounts.txt"
+# فایل «اکانت‌های دستی». اکانت‌هایی که شما مطمئنید روی زنجیره وجود دارند ولی RPC
+# آن‌ها را null برمی‌گرداند (مثل اوراکل تازه‌ساخته، ALT بازساخته، یا PDA که این
+# اسلات نوشته شده). هر آدرس در یک خط (خطوط خالی و # نادیده گرفته می‌شوند). این‌ها
+# با commitment=processed (تازه‌ترین حالت) و retry بی‌نهایت لود می‌شوند و هرگز در
+# bad_accounts نوشته نمی‌شوند.
+manual_accounts_file = "manual_accounts.txt"
 # fail_closed=true  (امن)  : اگر sim خطا داد ⇒ ارسال نکن
 # fail_closed=false (رول‌اوت) : اگر sim خطا داد ⇒ فقط log بزن و بفرست
 fail_closed = true
