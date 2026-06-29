@@ -193,13 +193,15 @@ impl Simulator {
     ) -> SimVerdict {
         let accounts = collect_tx_accounts(tx, alts);
 
-        // Batch-fetch any accounts missing from the Yellowstone cache in ONE
-        // getMultipleAccounts call. For AMM pools this is a no-op (all accounts
-        // already streamed). For static config / oracle / vendor accounts not
-        // covered by the owner filter (e.g. AlphaQ's Enc6rB84…), this loads them
-        // once and caches permanently. Runs BEFORE the svm mutex so the RPC does
-        // not stall workers. The Instructions sysvar is skipped — LiteSVM
-        // synthesizes it per-transaction and the RPC never returns it.
+        // Hand any accounts missing from the Yellowstone cache to the background
+        // loader (rate-limited, retried, cached once for the life of the
+        // process). This is NON-BLOCKING: we do NOT fetch on the hot path, so a
+        // sim is never delayed and the RPC is never hit per-transaction. Cold
+        // accounts (e.g. CLMM tick arrays the owner-filter never streamed because
+        // they didn't change, or AlphaQ's Enc6rB84…) are loaded in the
+        // background; the first sim that needs one may still revert, but every
+        // later sim of that route reads it straight from RAM. The Instructions
+        // sysvar is skipped — LiteSVM synthesizes it per-transaction.
         let instructions_sysvar = solana_sdk::sysvar::instructions::id();
         let to_fetch: Vec<Pubkey> = accounts
             .iter()
@@ -207,7 +209,7 @@ impl Simulator {
             .copied()
             .collect();
         if !to_fetch.is_empty() {
-            cache.get_or_fetch_many(&to_fetch);
+            cache.enqueue_load(&to_fetch);
         }
 
         let mut svm = self.svm.lock().unwrap();

@@ -203,7 +203,34 @@ async fn async_main(config: config::Config) -> Result<()> {
         }
         warm.extend_from_slice(&dex_pools.all_accounts);
         warm.extend_from_slice(&static_pools.accounts);
-        cache.prefetch(&warm);
+
+        // Start the rate-limited background loader, then load the known accounts
+        // ONCE into RAM before trading begins. The loader caps RPC usage, retries
+        // transient failures, and writes genuinely-unreachable accounts to the
+        // bad-accounts file. We wait for the warm-up set to drain (bounded) so
+        // the bot starts with its static pools already in memory; dynamically
+        // discovered accounts (e.g. CLMM tick arrays) are loaded lazily later.
+        cache.spawn_loader(config.simulation.bad_accounts_file.clone());
+        cache.enqueue_load(&warm);
+        let warm_total = warm.len();
+        let warm_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(180);
+        loop {
+            let pending = cache.pending_loads();
+            if pending == 0 {
+                tracing::info!(loaded = warm_total, "warm-up accounts loaded into RAM");
+                break;
+            }
+            if std::time::Instant::now() >= warm_deadline {
+                tracing::warn!(
+                    pending,
+                    total = warm_total,
+                    "warm-up timed out; starting anyway (remaining load in background)"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
 
         let reject_log = Arc::new(reject_log::RejectLog::new(
             &config.simulation.reject_log_file,

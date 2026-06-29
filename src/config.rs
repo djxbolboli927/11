@@ -90,6 +90,12 @@ pub struct SimulationConfig {
     /// the simulator — the main diagnostic for "why was this tx dropped?".
     #[serde(default = "default_reject_log_file")]
     pub reject_log_file: String,
+    /// File (project-root relative) where accounts the background loader could
+    /// not fetch after all retries are appended (one pubkey per line). An entry
+    /// here means the account is genuinely unreachable (or the RPC stayed down
+    /// across all attempts), not a transient miss.
+    #[serde(default = "default_bad_accounts_file")]
+    pub bad_accounts_file: String,
     /// When sim reverts or errors, `fail_closed=true` drops the send (safest);
     /// `false` logs and forwards to Jito anyway (useful during rollout).
     #[serde(default = "default_true")]
@@ -112,6 +118,7 @@ impl Default for SimulationConfig {
             dex_dir: default_dex_dir(),
             pools_file: default_pools_file(),
             reject_log_file: default_reject_log_file(),
+            bad_accounts_file: default_bad_accounts_file(),
             fail_closed: true,
             workers: default_workers(),
         }
@@ -124,6 +131,10 @@ fn default_pools_file() -> String {
 
 fn default_reject_log_file() -> String {
     "sim_rejects.jsonl".to_string()
+}
+
+fn default_bad_accounts_file() -> String {
+    "bad_accounts.txt".to_string()
 }
 
 fn default_so_dir() -> String {

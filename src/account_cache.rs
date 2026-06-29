@@ -23,6 +23,8 @@ use solana_address::Address;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -52,11 +54,21 @@ pub struct AccountCache {
     add_tx: mpsc::UnboundedSender<Pubkey>,
     /// Receiver half — taken (once) by `spawn_subscription`.
     add_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<Pubkey>>>>,
+    /// Accounts handed to the background loader. An account is enqueued at most
+    /// once (deduped here): the loader fetches it ONE time and caches it for the
+    /// life of the process, so the per-transaction path never re-fetches.
+    /// Removed once it lands in `inner` or is written off as bad.
+    queued: Arc<DashSet<Pubkey>>,
+    /// Sender feeding the background loader (`spawn_loader`).
+    load_tx: mpsc::UnboundedSender<Pubkey>,
+    /// Receiver half — taken (once) by `spawn_loader`.
+    load_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<Pubkey>>>>,
 }
 
 impl AccountCache {
     pub fn new(rpc: Arc<RpcClient>) -> Self {
         let (add_tx, add_rx) = mpsc::unbounded_channel();
+        let (load_tx, load_rx) = mpsc::unbounded_channel();
         Self {
             inner: Arc::new(DashMap::with_capacity(4096)),
             rpc,
@@ -64,6 +76,9 @@ impl AccountCache {
             subscribed: Arc::new(DashSet::new()),
             add_tx,
             add_rx: Arc::new(Mutex::new(Some(add_rx))),
+            queued: Arc::new(DashSet::new()),
+            load_tx,
+            load_rx: Arc::new(Mutex::new(Some(load_rx))),
         }
     }
 
@@ -122,46 +137,177 @@ impl AccountCache {
         Ok(account)
     }
 
-    /// Fetch many accounts in ONE `getMultipleAccounts` RPC call and cache the
-    /// ones that exist. Used on the hot path to load accounts a transaction
-    /// references that aren't streamed (static configs, oracles, the AlphaQ
-    /// vendor account, …). Batching is critical: the previous per-account
-    /// `get_account` loop fired N requests per sim across every worker and
-    /// overwhelmed the RPC (timeouts → accounts never loaded → InvalidAccountOwner).
-    /// Accounts already cached are skipped; missing/nonexistent ones are ignored.
-    pub fn get_or_fetch_many(&self, pubkeys: &[Pubkey]) {
-        let to_fetch: Vec<Pubkey> = pubkeys
-            .iter()
-            .filter(|p| !self.inner.contains_key(*p))
-            .copied()
-            .collect();
-        if to_fetch.is_empty() {
-            return;
+    /// Hand a set of accounts to the background loader (`spawn_loader`). Each
+    /// account is enqueued AT MOST ONCE for the life of the process: ones
+    /// already cached or already queued are skipped. This is non-blocking and
+    /// safe to call on the hot path — it never touches the RPC itself, so a sim
+    /// is never delayed by a fetch and the RPC is never hit per-transaction.
+    /// The loader rate-limits, retries, and caches the result permanently.
+    pub fn enqueue_load(&self, pubkeys: &[Pubkey]) {
+        for pk in pubkeys {
+            if self.inner.contains_key(pk) {
+                continue;
+            }
+            // DashSet::insert returns true only the first time → enqueue once.
+            if self.queued.insert(*pk) {
+                let _ = self.load_tx.send(*pk);
+            }
         }
-        // getMultipleAccounts caps at 100 keys per request.
-        for chunk in to_fetch.chunks(100) {
-            match self.rpc.get_multiple_accounts(chunk) {
-                Ok(results) => {
-                    for (pk, maybe) in chunk.iter().zip(results) {
-                        if let Some(acct) = maybe {
-                            self.inner.insert(
-                                *pk,
-                                Account {
-                                    lamports: acct.lamports,
-                                    data: acct.data,
-                                    owner: Address::from(acct.owner.to_bytes()),
-                                    executable: acct.executable,
-                                    rent_epoch: acct.rent_epoch,
-                                },
-                            );
+    }
+
+    /// Number of accounts still waiting to be loaded (queued or being retried).
+    /// Startup waits on this so the bot only begins trading once its known
+    /// accounts are in RAM.
+    pub fn pending_loads(&self) -> usize {
+        self.queued.len()
+    }
+
+    /// Spawn the single background account loader. It pulls pubkeys off the
+    /// queue, fetches them with `getMultipleAccounts` at a fixed rate (well
+    /// under the RPC's request budget), caches successes in RAM forever, and
+    /// retries failures (RPC error OR account-not-found) up to `MAX_ATTEMPTS`
+    /// times with a delay between tries. Accounts that still can't be loaded
+    /// after all attempts are appended to `bad_accounts_path` and dropped, so a
+    /// single 429 no longer means an account is lost — only a sustained failure
+    /// across many seconds does, and that is recorded as genuinely unreachable.
+    pub fn spawn_loader(&self, bad_accounts_path: String) {
+        let mut rx = match self.load_rx.lock().unwrap().take() {
+            Some(r) => r,
+            None => return, // already spawned
+        };
+        let inner = self.inner.clone();
+        let queued = self.queued.clone();
+        let rpc = self.rpc.clone();
+
+        tokio::spawn(async move {
+            use std::collections::VecDeque;
+            // Tunables. The free RPC allows ~20 requests/sec shared across the
+            // whole bot; one getMultipleAccounts of BATCH keys is ONE request.
+            // BATCH keys per request, one request per TICK → stays far under the
+            // budget and leaves room for the blockhash fetcher. Raise the rate
+            // (lower TICK_MS / raise BATCH) once on a higher-limit RPC.
+            const BATCH: usize = 10;
+            const TICK_MS: u64 = 1000; // 1 request/sec ⇒ ~10 accounts/sec
+            const MAX_ATTEMPTS: u32 = 20;
+            const RETRY_DELAY: Duration = Duration::from_secs(3);
+
+            let mut bad_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&bad_accounts_path)
+                .ok();
+
+            let mut attempts: HashMap<Pubkey, u32> = HashMap::new();
+            let mut ready: VecDeque<Pubkey> = VecDeque::new();
+            let mut retry: VecDeque<(tokio::time::Instant, Pubkey)> = VecDeque::new();
+            let mut ticker = tokio::time::interval(Duration::from_millis(TICK_MS));
+
+            loop {
+                tokio::select! {
+                    maybe = rx.recv() => {
+                        match maybe {
+                            Some(pk) => ready.push_back(pk),
+                            None => return, // all senders dropped → shut down
+                        }
+                        while let Ok(pk) = rx.try_recv() {
+                            ready.push_back(pk);
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        // Promote any retries whose delay has elapsed.
+                        let now = tokio::time::Instant::now();
+                        while matches!(retry.front(), Some((when, _)) if *when <= now) {
+                            let (_, pk) = retry.pop_front().unwrap();
+                            ready.push_back(pk);
+                        }
+                        // Assemble one batch of not-yet-cached keys.
+                        let mut batch: Vec<Pubkey> = Vec::with_capacity(BATCH);
+                        while batch.len() < BATCH {
+                            match ready.pop_front() {
+                                Some(pk) => {
+                                    if inner.contains_key(&pk) {
+                                        queued.remove(&pk);
+                                        attempts.remove(&pk);
+                                        continue;
+                                    }
+                                    batch.push(pk);
+                                }
+                                None => break,
+                            }
+                        }
+                        if batch.is_empty() {
+                            continue;
+                        }
+                        // RpcClient is blocking → run it off the async worker.
+                        let rpc2 = rpc.clone();
+                        let keys = batch.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            rpc2.get_multiple_accounts(&keys)
+                        })
+                        .await;
+
+                        // Per-account outcome: Some=loaded, None=needs retry.
+                        let mut outcomes: Vec<(Pubkey, Option<Account>)> =
+                            Vec::with_capacity(batch.len());
+                        match result {
+                            Ok(Ok(accts)) => {
+                                for (pk, maybe) in batch.iter().zip(accts) {
+                                    outcomes.push((
+                                        *pk,
+                                        maybe.map(|a| Account {
+                                            lamports: a.lamports,
+                                            data: a.data,
+                                            owner: Address::from(a.owner.to_bytes()),
+                                            executable: a.executable,
+                                            rent_epoch: a.rent_epoch,
+                                        }),
+                                    ));
+                                }
+                            }
+                            // Whole-batch failure (RPC error / 429 / join error):
+                            // everything retries.
+                            Ok(Err(e)) => {
+                                debug!(error = %e, n = batch.len(), "account batch fetch failed (will retry)");
+                                for pk in &batch {
+                                    outcomes.push((*pk, None));
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = %e, "account fetch task join failed (will retry)");
+                                for pk in &batch {
+                                    outcomes.push((*pk, None));
+                                }
+                            }
+                        }
+
+                        for (pk, maybe) in outcomes {
+                            match maybe {
+                                Some(acct) => {
+                                    inner.insert(pk, acct);
+                                    queued.remove(&pk);
+                                    attempts.remove(&pk);
+                                }
+                                None => {
+                                    let n = attempts.entry(pk).or_insert(0);
+                                    *n += 1;
+                                    if *n >= MAX_ATTEMPTS {
+                                        warn!(pubkey = %pk, attempts = *n, "account unreachable after max attempts → bad_accounts");
+                                        if let Some(f) = bad_file.as_mut() {
+                                            let _ = writeln!(f, "{pk}");
+                                            let _ = f.flush();
+                                        }
+                                        queued.remove(&pk);
+                                        attempts.remove(&pk);
+                                    } else {
+                                        retry.push_back((now + RETRY_DELAY, pk));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                Err(e) => {
-                    debug!(error = %e, n = chunk.len(), "batch account fetch failed");
-                }
             }
-        }
+        });
     }
 
     /// Diagnostic-only: fetch the CURRENT on-chain owner + data length of each
@@ -183,16 +329,6 @@ impl AccountCache {
             }
         }
         out
-    }
-
-    /// Pre-fetch a batch of accounts (used at startup to warm up mints, ATAs,
-    /// etc. that won't naturally stream in via the owner filter).
-    pub fn prefetch(&self, pubkeys: &[Pubkey]) {
-        for pk in pubkeys {
-            if let Err(e) = self.get_or_fetch(pk) {
-                warn!(pubkey = %pk, error = %e, "prefetch miss");
-            }
-        }
     }
 
     pub fn len(&self) -> usize {
