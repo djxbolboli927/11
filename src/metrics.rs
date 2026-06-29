@@ -60,6 +60,19 @@ pub struct Metrics {
     pub dropped_account_locks: AtomicU64,
     pub calc_done: AtomicU64,
 
+    // ── Stage 2.5: LiteSVM pre-flight simulation ──────────────────────────────
+    /// Tx simulated locally and succeeded (profitable) → forwarded to Jito.
+    pub sim_passed: AtomicU64,
+    /// Tx reverted in simulation for a reason OTHER than Jupiter slippage
+    /// (missing/stale account, other program error). Dropped (fail-closed).
+    pub sim_reverted: AtomicU64,
+    /// Tx reverted specifically with Jupiter's slippage error
+    /// (Custom(6001) == 0x1771): the opportunity is not real on-chain. Dropped.
+    pub sim_slippage: AtomicU64,
+    /// Sim skipped because the route touches a PMM DEX (oracle staleness can't
+    /// be reproduced locally) — sent to Jito without local pre-flight.
+    pub sim_skipped: AtomicU64,
+
     // ── Stage 3: Jito send ────────────────────────────────────────────────────
     pub rate_requeued: AtomicU64,
     pub jito_send_failed: AtomicU64,
@@ -98,6 +111,10 @@ impl Metrics {
             tx_too_large: AtomicU64::new(0),
             dropped_account_locks: AtomicU64::new(0),
             calc_done: AtomicU64::new(0),
+            sim_passed: AtomicU64::new(0),
+            sim_reverted: AtomicU64::new(0),
+            sim_slippage: AtomicU64::new(0),
+            sim_skipped: AtomicU64::new(0),
             rate_requeued: AtomicU64::new(0),
             jito_send_failed: AtomicU64::new(0),
             jito_sent: AtomicU64::new(0),
@@ -149,6 +166,12 @@ impl Metrics {
                 let too_big   = m.tx_too_large.swap(0, Ordering::Relaxed);
                 let too_locks = m.dropped_account_locks.swap(0, Ordering::Relaxed);
                 let calc      = m.calc_done.swap(0, Ordering::Relaxed);
+
+                let sim_pass  = m.sim_passed.swap(0, Ordering::Relaxed);
+                let sim_rev   = m.sim_reverted.swap(0, Ordering::Relaxed);
+                let sim_slip  = m.sim_slippage.swap(0, Ordering::Relaxed);
+                let sim_skip  = m.sim_skipped.swap(0, Ordering::Relaxed);
+
                 let requeued  = m.rate_requeued.swap(0, Ordering::Relaxed);
                 let jfail     = m.jito_send_failed.swap(0, Ordering::Relaxed);
                 let jito      = m.jito_sent.swap(0, Ordering::Relaxed);
@@ -181,6 +204,7 @@ FUNNEL    : profitable={profit}  drop_same_pool={drop_pool}  drop_multi_hop={dro
 PRE-QUEUE : swap_ix_ok={sw_ok}  swap_ix_fail={swap_fail} [timeout={sf_to} http={sf_http} net={sf_net} parse={sf_parse}] -> queue_in={q_in}  (depth_now={depth})\n  \
 IN-QUEUE  : stale={stale} (waited >{ttl_secs}s)\n  \
 TX-BUILD  : build_fail={build}  too_large={too_big}  too_many_locks={too_locks}  calc_ok={calc}\n  \
+SIM       : passed={sim_pass}  reverted={sim_rev}  slippage_6001={sim_slip}  failopen_sent={sim_skip}\n  \
 JITO      : sent={jito}  send_fail={jfail}  waited_for_slot={requeued}\n  \
 SWAP-IX   : avg_metis={avg_ms}ms"
                 );

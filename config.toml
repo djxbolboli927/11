@@ -30,7 +30,7 @@ urls = [
     "https://tokyo.mainnet.block-engine.jito.wtf",
 ]
 uuid = "8c7cda54-ef6e-4792-8617-da0341f8d485"
-trading_keypair = "/root/c/wallet/wallet.json"
+trading_keypair = "/home/dj32/1/4/wallet/wallet.json"
 tip_min_lamports = 1000
 tip_max_lamports = 1000000
 tip_profit_percent = 0.50
@@ -42,8 +42,8 @@ max_bundles_per_second = 5
 url = "https://rpc.fra.shyft.to?api_key=farYqEW-7r1vxqok"
 
 [yellowstone_grpc]
-endpoint = "https://grpc.fra.shyft.to"
-x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
+endpoint = "https://solana-yellowstone-grpc.publicnode.com:443"
+x_token = "cba491e2cd18e339c6517a51d4d497737cb04edd08d8915fc872c8a30cd5656a"
 
 [performance]
 # تعداد worker thread های tokio برای ربات. در سرور 16 هسته‌ای،
@@ -51,7 +51,12 @@ x_token = "41cd21e6-6a66-493d-bdc6-a7057409c2a1"
 threads = 4
 quote_timeout_ms = 200
 # CU limit بر اساس تعداد هاپ: [2 hops, 3 hops, 4 hops, 5 hops, 6 hops]
-cu_limits = [170000, 220000, 280000, 330000, 380000]
+# قبلاً 170k برای ۲هاپ خیلی کم بود: صرافی‌های سنگین مثل SolFi V2 (~100k CU) +
+# 1Dex (~58k CU) دقیقاً به سقف 170k می‌خوردند و با ComputationalBudgetExceeded
+# revert می‌شدند (هم در شبیه‌ساز هم روی زنجیره چون همین limit روی tx واقعی ست
+# می‌شود). مقادیر بالاتر فضای کافی می‌دهند؛ برای باندل Jito هزینه‌ی اضافه ندارد
+# (tip-based، نه priority-fee). در صورت نیاز بعداً برای landing بهتر کم کنید.
+cu_limits = [300000, 450000, 600000, 750000, 900000]
 # حداکثر درخواست‌های همزمان به Metis در هر chunk.
 # 256 تا = نصف بار قبلی (512) تا متیس پهنای باند کافی برای swap_instructions داشته باشد
 max_concurrent_quotes = 256
@@ -75,11 +80,36 @@ bot_cpu_cores = [12,13,14,15,28,29,30,31]
 #
 # منبع داده‌ی sim = همان gRPC شیفت که Metis هم می‌خواند (یک اتصال جدا،
 # هیچ سربار متقابلی با Metis ندارد).
-enabled = false
-so_dir = "/root/c/so"
+enabled = true
+so_dir = "/home/dj32/1/4/so"
+# لیست استخرهای ثابت (pool + owner + همه‌ی اکانت‌ها). هر اکانت داخل آن
+# پیش‌فچ و به‌صورت زنده روی gRPC سابسکرایب می‌شود تا شبیه‌ساز همیشه داده‌ی
+# تازه داشته باشد. اگر فایل نبود فقط warm-up غیرفعال می‌شود (سابسکرایب پویا
+# از روی اینستراکشن متیس همچنان کار می‌کند).
+pools_file = "pools.json"
+# فایل لاگ ردشدن‌ها (در ریشه پروژه). هر تراکنشی که در شبیه‌ساز با خطایی غیر از
+# لغزش رد شود، یک خط JSON اینجا ذخیره می‌شود شامل خطا، برنامه‌ی خطاده، و مهم‌تر
+# از همه «اکانت‌های گم‌شده» (missing_accounts) که علت اصلی اکثر ریورت‌هاست.
+# خطاهای لغزش (6001) عمداً ذخیره نمی‌شوند. تحلیل با: jq . sim_rejects.jsonl
+reject_log_file = "sim_rejects.jsonl"
+# فایل «اکانت‌های خراب». لودر پس‌زمینه هر اکانت را یک‌بار با RPC می‌گیرد و در رم
+# نگه می‌دارد؛ اگر گرفتن یک اکانت پس از ۲۰ تلاش (با فاصله) شکست خورد، آدرسش اینجا
+# (یک pubkey در هر خط) نوشته می‌شود. وجود یک آدرس اینجا یعنی واقعاً غیرقابل‌دسترس
+# است یا RPC در تمام تلاش‌ها پایین بوده — نه یک خطای گذرای 429.
+bad_accounts_file = "bad_accounts.txt"
+# فایل «اکانت‌های دستی». اکانت‌هایی که شما مطمئنید روی زنجیره وجود دارند ولی RPC
+# آن‌ها را null برمی‌گرداند (مثل اوراکل تازه‌ساخته، ALT بازساخته، یا PDA که این
+# اسلات نوشته شده). هر آدرس در یک خط (خطوط خالی و # نادیده گرفته می‌شوند). این‌ها
+# با commitment=processed (تازه‌ترین حالت) و retry بی‌نهایت لود می‌شوند و هرگز در
+# bad_accounts نوشته نمی‌شوند.
+manual_accounts_file = "manual_accounts.txt"
 # fail_closed=true  (امن)  : اگر sim خطا داد ⇒ ارسال نکن
 # fail_closed=false (رول‌اوت) : اگر sim خطا داد ⇒ فقط log بزن و بفرست
 fail_closed = true
+# اکانت‌های vault استخرها به‌صورت پویا از روی اینستراکشن‌های متیس کشف و به اشتراک
+# یلواستون اضافه می‌شوند؛ پس نیازی به فایل‌های TOML استخر (dex_dir) نیست. اگر
+# dex_dir موجود باشد برای warm-up اولیه استفاده می‌شود، در غیر این صورت اشتراک
+# پویا پوشش می‌دهد.
 
 [jito_grpc]
 # مسیر دوم ارسال باندل از طریق SearcherService gRPC جیتو با کیف whitelist.
@@ -109,7 +139,7 @@ endpoints = [
 ]
 # این ولت توسط جیتو whitelist شده — هیچ دارایی‌ای نگه نمی‌دارد و هیچ
 # تراکنشی امضا نمی‌کند. فقط برای احراز هویت اتصال gRPC استفاده می‌شود.
-auth_keypair = "/root/c/wallet/grpc.json"
+auth_keypair = "/home/dj32/1/4/wallet/grpc.json"
 max_bundles_per_second = 5
 
 [template_cache]

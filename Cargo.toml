@@ -5,6 +5,12 @@
 # because Cargo resolves 'workspace = true' from the patching workspace root,
 # not litesvm's own workspace root.
 resolver = "2"
+# Keep the vendored LiteSVM source out of THIS workspace so its crates resolve
+# their own `workspace = true` dependencies against vendor/litesvm/Cargo.toml
+# (its own [workspace.package] / [workspace.dependencies]) instead of ours.
+# Without this exclude, Cargo would pull vendor/litesvm/crates/litesvm in as a
+# member of our workspace and fail to resolve `license.workspace = true` etc.
+exclude = ["vendor/litesvm"]
 
 [package]
 name = "solana-arb-bot"
@@ -58,9 +64,11 @@ thiserror = "1"
 core_affinity = "0.8"
 
 # Local SVM simulation (pre-flight filter before Jito send).
-# Git dep so Cargo resolves litesvm's own workspace dependencies correctly.
-# The vendored source at vendor/litesvm is a reference copy at the same commit.
-litesvm = { git = "https://github.com/LiteSVM/litesvm", branch = "master" }
+# Path dep against the vendored source (vendor/litesvm). The outer `exclude`
+# above keeps that tree as its own workspace, so litesvm's `workspace = true`
+# deps resolve from vendor/litesvm/Cargo.toml. This also means the build needs
+# NO network access to github (the egress policy blocks git fetches anyway).
+litesvm = { path = "vendor/litesvm/crates/litesvm" }
 # solana-account must match litesvm's workspace pin (3.2.0) so the Account
 # type that crosses the Yellowstone cache → LiteSVM boundary is the same type.
 solana-account = "3.2.0"

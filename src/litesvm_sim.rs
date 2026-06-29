@@ -46,18 +46,37 @@ use tracing::{debug, info, warn};
 
 use crate::account_cache::AccountCache;
 use crate::metrics::Metrics;
+use crate::reject_log::RejectLog;
 
 pub struct SimOutcome {
     pub compute_units: u64,
     pub wsol_after: u64,
 }
 
+/// Outcome of a pre-flight simulation. The send/drop *policy* lives in the
+/// caller (the worker) so it can apply per-route rules (e.g. PMM fail-open)
+/// on top of the global `fail_closed` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimVerdict {
+    /// Tx executed and left ≥ the on-chain floor in the WSOL ATA. Send it.
+    Pass,
+    /// Jupiter slippage error (Custom(6001)/0x1771) OR output below the floor:
+    /// the opportunity is not real on-chain. ALWAYS drop — never send.
+    Slippage,
+    /// Any other revert/error (missing-or-stale account, unloaded program,
+    /// other program error, tx-conversion failure). The caller decides whether
+    /// to drop (fail-closed) or send anyway (fail-open) based on the route.
+    Revert,
+}
+
 pub struct Simulator {
     svm: Mutex<LiteSVM>,
     wsol_ata: Pubkey,
-    fail_closed: bool,
     /// Live mainnet slot from the Yellowstone gRPC stream (zero RPC).
     current_slot: Arc<AtomicU64>,
+    /// Records non-slippage rejections (with the accounts that were missing)
+    /// to a file in the project root for diagnosis.
+    reject_log: Arc<RejectLog>,
 }
 
 // ── Type-conversion helpers at the solana-sdk 2.x / LiteSVM 3.x boundary ───
@@ -89,8 +108,8 @@ impl Simulator {
     pub fn new(
         so_dir: &str,
         wsol_ata: Pubkey,
-        fail_closed: bool,
         current_slot: Arc<AtomicU64>,
+        reject_log: Arc<RejectLog>,
     ) -> Result<Self> {
         // Build the SVM with the full mainnet feature set.
         //
@@ -151,18 +170,19 @@ impl Simulator {
         Ok(Self {
             svm: Mutex::new(svm),
             wsol_ata,
-            fail_closed,
             current_slot,
+            reject_log,
         })
     }
 
-    /// Simulate `tx` against the Yellowstone-fed `cache`. Returns
-    /// `Ok(SimOutcome)` when the tx succeeds AND leaves at least
-    /// `min_acceptable_out` lamports in the user's WSOL ATA. Returns `Err`
-    /// for reverts or unprofitable outcomes — caller should drop the bundle.
+    /// Simulate `tx` against the Yellowstone-fed `cache` and classify the
+    /// result as [`SimVerdict`]. `Pass` when the tx succeeds AND leaves at
+    /// least `min_acceptable_out` lamports in the user's WSOL ATA; `Slippage`
+    /// when it is provably unprofitable on-chain; `Revert` for everything else.
+    /// The send/drop decision is left to the caller.
     ///
-    /// ZERO RPC calls. Every account read from the Yellowstone-fed cache.
-    /// The live slot is sourced from the same stream via `current_slot`.
+    /// ZERO RPC calls on the hot path (missing accounts are lazily fetched once
+    /// then cached). The live slot is sourced from the Yellowstone stream.
     pub fn simulate(
         &self,
         tx: &VersionedTransaction,
@@ -170,20 +190,26 @@ impl Simulator {
         cache: &AccountCache,
         min_acceptable_out: u64,
         metrics: &Metrics,
-    ) -> Result<SimOutcome> {
+    ) -> SimVerdict {
         let accounts = collect_tx_accounts(tx, alts);
 
-        // Lazy-fetch any accounts missing from the Yellowstone cache.
-        // For AMM pools this is a no-op (all accounts already streamed).
-        // For PMM oracle accounts not in the owner-filter, this fetches them
-        // once via RPC and caches permanently — subsequent sims are zero-RPC.
-        // Runs BEFORE the svm mutex so a blocking RPC does not stall workers.
-        for pk in &accounts {
-            if cache.get(pk).is_none() {
-                if let Err(e) = cache.get_or_fetch(pk) {
-                    debug!(pubkey = %pk, error = %e, "lazy RPC fetch for missing account");
-                }
-            }
+        // Hand any accounts missing from the Yellowstone cache to the background
+        // loader (rate-limited, retried, cached once for the life of the
+        // process). This is NON-BLOCKING: we do NOT fetch on the hot path, so a
+        // sim is never delayed and the RPC is never hit per-transaction. Cold
+        // accounts (e.g. CLMM tick arrays the owner-filter never streamed because
+        // they didn't change, or AlphaQ's Enc6rB84…) are loaded in the
+        // background; the first sim that needs one may still revert, but every
+        // later sim of that route reads it straight from RAM. The Instructions
+        // sysvar is skipped — LiteSVM synthesizes it per-transaction.
+        let instructions_sysvar = solana_sdk::sysvar::instructions::id();
+        let to_fetch: Vec<Pubkey> = accounts
+            .iter()
+            .filter(|pk| **pk != instructions_sysvar && cache.get(pk).is_none())
+            .copied()
+            .collect();
+        if !to_fetch.is_empty() {
+            cache.enqueue_load(&to_fetch);
         }
 
         let mut svm = self.svm.lock().unwrap();
@@ -225,10 +251,74 @@ impl Simulator {
         }
         debug!(injected, missing = missing_cnt, accounts = accounts.len(), "sim prepared");
 
+        // Set the live wall-clock timestamp on the Clock sysvar — done AFTER the
+        // injection loop on purpose. `warp_to_slot` only sets Clock.slot and
+        // leaves unix_timestamp at the genesis default (0); DEX oracle freshness
+        // checks then fail (Whirlpool 6022 "timestamp <= last_updated", and PMM
+        // DEXes mis-price against a zero clock → 0 output that poisons the next
+        // hop). The injection loop above could itself write the Clock sysvar
+        // account (if a tx references it, get_or_fetch_many pulls it from RPC and
+        // set_account overwrites our value — set_sysvar and set_account share the
+        // same store), so we set the clock LAST to guarantee our timestamp wins
+        // for the syscall the DEX programs read.
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            // Patch the Clock sysvar account bytes directly instead of going
+            // through a typed solana_clock::Clock — that would require pinning an
+            // extra solana-clock crate that must exactly match litesvm's version,
+            // which broke the build when Cargo.toml drifted. Clock is a fixed
+            // 40-byte bincode (fixint, little-endian) struct:
+            //   slot[0..8] epoch_start_timestamp[8..16] epoch[16..24]
+            //   leader_schedule_epoch[24..32] unix_timestamp[32..40]
+            // We rewrite epoch_start_timestamp and unix_timestamp to live time.
+            // Writing the account re-triggers LiteSVM's sysvar_cache rebuild
+            // (accounts_db::maybe_handle_sysvar_account), so the
+            // sol_get_clock_sysvar syscall the DEX programs read returns this.
+            let clock_id = pk_to_addr(solana_sdk::sysvar::clock::id());
+            if let Some(mut acct) = svm.get_account(&clock_id) {
+                if acct.data.len() >= 40 {
+                    acct.data[8..16].copy_from_slice(&now.to_le_bytes());
+                    acct.data[32..40].copy_from_slice(&now.to_le_bytes());
+                    if let Err(e) = svm.set_account(clock_id, acct) {
+                        warn!(error = ?e, "set Clock sysvar timestamp failed");
+                    }
+                }
+            }
+        }
+
+        // Accounts referenced by the tx but absent from BOTH the cache and the
+        // SVM (loaded programs/sysvars). These get a default System-owned empty
+        // account inside LiteSVM, which is the usual cause of InvalidAccountOwner
+        // / RequireGtViolated(0,0) / Jupiter panics. Captured for the reject log.
+        //
+        // The Instructions sysvar is EXCLUDED: LiteSVM synthesizes it per-tx in
+        // process_transaction (lib.rs:1142 construct_instructions_account) and
+        // never stores it as an account, so it always shows "absent" here even
+        // though it is built correctly. Listing it as missing is a false alarm.
+        let missing_accounts: Vec<Pubkey> = accounts
+            .iter()
+            .filter(|pk| {
+                **pk != instructions_sysvar
+                    && cache.get(pk).is_none()
+                    && svm.get_account(&pk_to_addr(**pk)).is_none()
+            })
+            .copied()
+            .collect();
+
         let wsol_before = parse_wsol_amount(&svm, self.wsol_ata);
 
         // Convert solana-sdk 2.x VersionedTransaction → solana-transaction 3.x.
-        let litesvm_tx = to_litesvm_tx(tx)?;
+        let litesvm_tx = match to_litesvm_tx(tx) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "tx conversion for sim failed");
+                metrics.sim_reverted.fetch_add(1, Ordering::Relaxed);
+                return SimVerdict::Revert;
+            }
+        };
 
         match svm.simulate_transaction(litesvm_tx) {
             Ok(info) => {
@@ -244,35 +334,116 @@ impl Simulator {
                 let cu = info.meta.compute_units_consumed;
 
                 if wsol_after < min_acceptable_out {
+                    // Output fell below the on-chain floor — economically the
+                    // same outcome as the Jupiter slippage revert (6001): the
+                    // opportunity is not real. Treat as a slippage drop.
+                    metrics.sim_slippage.fetch_add(1, Ordering::Relaxed);
                     metrics.tx_dropped.fetch_add(1, Ordering::Relaxed);
-                    anyhow::bail!(
-                        "sim unprofitable: wsol_after={} < min={}",
-                        wsol_after,
-                        min_acceptable_out
-                    );
+                    debug!(wsol_after, min = min_acceptable_out, "sim below floor → Slippage");
+                    return SimVerdict::Slippage;
                 }
-                Ok(SimOutcome {
-                    compute_units: cu,
-                    wsol_after,
-                })
+                metrics.sim_passed.fetch_add(1, Ordering::Relaxed);
+                debug!(cu, wsol_after, "sim passed");
+                SimVerdict::Pass
             }
             Err(meta) => {
-                if self.fail_closed {
-                    anyhow::bail!(
-                        "sim reverted: err={:?} logs={:#?}",
-                        meta.err,
-                        meta.meta.logs
-                    );
+                // Jupiter's "Slippage tolerance exceeded" is Custom(6001), which
+                // shows in logs/err as 0x1771. Classify it separately from real
+                // reverts (missing/stale account, other program errors) so the
+                // SIM metric line distinguishes "not profitable on-chain" from
+                // "sim infrastructure / other failure", and so the caller can
+                // ALWAYS drop slippage but fail-open on other reverts.
+                let is_slippage = format!("{:?}", meta.err).contains("Custom(6001)");
+                if is_slippage {
+                    metrics.sim_slippage.fetch_add(1, Ordering::Relaxed);
+                    debug!(err = ?meta.err, "sim reverted with slippage 6001");
+                    SimVerdict::Slippage
                 } else {
-                    warn!(
-                        err = ?meta.err,
-                        logs = ?meta.meta.logs,
-                        "sim reverted but fail_open=true, allowing send"
+                    metrics.sim_reverted.fetch_add(1, Ordering::Relaxed);
+                    warn!(err = ?meta.err, missing = missing_accounts.len(), "sim reverted (non-slippage)");
+                    // Snapshot every account AS THE PROGRAM SAW IT (owner /
+                    // lamports / data length). An account that should be an SPL
+                    // token account but shows owner=1111..1 / data_len=0 was
+                    // never loaded — that is the real culprit behind
+                    // InvalidAccountOwner / RequireGtViolated / Jupiter panics.
+                    let acct_views: Vec<crate::reject_log::AcctView> = accounts
+                        .iter()
+                        .map(|pk| match svm.get_account(&pk_to_addr(*pk)) {
+                            Some(acc) => crate::reject_log::AcctView {
+                                pubkey: *pk,
+                                owner: Some(Pubkey::new_from_array(acc.owner().to_bytes())),
+                                lamports: acc.lamports(),
+                                data_len: acc.data().len(),
+                                executable: acc.executable(),
+                            },
+                            None => crate::reject_log::AcctView {
+                                pubkey: *pk,
+                                owner: None,
+                                lamports: 0,
+                                data_len: 0,
+                                executable: false,
+                            },
+                        })
+                        .collect();
+
+                    // First occurrence of this (error, failed_program) shape:
+                    // audit the sim's account state against the LIVE chain so we
+                    // can tell a load bug (owner/data mismatch) apart from the
+                    // program's own logic over correctly-loaded state. This is
+                    // the decisive check that removes guesswork on errors like
+                    // InvalidAccountOwner. Skipped for repeats (cost: one RPC).
+                    let err_str = format!("{:?}", meta.err);
+                    let failed_program =
+                        crate::reject_log::failed_program_from_logs(&meta.meta.logs);
+                    let chain_mismatches: Vec<crate::reject_log::ChainMismatch> =
+                        if self.reject_log.seen_before(&err_str, &failed_program) {
+                            Vec::new()
+                        } else {
+                            // Audit only non-executable accounts (programs/sysvars
+                            // are loaded from .so / synthesized, not from chain).
+                            let to_audit: Vec<Pubkey> = acct_views
+                                .iter()
+                                .filter(|v| !v.executable)
+                                .map(|v| v.pubkey)
+                                .collect();
+                            let chain = cache.audit_fetch(&to_audit);
+                            acct_views
+                                .iter()
+                                .filter(|v| !v.executable)
+                                .filter_map(|v| {
+                                    let chain_entry = chain.get(&v.pubkey)?;
+                                    let (chain_owner, chain_len) = match chain_entry {
+                                        Some((o, l)) => (Some(*o), Some(*l)),
+                                        None => (None, None),
+                                    };
+                                    let owner_differs = v.owner != chain_owner;
+                                    let len_differs = chain_len != Some(v.data_len);
+                                    if owner_differs || len_differs {
+                                        Some(crate::reject_log::ChainMismatch {
+                                            pubkey: v.pubkey,
+                                            sim_owner: v.owner,
+                                            chain_owner,
+                                            sim_data_len: v.data_len,
+                                            chain_data_len: chain_len,
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        };
+
+                    // Persist the rejection (first occurrence of each shape) so
+                    // the operator can see exactly why each tx was dropped.
+                    self.reject_log.record(
+                        &err_str,
+                        &meta.meta.logs,
+                        &acct_views,
+                        &missing_accounts,
+                        &chain_mismatches,
+                        meta.meta.compute_units_consumed,
                     );
-                    Ok(SimOutcome {
-                        compute_units: meta.meta.compute_units_consumed,
-                        wsol_after: 0,
-                    })
+                    SimVerdict::Revert
                 }
             }
         }
@@ -340,13 +511,13 @@ impl SimulatorPool {
         workers: usize,
         so_dir: &str,
         wsol_ata: Pubkey,
-        fail_closed: bool,
         current_slot: Arc<AtomicU64>,
+        reject_log: Arc<RejectLog>,
     ) -> Result<Self> {
         let workers = workers.max(1);
         let mut sims = Vec::with_capacity(workers);
         for i in 0..workers {
-            let sim = Simulator::new(so_dir, wsol_ata, fail_closed, current_slot.clone())
+            let sim = Simulator::new(so_dir, wsol_ata, current_slot.clone(), reject_log.clone())
                 .with_context(|| format!("failed to build sim worker #{i}"))?;
             sims.push(Arc::new(sim));
             info!(worker = i, "sim worker initialised");

@@ -78,6 +78,32 @@ pub struct SimulationConfig {
     /// subscribed for live Yellowstone updates.
     #[serde(default = "default_dex_dir")]
     pub dex_dir: String,
+    /// JSON file listing the fixed pools to arbitrage (pool key + owner +
+    /// params). Every account it references (vaults, mints, oracle, ALT, …) is
+    /// pre-fetched at startup AND subscribed for live Yellowstone updates, so
+    /// the simulator always has fresh state for these pools. Missing file =
+    /// static warm-up disabled (dynamic per-instruction subscription still runs).
+    #[serde(default = "default_pools_file")]
+    pub pools_file: String,
+    /// File (project-root relative) where non-slippage sim rejections are
+    /// appended as JSON lines, including the accounts that were missing from
+    /// the simulator — the main diagnostic for "why was this tx dropped?".
+    #[serde(default = "default_reject_log_file")]
+    pub reject_log_file: String,
+    /// File (project-root relative) where accounts the background loader could
+    /// not fetch after all retries are appended (one pubkey per line). An entry
+    /// here means the account is genuinely unreachable (or the RPC stayed down
+    /// across all attempts), not a transient miss.
+    #[serde(default = "default_bad_accounts_file")]
+    pub bad_accounts_file: String,
+    /// File (project-root relative) listing accounts the operator KNOWS exist on
+    /// chain but the RPC fails to return (e.g. a fresh oracle / re-created ALT /
+    /// PDA visible only at a fresher commitment). One base58 pubkey per line
+    /// (blank lines and `#` comments ignored). These are force-loaded at
+    /// `processed` commitment, retried forever, and never written to
+    /// bad_accounts.
+    #[serde(default = "default_manual_accounts_file")]
+    pub manual_accounts_file: String,
     /// When sim reverts or errors, `fail_closed=true` drops the send (safest);
     /// `false` logs and forwards to Jito anyway (useful during rollout).
     #[serde(default = "default_true")]
@@ -98,10 +124,30 @@ impl Default for SimulationConfig {
             enabled: false,
             so_dir: default_so_dir(),
             dex_dir: default_dex_dir(),
+            pools_file: default_pools_file(),
+            reject_log_file: default_reject_log_file(),
+            bad_accounts_file: default_bad_accounts_file(),
+            manual_accounts_file: default_manual_accounts_file(),
             fail_closed: true,
             workers: default_workers(),
         }
     }
+}
+
+fn default_pools_file() -> String {
+    "pools.json".to_string()
+}
+
+fn default_reject_log_file() -> String {
+    "sim_rejects.jsonl".to_string()
+}
+
+fn default_bad_accounts_file() -> String {
+    "bad_accounts.txt".to_string()
+}
+
+fn default_manual_accounts_file() -> String {
+    "manual_accounts.txt".to_string()
 }
 
 fn default_so_dir() -> String {

@@ -23,6 +23,13 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     ("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "Jupiter_Aggregator_v6.so"),
 
     // --- AMM / CLMM / orderbook DEXes ---
+    ("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", "Raydium_AMM_v4.so"),
+    // BiSON: present in pools.json but no .so shipped yet. Listed here so
+    // `scripts/redump_so.sh` dumps BiSON.so automatically and the Yellowstone
+    // owner-filter subscribes its pools. Until BiSON.so exists on disk the
+    // loader skips it (warns) and BiSON routes revert in sim → dropped under
+    // fail_closed. Run redump_so.sh to enable BiSON simulation.
+    ("BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi", "BiSON.so"),
     ("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG", "Meteora_DAMM_v2.so"),
     ("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", "Raydium_Concentrated_Liquidity.so"),
     ("MNFSTqtC93rEfYHB6hF82sKdZpUDFWkViLByLd1k1Ms", "Manifest.so"),
@@ -33,16 +40,25 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     ("DEXYosS6oEGvk8uCDayvwEZz4qEyDJRf9nFgYCaqPMTm", "1Dex_Program.so"),
     ("MERLuDFBMmsHnsBPZw2sDQZHvXFMwp8EdjudcU2HKky", "Mercurial_Stable_Swap.so"),
     ("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C", "Raydium_CPMM.so"),
-    ("9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP", "Meteora_Pools_Program.so"),
-    ("24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi", "Invariant_Swap.so"),
-    ("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB", "PancakeSwap.so"),
-    ("HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt", "Meteora_Vault_Program.so"),
+    // The four addresses below were mapped to the WRONG .so filenames, which
+    // caused DeclaredProgramIdMismatch (4100): the loaded binary's embedded
+    // declare_id did not match the address. Corrected per the operator's
+    // on-chain identification — the .so files in so/ are correct, only the
+    // address↔filename pairing was swapped.
+    ("9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP", "Orca_Token_Swap_V2.so"), // was Meteora_Pools (wrong)
+    ("24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi", "Meteora_Vault_Program.so"), // was Invariant (wrong)
+    ("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB", "Meteora_Pools_Program.so"), // was PancakeSwap (wrong)
+    ("HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt", "Invariant_Swap.so"), // was Meteora_Vault (wrong)
 
     // --- Previously forbidden — now allowed at user's request ---
     ("ALPHAQmeA7bjrVuccPsYPiCvsi428SNwte66Srvs4pHA", "AlphaQ.so"),
     ("AQU1FRd7papthgdrwPTTq5JacJh8YtwEXaBfKU3bTz45", "Aquifer.so"),
-    ("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq", "Byreal_CLMM.so"),
-    ("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2", "REALQq.so"),
+    // Byreal CLMM: the operator's binary declares program id
+    // REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2, so it is registered there.
+    ("REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2", "Byreal_CLMM.so"),
+    // HpNfyc2Saw7... is the real PancakeSwap program (operator-confirmed). The
+    // PancakeSwap.so binary belongs HERE, not on Eo7Wj (which is Meteora Pools).
+    ("HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq", "PancakeSwap.so"),
 
     // --- PMM DEXes — bypass simulation when enabled, otherwise go direct ---
     ("TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH", "Tessera_V.so"),
@@ -53,7 +69,7 @@ pub const PROGRAMS: &[(&str, &str)] = &[
     // --- PMM DEX — LiteSVM simulatable (no oracle staleness check) ---
     // GoonFi V2: uses sysvar_instructions whitelist (passes because we send
     // real Jupiter txs). Token vault accounts lazily RPC-fetched on first sim.
-    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "goofni_v2.so"),
+    ("goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", "GoonFi_V2.so"),
 ];
 
 /// PMM (Proprietary Market Maker) program ids. Routes through these DEXes
@@ -65,6 +81,17 @@ pub const PMM_PROGRAM_IDS: &[&str] = &[
     "SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe",   // SolFi
     "SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF",   // SolFi V2
     "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",   // ZeroFi
+];
+
+/// PMM DEX *labels* as they appear in Metis `route_plan[].swapInfo.label`.
+/// Metis route data carries the human label (e.g. "SolFi V2"), NOT the program
+/// id, so PMM detection must also match on label. Matched case-insensitively as
+/// a substring. Routes hitting any of these are simulated but fail-open (their
+/// oracle freshness / compute cost can't be perfectly reproduced locally).
+pub const PMM_LABELS: &[&str] = &[
+    "tessera",
+    "solfi",   // matches "SolFi" and "SolFi V2"
+    "zerofi",
 ];
 
 /// Program ids the bot refuses to route through. Currently empty — every

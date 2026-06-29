@@ -12,7 +12,9 @@ mod jito_grpc;
 mod litesvm_sim;
 mod metis;
 mod metrics;
+mod pools;
 mod program_registry;
+mod reject_log;
 mod rate_limiter;
 mod template_cache;
 mod token_metrics;
@@ -146,8 +148,35 @@ async fn async_main(config: config::Config) -> Result<()> {
         }
 
         let dex_pools = dex_accounts::load(&config.simulation.dex_dir);
+        // Fixed-pool registry from pools.json: every referenced account
+        // (pool, vaults, mints, oracle, ALT, …) is subscribed live so the sim
+        // always sees fresh state, and pre-fetched below for warm-up.
+        let static_pools = pools::load(&config.simulation.pools_file);
+        if !static_pools.is_empty() {
+            // Flag any configured pool whose owning program isn't registered:
+            // its .so won't load, so that pool's routes can't be simulated.
+            let registered: std::collections::HashSet<String> =
+                program_registry::all_program_ids().into_iter().collect();
+            for owner in &static_pools.owners {
+                if !registered.contains(&owner.to_string()) {
+                    eprintln!(
+                        "[pools] WARNING: owner {owner} not in program_registry — \
+                         its pool routes cannot be simulated (add it + dump the .so)"
+                    );
+                }
+            }
+            eprintln!(
+                "[pools] loaded {} pools / {} accounts for sim warm-up + live subscription",
+                static_pools.pool_count,
+                static_pools.accounts.len()
+            );
+        }
+
         let mut live_extra = vec![wsol_ata];
         live_extra.extend_from_slice(&dex_pools.subscribe_accounts);
+        live_extra.extend_from_slice(&static_pools.accounts);
+        live_extra.sort_unstable();
+        live_extra.dedup();
 
         cache.spawn_subscription(
             config.yellowstone_grpc.endpoint.clone(),
@@ -173,14 +202,69 @@ async fn async_main(config: config::Config) -> Result<()> {
             }
         }
         warm.extend_from_slice(&dex_pools.all_accounts);
-        cache.prefetch(&warm);
+        warm.extend_from_slice(&static_pools.accounts);
+
+        // Start the rate-limited background loader, then load the known accounts
+        // ONCE into RAM before trading begins. The loader caps RPC usage, retries
+        // transient failures, and writes genuinely-unreachable accounts to the
+        // bad-accounts file. We wait for the warm-up set to drain (bounded) so
+        // the bot starts with its static pools already in memory; dynamically
+        // discovered accounts (e.g. CLMM tick arrays) are loaded lazily later.
+        cache.spawn_loader(config.simulation.bad_accounts_file.clone());
+
+        // Force-load operator-asserted accounts (manual file): ones known to
+        // exist on chain that the RPC keeps returning null for. Fetched at
+        // `processed` commitment, retried forever, never bad-listed.
+        let manual: Vec<solana_sdk::pubkey::Pubkey> =
+            match std::fs::read_to_string(&config.simulation.manual_accounts_file) {
+                Ok(text) => text
+                    .lines()
+                    .map(|l| l.split('#').next().unwrap_or("").trim())
+                    .filter(|l| !l.is_empty())
+                    .filter_map(|l| solana_sdk::pubkey::Pubkey::try_from(l).ok())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+        if !manual.is_empty() {
+            tracing::info!(
+                count = manual.len(),
+                file = %config.simulation.manual_accounts_file,
+                "force-loading operator-asserted accounts"
+            );
+            cache.force_load(&manual);
+        }
+
+        cache.enqueue_load(&warm);
+        let warm_total = warm.len();
+        let warm_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(180);
+        loop {
+            let pending = cache.pending_loads();
+            if pending == 0 {
+                tracing::info!(loaded = warm_total, "warm-up accounts loaded into RAM");
+                break;
+            }
+            if std::time::Instant::now() >= warm_deadline {
+                tracing::warn!(
+                    pending,
+                    total = warm_total,
+                    "warm-up timed out; starting anyway (remaining load in background)"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        let reject_log = Arc::new(reject_log::RejectLog::new(
+            &config.simulation.reject_log_file,
+        ));
 
         let pool = litesvm_sim::SimulatorPool::new(
             config.simulation.workers,
             &config.simulation.so_dir,
             wsol_ata,
-            config.simulation.fail_closed,
             cache.stream_slot(),
+            reject_log,
         )?;
         (Some(Arc::new(cache)), Some(Arc::new(pool)))
     } else {
@@ -202,6 +286,7 @@ async fn async_main(config: config::Config) -> Result<()> {
         user_pubkey: trading_keypair.pubkey().to_string(),
         sim_cache,
         sim_pool,
+        sim_fail_closed: config.simulation.fail_closed,
         template_store,
     });
 
